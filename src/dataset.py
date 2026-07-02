@@ -162,14 +162,20 @@ def parse_cityjson_file_to_graphs(filepath, normalize_coords=False):
 # PyTorch Dataset Object
 # ==============================================================================
 
+NUM_NODE_CLASSES = 2  # 0 = Active, 1 = Virtual
+
 class CityJSONDataset(Dataset):
-    def __init__(self, dataset_dir, lods, normalize_coords=False, transform=None):
+    def __init__(self, dataset_dir, lods, normalize_coords=False, transform=None,
+                 n_max=None):
         """
         Args:
             dataset_dir (str or Path): Folder containing dataset (e.g. data/The Hague).
             lods (int, str, list, tuple): Single LOD or a list of LODs to match.
             normalize_coords (bool): If True, shifts nodes such that center of building base is at (0, 0, 0).
             transform (callable, optional): Optional transform to apply on graph items.
+            n_max (int, optional): Maximum number of nodes per graph. All graphs are padded
+                to this size with Virtual nodes. If None, auto-detected from the dataset
+                as the maximum observed node count.
         """
         self.dataset_dir = Path(dataset_dir)
         self.normalize_coords = normalize_coords
@@ -223,19 +229,92 @@ class CityJSONDataset(Dataset):
         if not self.ids:
             print(f"Warning: No matching CityObjects found across requested LODs: {self.lods}")
 
+        # ------------------------------------------------------------------
+        # Compute N_max: the fixed graph size for padding
+        # ------------------------------------------------------------------
+        observed_max = 0
+        for lod in self.lods:
+            for obj_id in self.ids:
+                graph = self.lod_data[lod].get(obj_id)
+                if graph is not None:
+                    num_nodes = graph["x"].size(0)
+                    observed_max = max(observed_max, num_nodes)
+        
+        if n_max is not None:
+            if n_max < observed_max:
+                raise ValueError(
+                    f"Provided n_max={n_max} is smaller than the largest graph "
+                    f"in the dataset ({observed_max} nodes). Use n_max >= {observed_max}."
+                )
+            self.n_max = n_max
+        else:
+            self.n_max = observed_max
+            
+        print(f"N_max = {self.n_max} (dataset max: {observed_max})")
+
     def __len__(self):
         return len(self.ids)
+
+    def _pad_graph(self, graph):
+        """
+        Pads a variable-size graph to fixed N_max size and produces dense tensors
+        with Active/Virtual node categories.
+        
+        Returns a dict with:
+            "x":               [N_max, 3]        — coordinates (zero for virtual)
+            "node_categories": [N_max, 2]        — one-hot: [1,0]=Active, [0,1]=Virtual
+            "y":               [N_max, N_max, 1]  — dense adjacency (0 for virtual-involving)
+            "node_mask":       [N_max]            — 1=Active, 0=Virtual
+            "id":              str
+            "type":            str
+        """
+        x = graph["x"]                  # [N, 3]
+        edge_index = graph["edge_index"]  # [2, E]
+        N = x.size(0)
+        N_max = self.n_max
+        
+        # 1. Pad coordinates: active nodes keep their coords, virtual nodes get zeros
+        x_padded = torch.zeros((N_max, 3), dtype=torch.float32)
+        x_padded[:N] = x
+        
+        # 2. Node categories: one-hot [Active, Virtual]
+        #    Active = [1, 0], Virtual = [0, 1]
+        node_categories = torch.zeros((N_max, NUM_NODE_CLASSES), dtype=torch.float32)
+        node_categories[:N, 0] = 1.0   # Active
+        node_categories[N:, 1] = 1.0   # Virtual
+        
+        # 3. Node mask: 1 for active, 0 for virtual
+        node_mask = torch.zeros(N_max, dtype=torch.float32)
+        node_mask[:N] = 1.0
+        
+        # 4. Dense adjacency matrix from sparse edge_index
+        y = torch.zeros((N_max, N_max, 1), dtype=torch.float32)
+        if edge_index.numel() > 0:
+            src = edge_index[0]  # [E]
+            dst = edge_index[1]  # [E]
+            y[src, dst, 0] = 1.0
+        
+        return {
+            "x": x_padded,
+            "node_categories": node_categories,
+            "y": y,
+            "node_mask": node_mask,
+            "id": graph["id"],
+            "type": graph["type"],
+        }
 
     def __getitem__(self, index):
         obj_id = self.ids[index]
         
         if self.is_single_lod:
-            item = self.lod_data[self.lods[0]][obj_id]
+            item = self._pad_graph(self.lod_data[self.lods[0]][obj_id])
             if self.transform:
                 item = self.transform(item)
             return item
         else:
-            items = tuple(self.lod_data[lod][obj_id] for lod in self.lods)
+            items = tuple(
+                self._pad_graph(self.lod_data[lod][obj_id]) for lod in self.lods
+            )
             if self.transform:
                 items = tuple(self.transform(item) for item in items)
             return items
@@ -246,39 +325,19 @@ class CityJSONDataset(Dataset):
 
 def collate_single_lod(graphs):
     """
-    Collates a list of graph dictionaries into a single batch using disjoint union mapping.
+    Collates a list of padded graph dictionaries into a single batch via torch.stack.
+    All graphs are already padded to the same N_max, so simple stacking works.
     """
-    x_list = []
-    edge_index_list = []
-    batch_list = []
-    ids = []
-    types = []
-    
-    node_offset = 0
-    for i, g in enumerate(graphs):
-        x = g["x"]
-        edge_index = g["edge_index"]
-        num_nodes = x.size(0)
-        
-        x_list.append(x)
-        edge_index_list.append(edge_index + node_offset)
-        batch_list.append(torch.full((num_nodes,), i, dtype=torch.long))
-        
-        ids.append(g["id"])
-        types.append(g["type"])
-        
-        node_offset += num_nodes
-        
-    batched_x = torch.cat(x_list, dim=0) if x_list else torch.empty((0, 3), dtype=torch.float32)
-    batched_edge_index = torch.cat(edge_index_list, dim=1) if edge_index_list else torch.empty((2, 0), dtype=torch.long)
-    batched_batch = torch.cat(batch_list, dim=0) if batch_list else torch.empty((0,), dtype=torch.long)
+    ids = [g["id"] for g in graphs]
+    types = [g["type"] for g in graphs]
     
     return {
-        "x": batched_x,
-        "edge_index": batched_edge_index,
-        "batch": batched_batch,
+        "x": torch.stack([g["x"] for g in graphs], dim=0),                  # [B, N_max, 3]
+        "node_categories": torch.stack([g["node_categories"] for g in graphs], dim=0),  # [B, N_max, 2]
+        "y": torch.stack([g["y"] for g in graphs], dim=0),                  # [B, N_max, N_max, 1]
+        "node_mask": torch.stack([g["node_mask"] for g in graphs], dim=0),  # [B, N_max]
         "ids": ids,
-        "types": types
+        "types": types,
     }
 
 

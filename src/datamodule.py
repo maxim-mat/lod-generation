@@ -35,6 +35,7 @@ class CityJSONDataModule(LightningDataModule):
         normalize_coords=False,
         num_workers=0,
         seed=42,
+        n_max=None,
     ):
         """
         PyTorch Lightning DataModule for CityJSON graph datasets.
@@ -47,6 +48,8 @@ class CityJSONDataModule(LightningDataModule):
             normalize_coords (bool): If True, shifts nodes so base center is at (0, 0, 0).
             num_workers (int): Number of subprocesses to use for data loading.
             seed (int): Random seed for reproducibility of splits.
+            n_max (int, optional): Maximum number of nodes per graph. If None, auto-detected
+                from the dataset as the maximum observed node count.
         """
         super().__init__()
         self.dataset_dir = dataset_dir
@@ -56,6 +59,7 @@ class CityJSONDataModule(LightningDataModule):
         self.normalize_coords = normalize_coords
         self.num_workers = num_workers
         self.seed = seed
+        self.n_max = n_max
         
         # Datasets placeholders
         self.full_dataset = None
@@ -78,7 +82,11 @@ class CityJSONDataModule(LightningDataModule):
                 dataset_dir=self.dataset_dir,
                 lods=self.lods,
                 normalize_coords=self.normalize_coords,
+                n_max=self.n_max,
             )
+            
+            # Expose the resolved n_max for downstream consumers (e.g. model)
+            self.n_max = self.full_dataset.n_max
             
             # Split dataset using seed
             total = len(self.full_dataset)

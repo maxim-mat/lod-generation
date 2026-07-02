@@ -127,11 +127,11 @@ def convert_to_lod1(_cj):
                 outer_ring = ensure_orientation(
                     face[0],
                     _vertices,
-                    ccw=True
+                    ccw=False  # CW viewed from above → outward normal points down
                 )
 
                 hole_rings = [
-                    ensure_orientation(r, _vertices, ccw=False)
+                    ensure_orientation(r, _vertices, ccw=True)  # opposite of outer ring
                     for r in face[1:]
                 ]
 
@@ -141,12 +141,12 @@ def convert_to_lod1(_cj):
 
                 roof_face = []
                 roof_face.append(
-                    [get_roof_vertex(v) for v in outer_ring][::-1]
+                    [get_roof_vertex(v) for v in outer_ring]  # keep CCW → outward normal points up
                 )
 
                 for hole in hole_rings:
                     roof_face.append(
-                        [get_roof_vertex(v) for v in hole][::-1]
+                        [get_roof_vertex(v) for v in hole]  # keep same as ground hole (opposite of outer)
                     )
 
                 shell.append(roof_face)
