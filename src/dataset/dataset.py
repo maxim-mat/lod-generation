@@ -186,10 +186,9 @@ class CityJSONDataset(Dataset):
         # Parse LOD input type
         if isinstance(lods, (list, tuple, set, np.ndarray)):
             self.lods = [int(l) for l in lods]
-            self.is_single_lod = False
         else:
             self.lods = [int(lods)]
-            self.is_single_lod = True
+        self.is_single_lod = len(self.lods) == 1
             
         self.lod_data = {}
         
