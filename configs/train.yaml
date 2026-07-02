@@ -56,12 +56,12 @@ trainer:
 # Experiment logging
 logging:
   loggers:
-    - tensorboard
+    - wandb
   project_name: lod-generation
-  experiment_name: regnn_diffusion
-  run_name: default
+  experiment_name: initial-runs
+  run_name: debug
   save_dir: outputs
-  wandb_entity: null
+  wandb_entity: maxim-lod
   wandb_offline: false
   log_model: false
 

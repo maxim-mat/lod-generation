@@ -66,6 +66,7 @@ def create_loggers(cfg: Config, save_dir: Path) -> List[Logger]:
                 offline=cfg.logging.wandb_offline,
                 log_model=cfg.logging.log_model,
                 save_dir=str(save_dir),
+                group=cfg.logging.experiment_name,
             ))
             logger.info("Initialized WandB logger (remote)")
             
