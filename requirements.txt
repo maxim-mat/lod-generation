@@ -1,0 +1,19 @@
+# Core dependencies
+torch>=2.0.0
+lightning>=2.0.0
+omegaconf>=2.3.0
+
+# Data handling & geometry
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Experiment tracking
+tensorboard>=2.12.0
+wandb>=0.15.0
+
+# Visualization
+plotly>=5.14.0
+rich>=13.0.0  # Optional, but nice for progress bars
+
+# Development & Notebooks
+jupyter>=1.0.0
