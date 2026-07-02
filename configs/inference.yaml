@@ -1,0 +1,35 @@
+# Inference Configuration for CityJSON LOD Generation
+# Usage: python main.py --config configs/inference.yaml
+
+mode: inference
+seed: 42
+
+# Data settings (used to verify splits/sizes if necessary)
+data:
+  dataset_dir: data/The Hague
+  lods:
+    - 1
+    - 2
+  normalize_coords: true
+  num_workers: 4
+  n_max: null
+
+# Model settings
+model:
+  num_node_classes: 2
+  hidden_dim: 64
+  num_layers: 4
+  T: 500
+  discrete_noise_type: uniform
+
+# Trainer settings (required to set up accelerator etc.)
+trainer:
+  accelerator: auto
+  devices: 1
+
+# Inference settings
+inference:
+  checkpoint_path: null
+  batch_size: 10
+  edge_threshold: 0.5
+  output_dir: outputs/generated

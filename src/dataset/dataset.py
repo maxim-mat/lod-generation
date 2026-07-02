@@ -1,10 +1,12 @@
-#!/usr/bin/env python3
 import json
 import os
+import logging
 from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+logger = logging.getLogger(__name__)
 
 # ==============================================================================
 # Helper functions for base footprint extraction & normalization
@@ -227,7 +229,7 @@ class CityJSONDataset(Dataset):
             self.ids = sorted(list(self.lod_data[self.lods[0]].keys()))
             
         if not self.ids:
-            print(f"Warning: No matching CityObjects found across requested LODs: {self.lods}")
+            logger.warning(f"No matching CityObjects found across requested LODs: {self.lods}")
 
         # ------------------------------------------------------------------
         # Compute N_max: the fixed graph size for padding
@@ -250,7 +252,7 @@ class CityJSONDataset(Dataset):
         else:
             self.n_max = observed_max
             
-        print(f"N_max = {self.n_max} (dataset max: {observed_max})")
+        logger.info(f"N_max = {self.n_max} (dataset max: {observed_max})")
 
     def __len__(self):
         return len(self.ids)

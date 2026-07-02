@@ -55,6 +55,7 @@ def convert_to_lod1(_cj):
             surfaces = semantics.get("surfaces", [])
             values = semantics.get("values", [])
 
+            # Find indices
             ground_idx = None
             roof_idx = None
             wall_idx = None

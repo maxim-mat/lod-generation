@@ -12,10 +12,7 @@ from statistics import median
 # ==============================================================================
 # Geometric Conversion Functions
 # ==============================================================================
-try:
-    from geometry import convert_to_lod1
-except ImportError:
-    from src.geometry import convert_to_lod1
+from src.geometry.geometry import convert_to_lod1
 
 
 # ==============================================================================

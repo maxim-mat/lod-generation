@@ -1,7 +1,9 @@
-#!/usr/bin/env python3
 import json
+import logging
 from pathlib import Path
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 # ==============================================================================
 # Cycle Extraction (Polygonal Face Reconstruction)
@@ -75,25 +77,13 @@ def straighten_face(face_coords):
     """
     Fits a plane to a 3D polygon face using Eigendecomposition (equivalent to SVD),
     snaps the normal to standard axes (roof/ground vs wall), and projects vertices.
-    
-    Args:
-        face_coords (np.ndarray): Shape [K, 3] of coordinate points.
-        
-    Returns:
-        projected_coords (np.ndarray): Shape [K, 3] of coplanar coprojections.
-        surface_type (str): 'RoofSurface', 'GroundSurface', or 'WallSurface'
     """
     K = len(face_coords)
     center = np.mean(face_coords, axis=0)
     centered = face_coords - center
     
-    # Compute covariance matrix [3, 3]
     cov = np.dot(centered.T, centered)
-    
-    # Eigendecomposition. eigh returns eigenvalues in ascending order
     eigenvalues, eigenvectors = np.linalg.eigh(cov)
-    
-    # Normal is the eigenvector corresponding to the smallest eigenvalue
     normal = eigenvectors[:, 0]
     
     # Snap normal to standard axes for structural rigidity
@@ -109,10 +99,9 @@ def straighten_face(face_coords):
             normal = normal / norm_xy
         surface_type = "WallSurface"
     else:
-        # Keep general fitting plane if semi-sloped
+        # Keep general sloped plane
         surface_type = "RoofSurface" if normal[2] > 0 else "WallSurface"
         
-    # Project points onto the snapped plane
     projected = []
     for p in face_coords:
         dist_to_plane = np.dot(p - center, normal)
@@ -134,7 +123,6 @@ def regularize_building_geometry(nodes, faces):
     vertex_projections = {i: [] for i in range(num_nodes)}
     face_surface_types = []
     
-    # Project each face to its fitting plane
     for face in faces:
         face_coords = nodes[face]
         proj_coords, surf_type = straighten_face(face_coords)
@@ -143,7 +131,6 @@ def regularize_building_geometry(nodes, faces):
         for idx_in_face, global_node_idx in enumerate(face):
             vertex_projections[global_node_idx].append(proj_coords[idx_in_face])
             
-    # Average coordinates for each vertex across all faces it belongs to
     new_nodes = np.zeros_like(nodes)
     for i in range(num_nodes):
         projs = vertex_projections[i]
@@ -176,14 +163,13 @@ def graph_to_cityjson(nodes, edge_probs, threshold=0.5, building_id="generated_b
     faces = find_cycles_dfs(adj_list, max_len=8)
     if not faces:
         # Fallback to a simple floor footprint if no cycles found
-        print("Warning: No closed cycles found in graph. Creating a fallback geometry.")
+        logger.warning("No closed cycles found in graph. Creating a fallback geometry.")
         return {}
         
     # 3. Regularize geometry (straighten out faces & average shared vertices)
     nodes_reg, surface_types = regularize_building_geometry(nodes, faces)
     
     # 4. Format into CityJSON structure
-    # Surfaces/semantics definition
     semantic_surfaces = [
         {"type": "GroundSurface"},
         {"type": "RoofSurface"},
@@ -191,8 +177,6 @@ def graph_to_cityjson(nodes, edge_probs, threshold=0.5, building_id="generated_b
     ]
     sem_map = {"GroundSurface": 0, "RoofSurface": 1, "WallSurface": 2}
     
-    # In CityJSON boundaries: faces are represented as lists of rings.
-    # We assume simple polygons with no holes (outer ring only).
     cj_faces = [[face] for face in faces]
     cj_semantics_values = [sem_map[stype] for stype in surface_types]
     
@@ -232,4 +216,4 @@ def save_to_file(cityjson_dict, output_path):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(cityjson_dict, f)
-    print(f"CityJSON saved successfully to {output_path}")
+    logger.info(f"CityJSON saved successfully to {output_path}")

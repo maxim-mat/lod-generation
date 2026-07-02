@@ -2,30 +2,12 @@
 import torch
 from torch.utils.data import DataLoader, random_split
 
-# Dynamic import for geometry/dataset modules
-try:
-    from dataset import CityJSONDataset, graph_collate_fn
-except ImportError:
-    from src.dataset import CityJSONDataset, graph_collate_fn
+import lightning as L
 
-# Conditionally import PyTorch Lightning or newer Lightning package
-try:
-    import pytorch_lightning as pl
-    LightningDataModule = pl.LightningDataModule
-    HAS_LIGHTNING = True
-except ImportError:
-    try:
-        import lightning.pytorch as pl
-        LightningDataModule = pl.LightningDataModule
-        HAS_LIGHTNING = True
-    except ImportError:
-        # Fallback dummy class if Lightning is not installed in the workspace
-        class LightningDataModule:
-            pass
-        HAS_LIGHTNING = False
+from src.dataset.dataset import CityJSONDataset, graph_collate_fn
 
 
-class CityJSONDataModule(LightningDataModule):
+class CityJSONDataModule(L.LightningDataModule):
     def __init__(
         self,
         dataset_dir,
@@ -136,10 +118,3 @@ class CityJSONDataModule(LightningDataModule):
             collate_fn=graph_collate_fn,
             pin_memory=True,
         )
-
-
-if not HAS_LIGHTNING:
-    # If pl is not installed, print a friendly message when datamodule is run directly
-    if __name__ == "__main__":
-        print("Note: PyTorch Lightning is not installed in the current environment.")
-        print("CityJSONDataModule will require 'pytorch-lightning' or 'lightning' to run as a DataModule.")
