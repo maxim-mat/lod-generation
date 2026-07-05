@@ -18,6 +18,7 @@ class CityJSONDataModule(L.LightningDataModule):
         num_workers=0,
         seed=42,
         n_max=None,
+        upper_limit_nodes=None,
     ):
         """
         PyTorch Lightning DataModule for CityJSON graph datasets.
@@ -42,6 +43,7 @@ class CityJSONDataModule(L.LightningDataModule):
         self.num_workers = num_workers
         self.seed = seed
         self.n_max = n_max
+        self.upper_limit_nodes = upper_limit_nodes
         
         # Datasets placeholders
         self.full_dataset = None
@@ -65,6 +67,7 @@ class CityJSONDataModule(L.LightningDataModule):
                 lods=self.lods,
                 normalize_coords=self.normalize_coords,
                 n_max=self.n_max,
+                upper_limit_nodes=self.upper_limit_nodes,
             )
             
             # Expose the resolved n_max for downstream consumers (e.g. model)

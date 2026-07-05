@@ -13,6 +13,7 @@ data:
   normalize_coords: true
   num_workers: 4
   n_max: null
+  upper_limit_nodes: null
 
 # Model settings
 model:

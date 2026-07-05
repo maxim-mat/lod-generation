@@ -23,6 +23,7 @@ def create_datamodule(cfg: Config) -> CityJSONDataModule:
         num_workers=cfg.data.num_workers,
         n_max=cfg.data.n_max,
         seed=cfg.seed,
+        upper_limit_nodes=cfg.data.upper_limit_nodes,
     )
 
 

@@ -10,6 +10,7 @@ class DataConfig:
     normalize_coords: bool = True
     num_workers: int = 4
     n_max: Optional[int] = None
+    upper_limit_nodes: Optional[int] = None
 
 @dataclass
 class ModelConfig:

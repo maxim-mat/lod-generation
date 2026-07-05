@@ -168,7 +168,7 @@ NUM_NODE_CLASSES = 2  # 0 = Active, 1 = Virtual
 
 class CityJSONDataset(Dataset):
     def __init__(self, dataset_dir, lods, normalize_coords=False, transform=None,
-                 n_max=None):
+                 n_max=None, upper_limit_nodes=None):
         """
         Args:
             dataset_dir (str or Path): Folder containing dataset (e.g. data/The Hague).
@@ -178,6 +178,8 @@ class CityJSONDataset(Dataset):
             n_max (int, optional): Maximum number of nodes per graph. All graphs are padded
                 to this size with Virtual nodes. If None, auto-detected from the dataset
                 as the maximum observed node count.
+            upper_limit_nodes (int, optional): Upper limit on the number of nodes per graph. 
+                Graphs exceeding this limit are excluded from the dataset.
         """
         self.dataset_dir = Path(dataset_dir)
         self.normalize_coords = normalize_coords
@@ -226,6 +228,34 @@ class CityJSONDataset(Dataset):
             self.ids = sorted(list(common_ids))
         else:
             self.ids = sorted(list(self.lod_data[self.lods[0]].keys()))
+
+        # Filter out building graphs exceeding upper_limit_nodes
+        if upper_limit_nodes is not None:
+            filtered_ids = []
+            removed_ids = []
+            for obj_id in self.ids:
+                keep = True
+                for lod in self.lods:
+                    graph = self.lod_data[lod].get(obj_id)
+                    if graph is not None and graph["x"].size(0) > upper_limit_nodes:
+                        keep = False
+                        break
+                if keep:
+                    filtered_ids.append(obj_id)
+                else:
+                    removed_ids.append(obj_id)
+            
+            # Remove from memory (lod_data)
+            for obj_id in removed_ids:
+                for lod in self.lods:
+                    if obj_id in self.lod_data[lod]:
+                        del self.lod_data[lod][obj_id]
+            
+            self.ids = filtered_ids
+            logger.info(
+                f"Filtered out {len(removed_ids)} buildings exceeding upper_limit_nodes={upper_limit_nodes}. "
+                f"{len(self.ids)} remaining."
+            )
             
         if not self.ids:
             logger.warning(f"No matching CityObjects found across requested LODs: {self.lods}")

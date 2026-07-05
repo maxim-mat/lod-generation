@@ -1,0 +1,76 @@
+# ==============================================================================
+# CityJSON LOD Generation — Default Configuration
+# ==============================================================================
+# Override any parameter from the CLI using dot notation:
+#   python src/main.py model.hidden_dim=128 training.batch_size=16 mode=inference
+# ==============================================================================
+
+# --- Run Mode ---------------------------------------------------------------
+# "train" or "inference"
+mode: train
+
+# --- Seed -------------------------------------------------------------------
+seed: 42
+
+# --- Data -------------------------------------------------------------------
+data:
+  dataset_dir: data/The Hague
+  lods: 1
+  normalize_coords: true
+  n_max: null              # null = auto-detect from dataset
+  num_workers: 0
+  upper_limit_nodes: null  # null = no limit
+
+# --- Model ------------------------------------------------------------------
+model:
+  num_node_classes: 2
+  hidden_dim: 64
+  num_layers: 4
+  T: 500
+  discrete_noise_type: uniform   # uniform | absorbing | discretized_gaussian
+
+# --- Training ---------------------------------------------------------------
+training:
+  lr: 1.0e-3
+  batch_size: 32
+  max_epochs: 200
+  train_val_test_split: [0.8, 0.1, 0.1]
+  gradient_clip_val: 1.0
+
+  # Early stopping
+  early_stopping:
+    enabled: true
+    monitor: val_coord_mse
+    patience: 20
+    mode: min
+
+  # Model checkpointing
+  checkpoint:
+    enabled: true
+    monitor: val_coord_mse
+    mode: min
+    save_top_k: 3
+    filename: "epoch={epoch:03d}-val_mse={val_coord_mse:.4f}"
+
+# --- Inference --------------------------------------------------------------
+inference:
+  checkpoint_path: null    # path to .ckpt file (required for inference mode)
+  batch_size: 4            # number of buildings to generate
+  edge_threshold: 0.5      # edge probability threshold for adjacency
+  output_dir: outputs/generated
+
+# --- WandB Logging ----------------------------------------------------------
+wandb:
+  enabled: true
+  project: lod-generation
+  entity: null             # null = use default wandb entity
+  name: null               # null = auto-generated run name
+  tags: []
+  log_model: false         # upload checkpoints to wandb
+
+# --- Trainer ----------------------------------------------------------------
+trainer:
+  accelerator: auto        # auto | cpu | gpu | mps
+  devices: 1
+  precision: 32            # 32 | 16-mixed | bf16-mixed
+  log_every_n_steps: 10
