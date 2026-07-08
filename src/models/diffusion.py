@@ -234,8 +234,8 @@ class CityJSONDiffusionModule(L.LightningModule):
     # Forward / Training / Validation
     # ------------------------------------------------------------------
 
-    def forward(self, X_t, R_t, Y_t, node_mask=None):
-        return self.network(X_t, R_t, Y_t, node_mask)
+    def forward(self, X_t, R_t, Y_t, t, node_mask=None):
+        return self.network(X_t, R_t, Y_t, t, node_mask)
 
     def training_step(self, batch, batch_idx):
         """
@@ -259,7 +259,7 @@ class CityJSONDiffusionModule(L.LightningModule):
         nodes_count = node_mask.sum(dim=1, keepdim=True).unsqueeze(-1) + 1e-6
         eps = eps - eps.sum(dim=1, keepdim=True) / nodes_count
             
-        Rt = alpha_bar * R0 + sigma_bar * eps
+        Rt = torch.sqrt(alpha_bar) * R0 + sigma_bar * eps
         
         # 3. Corrupt adjacency matrices Y0 -> Yt (discrete diffusion)
         Yt = self._discrete_forward_diffuse(Y0, alpha_bar)
@@ -268,7 +268,7 @@ class CityJSONDiffusionModule(L.LightningModule):
         Xt = self._categorical_forward_diffuse(X0, alpha_bar)
         
         # 5. Predict clean graph from noised state
-        R_pred, Y_pred, X_pred = self(Xt, Rt, Yt, node_mask=None)
+        R_pred, Y_pred, X_pred = self(Xt, Rt, Yt, t, node_mask=node_mask)
         
         # 6. Compute loss components
         coord_loss = F.mse_loss(
@@ -314,11 +314,11 @@ class CityJSONDiffusionModule(L.LightningModule):
         nodes_count = node_mask.sum(dim=1, keepdim=True).unsqueeze(-1) + 1e-6
         eps = eps - eps.sum(dim=1, keepdim=True) / nodes_count
             
-        Rt = alpha_bar * R0 + sigma_bar * eps
+        Rt = torch.sqrt(alpha_bar) * R0 + sigma_bar * eps
         Yt = self._discrete_forward_diffuse(Y0, alpha_bar)
         Xt = self._categorical_forward_diffuse(X0, alpha_bar)
         
-        R_pred, Y_pred, X_pred = self(Xt, Rt, Yt, node_mask=None)
+        R_pred, Y_pred, X_pred = self(Xt, Rt, Yt, t, node_mask=node_mask)
         
         val_mse = F.mse_loss(
             R_pred * node_mask.unsqueeze(-1),
@@ -334,6 +334,47 @@ class CityJSONDiffusionModule(L.LightningModule):
         self.log("val_coord_mse", val_mse, on_epoch=True, prog_bar=True)
         self.log("val_node_acc", node_acc, on_epoch=True, prog_bar=True)
         return val_mse
+
+    def test_step(self, batch, batch_idx):
+        R0 = batch["x"]
+        X0 = batch["node_categories"]
+        Y0 = batch["y"]
+        node_mask = batch["node_mask"]
+        B, N, _ = R0.shape
+
+        t = torch.full((B,), self.T // 2, dtype=torch.long, device=self.device)
+        alpha_bar = self.alphas_bar[t].view(B, 1, 1)
+        sigma_bar = torch.sqrt(1.0 - alpha_bar)
+
+        eps = torch.randn_like(R0)
+        eps = eps * node_mask.unsqueeze(-1)
+        nodes_count = node_mask.sum(dim=1, keepdim=True).unsqueeze(-1) + 1e-6
+        eps = eps - eps.sum(dim=1, keepdim=True) / nodes_count
+
+        Rt = torch.sqrt(alpha_bar) * R0 + sigma_bar * eps
+        Yt = self._discrete_forward_diffuse(Y0, alpha_bar)
+        Xt = self._categorical_forward_diffuse(X0, alpha_bar)
+
+        R_pred, Y_pred, X_pred = self(Xt, Rt, Yt, t, node_mask=node_mask)
+
+        test_mse = F.mse_loss(
+            R_pred * node_mask.unsqueeze(-1),
+            R0 * node_mask.unsqueeze(-1),
+            reduction='sum'
+        )
+        test_mse = test_mse / (node_mask.sum() * 3.0 + 1e-6)
+
+        target_edges = Y0.squeeze(-1)
+        edge_loss = F.binary_cross_entropy_with_logits(Y_pred, target_edges, reduction='mean')
+
+        node_target = X0.argmax(dim=-1)
+        node_preds = X_pred.argmax(dim=-1)
+        node_acc = (node_preds == node_target).float().mean()
+
+        self.log("test_coord_mse", test_mse, on_epoch=True, prog_bar=True)
+        self.log("test_edge_bce", edge_loss, on_epoch=True)
+        self.log("test_node_acc", node_acc, on_epoch=True, prog_bar=True)
+        return test_mse
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
@@ -398,7 +439,8 @@ class CityJSONDiffusionModule(L.LightningModule):
             Xt = F.one_hot(rand_indices, C).float()
         
         for t_idx in reversed(range(1, self.T + 1)):
-            R_pred, Y_pred, X_pred = self(Xt, Rt, Yt, node_mask=None)
+            t_tensor = torch.full((batch_size,), t_idx, dtype=torch.long, device=self.device)
+            R_pred, Y_pred, X_pred = self(Xt, Rt, Yt, t_tensor)
             
             alpha_bar_t = self.alphas_bar[t_idx]
             alpha_bar_prev = self.alphas_bar[t_idx - 1]
@@ -418,6 +460,9 @@ class CityJSONDiffusionModule(L.LightningModule):
                 Rt = mu + sigma.view(-1, 1, 1) * z
             else:
                 Rt = mu
+            
+            # Re-center coordinates to prevent drift
+            Rt = Rt - Rt.mean(dim=1, keepdim=True)
                 
             Yt = self._discrete_posterior_sample(Y_pred, Yt, alpha_bar_t, alpha_bar_prev, t_idx)
             Xt = self._categorical_posterior_sample(X_pred, Xt, alpha_bar_t, alpha_bar_prev, t_idx)
