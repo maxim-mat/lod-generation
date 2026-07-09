@@ -96,6 +96,10 @@ class rEGNNLayer(nn.Module):
         coord_msg = coord_weights * R_diff  # [B, N, N, 3]
         R_update = coord_msg.sum(dim=2)  # [B, N, 3]
         
+        # Normalize by number of active neighbors to keep updates O(1)
+        num_neighbors = node_mask.sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1)  # [B, 1, 1]
+        R_update = R_update / num_neighbors
+        
         R_new = R + R_update
         
         # Projection onto zero-CoM subspace
@@ -240,6 +244,11 @@ class rEGNNTransformer(nn.Module):
         coord_weights = self.coord_head(h_pair)        # [B, N, N, 1]
         coord_weights = coord_weights * pair_mask
         R_update = (coord_weights * R_diff).sum(dim=2)  # [B, N, 3]
+        
+        # Normalize by number of active neighbors to keep updates O(1)
+        num_neighbors = node_mask.sum(dim=1, keepdim=True).unsqueeze(-1).clamp(min=1)  # [B, 1, 1]
+        R_update = R_update / num_neighbors
+        
         R_pred = R + R_update
         
         # Center the final predicted coordinates
