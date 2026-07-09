@@ -136,9 +136,20 @@ class NodeEdgeBlock(nn.Module):
         pairwise_dist = torch.cdist(pos, pos).unsqueeze(-1).float()
         cosines = torch.sum(normalized_pos.unsqueeze(1) * normalized_pos.unsqueeze(2), dim=-1, keepdim=True)
         pos_info = torch.cat((pairwise_dist, cosines), dim=-1)
+        node_info = norm_pos
 
-        norm1 = self.lin_norm_pos1(norm_pos)
-        norm2 = self.lin_norm_pos2(norm_pos)
+        if self.equivariance == "so2":
+            # Yaw-invariant, but not O(3)-invariant: the height of a node and the
+            # vertical/horizontal split of each displacement. |dz| rather than dz
+            # keeps the pair features symmetric in (i, j), as E must be.
+            z = pos[..., 2:3]                                            # [B, N, 1]
+            dz = (z.unsqueeze(1) - z.unsqueeze(2)).abs()                 # [B, N, N, 1]
+            horiz_dist = torch.cdist(pos[..., :2], pos[..., :2]).unsqueeze(-1).float()
+            pos_info = torch.cat((pos_info, dz, horiz_dist), dim=-1)
+            node_info = torch.cat((norm_pos, z), dim=-1)
+
+        norm1 = self.lin_norm_pos1(node_info)
+        norm2 = self.lin_norm_pos2(node_info)
         dist1 = F.relu(self.lin_dist1(pos_info) + norm1.unsqueeze(2) + norm2.unsqueeze(1)) * e_mask1 * e_mask2
 
         # 1. Edges: FiLM in the node features, the geometry, then the globals.
@@ -202,9 +213,9 @@ class XEyTransformerLayer(nn.Module):
     """Pre-attention block + feed-forward, with SE3Norm on the position update."""
 
     def __init__(self, dx, de, dy, n_head, dim_ffX=256, dim_ffE=64, dim_ffy=256,
-                 dropout=0.1, layer_norm_eps=1e-5):
+                 dropout=0.1, layer_norm_eps=1e-5, equivariance="so2"):
         super().__init__()
-        self.self_attn = NodeEdgeBlock(dx, de, dy, n_head)
+        self.self_attn = NodeEdgeBlock(dx, de, dy, n_head, equivariance=equivariance)
 
         self.linX1 = Linear(dx, dim_ffX)
         self.linX2 = Linear(dim_ffX, dx)
@@ -262,7 +273,7 @@ class rEGNNTransformer(nn.Module):
 
     def __init__(self, num_node_classes=2, num_edge_classes=2, hidden_dim=64,
                  edge_dim=32, global_dim=32, n_head=8, num_layers=4, pos_mlp_dim=16,
-                 dropout=0.1):
+                 dropout=0.1, equivariance="so2"):
         """
         Args:
             num_node_classes (int): Node categories (Active / Virtual).
@@ -274,6 +285,8 @@ class rEGNNTransformer(nn.Module):
             n_head (int): Attention heads.
             num_layers (int): Number of XEyTransformerLayer blocks.
             pos_mlp_dim (int): Hidden width of the input/output PositionsMLP.
+            equivariance (str): 'so2' (yaw only, buildings have a canonical
+                vertical) or 'o3' (faithful MiDi). See the module docstring.
         """
         super().__init__()
         self.num_node_classes = num_node_classes
@@ -296,7 +309,7 @@ class rEGNNTransformer(nn.Module):
             XEyTransformerLayer(
                 dx=hidden_dim, de=edge_dim, dy=global_dim, n_head=n_head,
                 dim_ffX=hidden_dim, dim_ffE=edge_dim, dim_ffy=2 * global_dim,
-                dropout=dropout,
+                dropout=dropout, equivariance=equivariance,
             )
             for _ in range(num_layers)
         ])

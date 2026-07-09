@@ -68,9 +68,13 @@ class CityJSONDiffusionModule(L.LightningModule):
         x_marginals = torch.as_tensor(x_marginals, dtype=torch.float32)
         e_marginals = torch.as_tensor(e_marginals, dtype=torch.float32)
 
+        # ponytail: one knob drives both X and E transitions. GraphNoiseModel keeps
+        # them separate so they can be ablated independently -- add two config
+        # fields when that ablation is actually run.
         self.noise = GraphNoiseModel(
             T=T, x_marginals=x_marginals, e_marginals=e_marginals,
-            transition=discrete_noise_type, nu_pos=nu_pos, nu_x=nu_x, nu_e=nu_e,
+            transition_x=discrete_noise_type, transition_e=discrete_noise_type,
+            nu_pos=nu_pos, nu_x=nu_x, nu_e=nu_e,
         )
 
         self.network = rEGNNTransformer(
