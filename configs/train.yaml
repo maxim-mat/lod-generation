@@ -18,9 +18,19 @@ data:
 model:
   num_node_classes: 2
   hidden_dim: 64
+  edge_dim: 32
+  global_dim: 32
+  n_head: 8
   num_layers: 4
+  dropout: 0.1
   T: 500
-  discrete_noise_type: uniform
+  discrete_noise_type: marginal
+  nu_pos: 2.5
+  nu_x: 1.0
+  nu_e: 1.5
+  lambda_pos: 3.0
+  lambda_x: 0.4
+  lambda_e: 2.0
 
 # Training settings
 training:

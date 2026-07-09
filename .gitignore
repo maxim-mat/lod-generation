@@ -222,3 +222,7 @@ __marimo__/
 /anaconda_projects
 /.vscode
 /outputs
+/.claude
+AGENTS.md
+CLAUDE.md
+/tests

@@ -17,3 +17,4 @@ rich>=13.0.0  # Optional, but nice for progress bars
 
 # Development & Notebooks
 jupyter>=1.0.0
+pytest>=7.0.0

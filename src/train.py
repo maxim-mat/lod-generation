@@ -42,7 +42,12 @@ def train(cfg: Config):
     )
     
     logger.info("Creating Model...")
-    model = create_model(cfg, resolved_n_max)
+    x_marginals, e_marginals = datamodule.compute_marginals()
+    logger.info(
+        "Train-split marginals: nodes (active, virtual)=%s, edges (none, edge)=%s",
+        x_marginals.tolist(), e_marginals.tolist(),
+    )
+    model = create_model(cfg, resolved_n_max, x_marginals=x_marginals, e_marginals=e_marginals)
     
     logger.info("Creating loggers and callbacks...")
     exp_loggers = create_loggers(cfg, save_dir)

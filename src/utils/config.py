@@ -14,12 +14,28 @@ class DataConfig:
 
 @dataclass
 class ModelConfig:
-    """Configuration for model architecture."""
+    """Configuration for model architecture and the diffusion noise schedule."""
     num_node_classes: int = 2
-    hidden_dim: int = 64
+    hidden_dim: int = 64      # dx: node channel width, must be divisible by n_head
+    edge_dim: int = 32        # de: edge channel width; drives [B,N,N,de] memory
+    global_dim: int = 32      # dy: global feature width
+    n_head: int = 8
     num_layers: int = 4
+    dropout: float = 0.1
     T: int = 500
-    discrete_noise_type: str = "uniform"  # "uniform", "absorbing", "discretized_gaussian"
+    # "marginal" = limit distribution is the training class marginals (MiDi default)
+    discrete_noise_type: str = "marginal"  # "marginal" | "uniform"
+
+    # Cosine schedule exponent per feature (positions, node classes, edges).
+    # nu_pos > nu_e destroys coordinates faster than graph structure.
+    nu_pos: float = 2.5
+    nu_x: float = 1.0
+    nu_e: float = 1.5
+
+    # Loss weights, MiDi's lambda_train restricted to (pos, X, E).
+    lambda_pos: float = 3.0
+    lambda_x: float = 0.4
+    lambda_e: float = 2.0
 
 @dataclass
 class EarlyStoppingConfig:

@@ -92,6 +92,45 @@ class CityJSONDataModule(L.LightningDataModule):
                 generator=generator,
             )
 
+    def compute_marginals(self):
+        """Empirical node/edge class frequencies over the training split.
+
+        These define the limit distribution of the discrete diffusion when
+        `discrete_noise_type='marginal'` (MiDi's default). Computed on the train
+        split only, so the val/test splits do not leak into the noise schedule.
+
+        Returns:
+            tuple[Tensor, Tensor]: node marginals [num_node_classes] over
+            (Active, Virtual), and edge marginals [2] over (no-edge, edge)
+            counted across off-diagonal entries of the padded adjacency.
+        """
+        if self.train_dataset is None:
+            raise RuntimeError("compute_marginals() requires setup() to have run first.")
+
+        node_counts = None
+        edge_counts = torch.zeros(2, dtype=torch.float64)
+
+        for item in self.train_dataset:
+            # Multi-LOD datasets yield a tuple; the model trains on the first LOD.
+            if isinstance(item, tuple):
+                item = item[0]
+
+            categories = item["node_categories"]
+            if node_counts is None:
+                node_counts = torch.zeros(categories.shape[-1], dtype=torch.float64)
+            node_counts += categories.sum(dim=0).double()
+
+            adjacency = item["y"].squeeze(-1)
+            n = adjacency.shape[0]
+            off_diag = ~torch.eye(n, dtype=torch.bool)
+            edges = adjacency[off_diag]
+            edge_counts[1] += edges.sum().double()
+            edge_counts[0] += edges.numel() - edges.sum().double()
+
+        x_marginals = (node_counts / node_counts.sum()).float()
+        e_marginals = (edge_counts / edge_counts.sum()).float()
+        return x_marginals, e_marginals
+
     def train_dataloader(self):
         return DataLoader(
             self.train_dataset,

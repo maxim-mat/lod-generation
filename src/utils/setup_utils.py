@@ -27,12 +27,21 @@ def create_datamodule(cfg: Config) -> CityJSONDataModule:
     )
 
 
-def create_model(cfg: Config, n_max: int) -> CityJSONDiffusionModule:
-    """Create CityJSON Diffusion Module from configuration."""
+def create_model(cfg: Config, n_max: int, x_marginals=None, e_marginals=None) -> CityJSONDiffusionModule:
+    """Create CityJSON Diffusion Module from configuration.
+
+    Args:
+        x_marginals, e_marginals: training-split class frequencies, required for
+            the 'marginal' transition. Fall back to uniform when omitted.
+    """
     return CityJSONDiffusionModule(
         num_node_classes=cfg.model.num_node_classes,
         hidden_dim=cfg.model.hidden_dim,
+        edge_dim=cfg.model.edge_dim,
+        global_dim=cfg.model.global_dim,
+        n_head=cfg.model.n_head,
         num_layers=cfg.model.num_layers,
+        dropout=cfg.model.dropout,
         T=cfg.model.T,
         lr=cfg.training.lr,
         discrete_noise_type=cfg.model.discrete_noise_type,
@@ -40,6 +49,14 @@ def create_model(cfg: Config, n_max: int) -> CityJSONDiffusionModule:
         lr_scheduler=cfg.training.lr_scheduler,
         lr_decay_steps=cfg.training.lr_decay_steps,
         lr_decay_rate=cfg.training.lr_decay_rate,
+        x_marginals=x_marginals,
+        e_marginals=e_marginals,
+        nu_pos=cfg.model.nu_pos,
+        nu_x=cfg.model.nu_x,
+        nu_e=cfg.model.nu_e,
+        lambda_pos=cfg.model.lambda_pos,
+        lambda_x=cfg.model.lambda_x,
+        lambda_e=cfg.model.lambda_e,
     )
 
 
