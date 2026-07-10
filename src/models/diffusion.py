@@ -64,6 +64,9 @@ class CityJSONDiffusionModule(L.LightningModule):
         self.lr = lr
         self.n_max = n_max
         self.coord_scale = float(coord_scale)
+        # Batches dropped for a non-finite loss. Not a buffer: it describes this
+        # run, not the model, and must not travel with a checkpoint.
+        self._nonfinite_skips = 0
         self.num_node_classes = num_node_classes
         self.lr_scheduler = lr_scheduler
         self.lr_decay_steps = lr_decay_steps
@@ -175,13 +178,47 @@ class CityJSONDiffusionModule(L.LightningModule):
         sq_err = ((R_pred - R0) ** 2 * mask).sum()
         return sq_err / (mask.sum() * 3.0 + 1e-6)
 
+    def _skip_nonfinite_batch(self, batch_idx, total, coord_loss, node_loss, edge_loss):
+        """Drop a batch whose loss is not finite, loudly.
+
+        A single NaN or inf reaching backward fills every gradient with NaN, and
+        AdamW then writes NaN into every parameter and both moment buffers; the
+        model never recovers. Returning None makes Lightning skip backward and the
+        optimizer step, leaving the weights untouched.
+
+        Caveat: if the parameters are *already* non-finite, every subsequent batch
+        is skipped too and the run will make no progress while still looking alive.
+        `train_nonfinite_skips` climbing step-for-step is that failure.
+        """
+        self._nonfinite_skips += 1
+        logger.warning(
+            "Non-finite training loss at epoch %d, batch %d (global step %d): "
+            "total=%s coord_mse=%s node_ce=%s edge_ce=%s. "
+            "Skipping the optimizer step; %d batch(es) skipped so far.",
+            self.current_epoch, batch_idx, self.global_step,
+            total.item(), coord_loss.item(), node_loss.item(), edge_loss.item(),
+            self._nonfinite_skips,
+        )
+        self._log_nonfinite_skips()
+        return None
+
+    def _log_nonfinite_skips(self):
+        # Logged every step, not just on failure, so the wandb series is a
+        # continuous line that steps up rather than a scatter of isolated points.
+        self.log("train_nonfinite_skips", float(self._nonfinite_skips),
+                 on_step=True, on_epoch=False, prog_bar=True)
+
     def training_step(self, batch, batch_idx):
         total, coord_loss, node_loss, edge_loss, *_ = self._shared_step(batch)
+
+        if not torch.isfinite(total):
+            return self._skip_nonfinite_batch(batch_idx, total, coord_loss, node_loss, edge_loss)
 
         self.log("train_loss", total, on_step=True, on_epoch=True, prog_bar=True)
         self.log("train_coord_mse", coord_loss, on_epoch=True, prog_bar=True)
         self.log("train_edge_ce", edge_loss, on_epoch=True)
         self.log("train_node_ce", node_loss, on_epoch=True)
+        self._log_nonfinite_skips()
         return total
 
     def _eval_step(self, batch, prefix):
