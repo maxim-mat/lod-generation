@@ -47,7 +47,16 @@ def train(cfg: Config):
         "Train-split marginals: nodes (active, virtual)=%s, edges (none, edge)=%s",
         x_marginals.tolist(), e_marginals.tolist(),
     )
-    model = create_model(cfg, resolved_n_max, x_marginals=x_marginals, e_marginals=e_marginals)
+
+    coord_scale = cfg.data.coord_scale
+    if coord_scale is None:
+        coord_scale = datamodule.compute_coord_scale()
+        logger.info("Coordinate scale from train split: %.6f m/unit", coord_scale)
+    else:
+        logger.info("Coordinate scale from config: %.6f m/unit", coord_scale)
+
+    model = create_model(cfg, resolved_n_max, x_marginals=x_marginals,
+                         e_marginals=e_marginals, coord_scale=coord_scale)
     
     logger.info("Creating loggers and callbacks...")
     exp_loggers = create_loggers(cfg, save_dir)
@@ -71,6 +80,8 @@ def train(cfg: Config):
     if exp_loggers:
         from omegaconf import OmegaConf
         hparams = OmegaConf.to_container(OmegaConf.structured(cfg), resolve=True)
+        # Log the resolved scale, not the `null` placeholder that asked for it.
+        hparams["data"]["coord_scale"] = coord_scale
         for lg in trainer.loggers:
             lg.log_hyperparams(hparams)
             

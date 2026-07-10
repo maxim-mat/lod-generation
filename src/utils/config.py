@@ -11,6 +11,9 @@ class DataConfig:
     num_workers: int = 4
     n_max: Optional[int] = None
     upper_limit_nodes: Optional[int] = None
+    # Metres per unit of the model's coordinate space. None = compute the pooled
+    # std of the train split. Set explicitly to reuse a scale across runs.
+    coord_scale: Optional[float] = None
 
 @dataclass
 class ModelConfig:

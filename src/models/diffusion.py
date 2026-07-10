@@ -34,7 +34,8 @@ class CityJSONDiffusionModule(L.LightningModule):
                  edge_dim=32, global_dim=32, n_head=8, dropout=0.1,
                  x_marginals=None, e_marginals=None,
                  nu_pos=2.5, nu_x=1.0, nu_e=1.5,
-                 lambda_pos=3.0, lambda_x=0.4, lambda_e=2.0):
+                 lambda_pos=3.0, lambda_x=0.4, lambda_e=2.0,
+                 coord_scale=1.0):
         """
         Args:
             discrete_noise_type (str): 'marginal' (limit distribution = training
@@ -46,13 +47,23 @@ class CityJSONDiffusionModule(L.LightningModule):
             nu_pos, nu_x, nu_e (float): Cosine schedule exponents per feature.
                 nu_pos > nu_e destroys coordinates faster than graph structure.
             lambda_pos, lambda_x, lambda_e (float): Loss weights.
+            coord_scale (float): Metres per unit of the model's coordinate space.
+                Targets are divided by it so the data matches the unit-variance
+                Gaussian the position diffusion noises towards; `generate_cityjson`
+                multiplies by it to return metres. Obtain it from
+                `CityJSONDataModule.compute_coord_scale()`. Saved as a
+                hyperparameter, so inference restores it from the checkpoint.
         """
         super().__init__()
         self.save_hyperparameters()
 
+        if coord_scale <= 0:
+            raise ValueError(f"coord_scale must be positive, got {coord_scale}.")
+
         self.T = T
         self.lr = lr
         self.n_max = n_max
+        self.coord_scale = float(coord_scale)
         self.num_node_classes = num_node_classes
         self.lr_scheduler = lr_scheduler
         self.lr_decay_steps = lr_decay_steps
@@ -110,8 +121,12 @@ class CityJSONDiffusionModule(L.LightningModule):
         return (R0 - mean) * mask
 
     def _prepare(self, batch):
-        """Unpack a batch into clean (pos, X, E) plus the network's node mask."""
-        R0 = self._centre_positions(batch["x"], batch["node_mask"])
+        """Unpack a batch into clean (pos, X, E) plus the network's node mask.
+
+        Positions come back in scaled units (metres / `coord_scale`), which is the
+        space the whole diffusion -- and therefore every coordinate metric -- lives in.
+        """
+        R0 = self._centre_positions(batch["x"], batch["node_mask"]) / self.coord_scale
         X0 = batch["node_categories"]
         E0 = zero_diagonal(
             F.one_hot(batch["y"].squeeze(-1).long(), NUM_EDGE_CLASSES).float()
@@ -231,7 +246,8 @@ class CityJSONDiffusionModule(L.LightningModule):
         """Run the reverse chain from the limit distribution.
 
         Returns:
-            pos (Tensor): [B, n_max, 3] coordinates.
+            pos (Tensor): [B, n_max, 3] coordinates, in scaled units. Multiply by
+                `coord_scale` for metres.
             edge_probs (Tensor): [B, n_max, n_max] the sampled adjacency, in {0, 1}.
             active_mask (Tensor): [B, n_max] bool, True where the node is Active.
         """
@@ -279,7 +295,8 @@ class CityJSONDiffusionModule(L.LightningModule):
                 logger.warning(f"Building {i} has only {len(active_indices)} active nodes, skipping.")
                 continue
 
-            nodes = Rt[i, active_indices].cpu().numpy()
+            # The chain runs in scaled units; CityJSON is metres.
+            nodes = (Rt[i, active_indices] * self.coord_scale).cpu().numpy()
             edges = edge_probs[i][active_indices][:, active_indices].cpu().numpy()
 
             cj = graph_to_cityjson(

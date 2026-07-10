@@ -20,6 +20,10 @@ data:
   n_max: null              # null = auto-detect from dataset
   num_workers: 0
   upper_limit_nodes: null  # null = no limit
+  # Metres per unit of the model's coordinate space; targets are divided by it so
+  # the data matches the unit-variance prior the position diffusion noises toward.
+  # null = pooled std of the train split (~4.3 m on The Hague LOD2).
+  coord_scale: null
 
 # --- Model ------------------------------------------------------------------
 model:

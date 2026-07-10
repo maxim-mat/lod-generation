@@ -27,12 +27,15 @@ def create_datamodule(cfg: Config) -> CityJSONDataModule:
     )
 
 
-def create_model(cfg: Config, n_max: int, x_marginals=None, e_marginals=None) -> CityJSONDiffusionModule:
+def create_model(cfg: Config, n_max: int, x_marginals=None, e_marginals=None,
+                 coord_scale: float = 1.0) -> CityJSONDiffusionModule:
     """Create CityJSON Diffusion Module from configuration.
 
     Args:
         x_marginals, e_marginals: training-split class frequencies, required for
             the 'marginal' transition. Fall back to uniform when omitted.
+        coord_scale: metres per unit of the model's coordinate space, from
+            `CityJSONDataModule.compute_coord_scale()`.
     """
     return CityJSONDiffusionModule(
         num_node_classes=cfg.model.num_node_classes,
@@ -57,6 +60,7 @@ def create_model(cfg: Config, n_max: int, x_marginals=None, e_marginals=None) ->
         lambda_pos=cfg.model.lambda_pos,
         lambda_x=cfg.model.lambda_x,
         lambda_e=cfg.model.lambda_e,
+        coord_scale=coord_scale,
     )
 
 
