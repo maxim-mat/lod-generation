@@ -17,6 +17,8 @@ same degree-2 term. It survives there because molecular coordinates are Angstrom
 (scale ~1-2, narrow spread across molecules) and padding is masked out of the
 pooled statistics.
 """
+import math
+
 import pytest
 import torch
 import torch.nn as nn
@@ -89,3 +91,109 @@ def test_pooled_spread_gradient_is_finite_at_zero_variance():
     x = torch.ones(B, N, D, requires_grad=True)  # variance is exactly zero
     _xtoy_spread(x).sum().backward()
     assert torch.isfinite(x.grad).all(), "non-finite gradient through a zero-variance input"
+
+
+# --- end-to-end regression -------------------------------------------------
+# The conditions that killed gptwstyp: the real model size, a weight state drifted
+# away from init, and a batch holding the largest building in the dataset.
+
+N_MAX, BATCH, N_ACTIVE = 100, 2, 20
+WEIGHT_DRIFT = 4.0
+# Largest trainable building in The Hague LOD2 spans ~154 m, i.e. a coordinate
+# std of ~17 m. Raw metres, so this exercises the network, not the coord scaling.
+LARGEST_BUILDING_COORD_STD = 17.0
+
+
+def _drifted_model(weight_scale):
+    from src.models.diffusion import CityJSONDiffusionModule
+
+    torch.manual_seed(0)
+    model = CityJSONDiffusionModule(
+        n_max=N_MAX, hidden_dim=64, edge_dim=32, global_dim=32, n_head=8,
+        num_layers=4, T=500, dropout=0.0,
+        x_marginals=torch.tensor([0.2001, 0.7999]),
+        e_marginals=torch.tensor([0.9936, 0.0064]),
+    )
+    with torch.no_grad():
+        for module in model.network.modules():
+            if isinstance(module, nn.Linear):
+                module.weight.mul_(weight_scale)
+                if module.bias is not None:
+                    module.bias.mul_(weight_scale)
+    return model
+
+
+def _large_building_batch(coord_std):
+    torch.manual_seed(1)
+    x = torch.zeros(BATCH, N_MAX, 3)
+    node_mask = torch.zeros(BATCH, N_MAX)
+    node_categories = torch.zeros(BATCH, N_MAX, 2)
+    adjacency = torch.zeros(BATCH, N_MAX, N_MAX, 1)
+
+    for b in range(BATCH):
+        x[b, :N_ACTIVE] = torch.randn(N_ACTIVE, 3) * coord_std
+        node_mask[b, :N_ACTIVE] = 1.0
+        node_categories[b, :N_ACTIVE, 0] = 1.0
+        node_categories[b, N_ACTIVE:, 1] = 1.0
+        ring = torch.arange(N_ACTIVE)
+        adjacency[b, ring, (ring + 1) % N_ACTIVE, 0] = 1.0
+        adjacency[b, (ring + 1) % N_ACTIVE, ring, 0] = 1.0
+
+    return {"x": x, "node_categories": node_categories, "y": adjacency, "node_mask": node_mask}
+
+
+def test_forward_and_backward_stay_finite_for_a_large_building_under_weight_drift():
+    """The exact regression: fp32 overflow in the global-feature branch.
+
+    Before the pooled-std fix this overflowed the forward pass, `LayerNorm(inf)`
+    returned NaN, and AdamW propagated NaN into every parameter.
+    """
+    model = _drifted_model(WEIGHT_DRIFT)
+    batch = _large_building_batch(LARGEST_BUILDING_COORD_STD)
+    t_int = torch.full((BATCH, 1), 250, dtype=torch.long)
+
+    total, coord_loss, node_loss, edge_loss = model._shared_step(batch, t_int=t_int)[:4]
+
+    assert torch.isfinite(total), (
+        f"forward overflowed: total={total.item()} coord={coord_loss.item()} "
+        f"node={node_loss.item()} edge={edge_loss.item()}"
+    )
+
+    total.backward()
+    nonfinite = [
+        name for name, p in model.named_parameters()
+        if p.grad is not None and not torch.isfinite(p.grad).all()
+    ]
+    assert not nonfinite, f"non-finite gradients in: {nonfinite[:5]}"
+
+
+def test_global_feature_branch_keeps_headroom_before_fp32_overflows():
+    """`y_out` is where the overflow surfaced, so it must stay far from fp32 max.
+
+    Under this same stress the upstream variance reaches 3.8e27 in layer 0 and
+    NaN thereafter; the pooled std peaks at 3.7e10. Asserting headroom rather
+    than a tuned constant keeps the test meaningful if the model is resized.
+
+    Note the peak is still large: that is raw metres talking, and it is what
+    `coord_scale` is for. This test deliberately leaves coordinates unscaled so
+    it exercises the network in isolation.
+    """
+    model = _drifted_model(WEIGHT_DRIFT)
+    batch = _large_building_batch(LARGEST_BUILDING_COORD_STD)
+
+    peaks = {}
+    for i, layer in enumerate(model.network.tf_layers):
+        layer.self_attn.y_out.register_forward_hook(
+            lambda _m, _i, out, i=i: peaks.__setitem__(i, out.abs().max().item())
+        )
+
+    with torch.no_grad():
+        model._shared_step(batch, t_int=torch.full((BATCH, 1), 250, dtype=torch.long))
+
+    assert all(math.isfinite(v) for v in peaks.values()), f"y_out overflowed: {peaks}"
+
+    headroom = torch.finfo(torch.float32).max / max(peaks.values())
+    assert headroom > 1e20, (
+        f"global-feature branch is amplifying: peaks={peaks}, "
+        f"only {headroom:.1e}x headroom before fp32 overflows"
+    )
