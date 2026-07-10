@@ -14,6 +14,11 @@ import torch.nn as nn
 from torch.nn import init
 
 
+# Guards the sqrt below: d/dv sqrt(v) is unbounded as v -> 0, and a constant
+# feature across nodes has exactly zero variance.
+_VAR_EPS = 1e-6
+
+
 def remove_mean_with_mask(x, node_mask):
     """Project onto the zero centre-of-mass subspace, ignoring padded nodes.
 
@@ -80,7 +85,15 @@ class PositionsMLP(nn.Module):
 
 
 class Xtoy(nn.Module):
-    """Map node features to global features."""
+    """Map node features to global features.
+
+    Deviates from MiDi: upstream pools a *variance* alongside mean/min/max and
+    feeds all four to one Linear. The variance is degree 2 in the activations
+    while its siblings are degree 1, which makes the global-feature branch
+    overflow fp32 once activations leave the O(1) range molecules keep them in.
+    Taking the square root restores a common scale; a standard deviation carries
+    the same information as a variance.
+    """
 
     def __init__(self, dx, dy):
         super().__init__()
@@ -92,12 +105,16 @@ class Xtoy(nn.Module):
         m = X.sum(dim=1) / torch.sum(x_mask, dim=1)
         mi = (X + 1e5 * float_imask).min(dim=1)[0]
         ma = (X - 1e5 * float_imask).max(dim=1)[0]
-        std = torch.sum(((X - m[:, None, :]) ** 2) * x_mask, dim=1) / torch.sum(x_mask, dim=1)
+        var = torch.sum(((X - m[:, None, :]) ** 2) * x_mask, dim=1) / torch.sum(x_mask, dim=1)
+        std = torch.sqrt(var + _VAR_EPS)
         return self.lin(torch.hstack((m, mi, ma, std)))
 
 
 class Etoy(nn.Module):
-    """Map edge features to global features."""
+    """Map edge features to global features.
+
+    Pools a standard deviation rather than MiDi's variance; see `Xtoy`.
+    """
 
     def __init__(self, d, dy):
         super().__init__()
@@ -110,12 +127,16 @@ class Etoy(nn.Module):
         m = E.sum(dim=(1, 2)) / divide
         mi = (E + 1e5 * float_imask).min(dim=2)[0].min(dim=1)[0]
         ma = (E - 1e5 * float_imask).max(dim=2)[0].max(dim=1)[0]
-        std = torch.sum(((E - m[:, None, None, :]) ** 2) * mask, dim=(1, 2)) / divide
+        var = torch.sum(((E - m[:, None, None, :]) ** 2) * mask, dim=(1, 2)) / divide
+        std = torch.sqrt(var + _VAR_EPS)
         return self.lin(torch.hstack((m, mi, ma, std)))
 
 
 class EtoX(nn.Module):
-    """Aggregate edge features onto their incident nodes."""
+    """Aggregate edge features onto their incident nodes.
+
+    Pools a standard deviation rather than MiDi's variance; see `Xtoy`.
+    """
 
     def __init__(self, de, dx):
         super().__init__()
@@ -128,5 +149,6 @@ class EtoX(nn.Module):
         m = E.sum(dim=2) / torch.sum(e_mask2, dim=2)
         mi = (E + 1e5 * float_imask).min(dim=2)[0]
         ma = (E - 1e5 * float_imask).max(dim=2)[0]
-        std = torch.sum(((E - m[:, :, None, :]) ** 2) * e_mask2, dim=2) / torch.sum(e_mask2, dim=2)
+        var = torch.sum(((E - m[:, :, None, :]) ** 2) * e_mask2, dim=2) / torch.sum(e_mask2, dim=2)
+        std = torch.sqrt(var + _VAR_EPS)
         return self.lin(torch.cat((m, mi, ma, std), dim=2))
