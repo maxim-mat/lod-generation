@@ -21,6 +21,7 @@ def create_datamodule(cfg: Config) -> CityJSONDataModule:
         train_val_test_split=tuple(cfg.training.train_val_test_split),
         normalize_coords=cfg.data.normalize_coords,
         num_workers=cfg.data.num_workers,
+        persistent_workers=cfg.data.persistent_workers,
         n_max=cfg.data.n_max,
         seed=cfg.seed,
         upper_limit_nodes=cfg.data.upper_limit_nodes,

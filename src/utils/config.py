@@ -9,6 +9,8 @@ class DataConfig:
     lods: List[int] = field(default_factory=lambda: [1, 2])
     normalize_coords: bool = True
     num_workers: int = 4
+    # Keep DataLoader workers alive across epochs (ignored when num_workers=0).
+    persistent_workers: bool = False
     n_max: Optional[int] = None
     upper_limit_nodes: Optional[int] = None
     # Metres per unit of the model's coordinate space. None = compute the pooled
