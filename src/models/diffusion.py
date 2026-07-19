@@ -108,21 +108,28 @@ class CityJSONDiffusionModule(L.LightningModule):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _centre_positions(R0, node_mask):
-        """Move the active-node centre of mass to the origin, leaving virtual nodes at 0.
+    def _centre_positions(R0, node_categories, xy_only=False, z_shift=0.0):
+        """Centre real (vertex + face) nodes, leaving Off nodes at 0.
 
         The network is constrained to emit zero-CoM coordinates (PositionsMLP and
-        every layer re-centre), so the target must live on the same subspace or
-        the coordinate loss has an irreducible floor. The dataset centres each
-        building on its ground-surface footprint, whose mean is not the centroid.
+        every layer re-centre over all N slots), so the target must live on the
+        same subspace or the coordinate loss has an irreducible floor. Centering
+        over the real nodes and pinning Off slots to zero makes the all-N mean
+        exactly zero. The real mask is 1 - P(last class): the last class is
+        Off/Virtual in both the 5-class and legacy 2-class conventions.
 
-        Keeping virtual nodes at exactly 0 means the mean over all n_max nodes is
-        also 0, matching the invariant MiDi asserts on its dense batches.
+        Under se2 (`xy_only=True`) only the xy mean is removed — z keeps its
+        absolute value minus `z_shift` (the train-split mean vertex height), the
+        moment-matching analogue of the discrete marginal priors.
         """
-        mask = node_mask.unsqueeze(-1)
-        num_active = mask.sum(dim=1, keepdim=True).clamp(min=1)
-        mean = (R0 * mask).sum(dim=1, keepdim=True) / num_active
-        return (R0 - mean) * mask
+        real = (1.0 - node_categories[..., -1]).unsqueeze(-1)     # [B, N, 1]
+        num_real = real.sum(dim=1, keepdim=True).clamp(min=1)
+        mean = (R0 * real).sum(dim=1, keepdim=True) / num_real
+        if xy_only:
+            mean = torch.cat(
+                (mean[..., :2], torch.full_like(mean[..., 2:], z_shift)), dim=-1
+            )
+        return (R0 - mean) * real
 
     def _prepare(self, batch):
         """Unpack a batch into clean (pos, X, E) plus the network's node mask.
@@ -130,7 +137,7 @@ class CityJSONDiffusionModule(L.LightningModule):
         Positions come back in scaled units (metres / `coord_scale`), which is the
         space the whole diffusion -- and therefore every coordinate metric -- lives in.
         """
-        R0 = self._centre_positions(batch["x"], batch["node_mask"]) / self.coord_scale
+        R0 = self._centre_positions(batch["x"], batch["node_categories"]) / self.coord_scale
         X0 = batch["node_categories"]
         E0 = zero_diagonal(
             F.one_hot(batch["y"].squeeze(-1).long(), self.num_edge_classes).float()

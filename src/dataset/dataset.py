@@ -153,7 +153,8 @@ def parse_cityjson_file_to_graphs(filepath, normalize_coords=False):
     """Parses a single CityJSON file into a dict of Levi building graphs.
 
     Node order: the building's vertices (class VERTEX, 3D coords) followed by
-    one node per face outer ring (classes GROUND/ROOF/WALL, zero coords).
+    one node per face outer ring (classes GROUND/ROOF/WALL, positioned at
+    their ring centroid).
     Edges: EDGE_VV ring adjacency, EDGE_VF face membership; both directions.
     Face semantics come from the file, falling back to the face normal.
     """
@@ -194,6 +195,8 @@ def parse_cityjson_file_to_graphs(filepath, normalize_coords=False):
 
         x = np.zeros((n_vertices + len(faces), 3))
         x[:n_vertices] = coords
+        for f_i, (ring, _) in enumerate(faces):
+            x[n_vertices + f_i] = coords[[idx_map[v] for v in ring]].mean(axis=0)
         node_labels = [VERTEX] * n_vertices + [cls for _, cls in faces]
 
         edges = {}

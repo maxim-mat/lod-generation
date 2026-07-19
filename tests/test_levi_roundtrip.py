@@ -84,8 +84,13 @@ def test_parse_cube_levi_structure(tmp_path):
     assert (labels == GROUND).sum() == 1
     assert (labels == ROOF).sum() == 1
     assert (labels == WALL).sum() == 4
-    # face nodes carry no coordinates
-    assert torch.all(g["x"][8:] == 0)
+    # face nodes sit at their ring centroid
+    expected_centroids = torch.tensor(
+        np.array([np.mean([CUBE_VERTICES[v] for v in ring], axis=0)
+                  for ring, _ in CUBE_FACES]),
+        dtype=torch.float32,
+    )
+    assert torch.allclose(g["x"][8:], expected_centroids)
     # vertex coords are raw metres, uncentered
     assert torch.allclose(
         g["x"][:8], torch.tensor(CUBE_VERTICES, dtype=torch.float32)
