@@ -4,9 +4,23 @@ import logging
 from pathlib import Path
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 logger = logging.getLogger(__name__)
+
+# ==============================================================================
+# Levi graph classes
+# ==============================================================================
+# Nodes: vertices carry coordinates; each face of the building becomes its own
+# node whose class is its surface semantic; OFF pads to n_max.
+VERTEX, GROUND, ROOF, WALL, OFF = 0, 1, 2, 3, 4
+NUM_NODE_CLASSES = 5
+NODE_CLASS_NAMES = ("Vertex", "GroundSurface", "RoofSurface", "WallSurface", "Off")
+SURFACE_TO_CLASS = {"GroundSurface": GROUND, "RoofSurface": ROOF, "WallSurface": WALL}
+# Edges: ring adjacency between vertices, membership between a face and its vertices.
+EDGE_OFF, EDGE_VV, EDGE_VF = 0, 1, 2
+NUM_EDGE_CLASSES = 3
 
 # ==============================================================================
 # Helper functions for base footprint extraction & normalization
@@ -89,9 +103,59 @@ def get_base_center(geom_list, v_raw, active_vertex_indices):
     return np.array([cx, cy, cz], dtype=float)
 
 
-def parse_cityjson_file_to_graphs(filepath, normalize_coords=False):
+def surface_class_from_normal(ring_coords):
+    """Fallback face class when the file has no semantics.
+
+    Same snap thresholds as `straighten_face`: |nz| > 0.9 horizontal
+    (roof up / ground down), < 0.1 wall, sloped otherwise (roof if up).
+    Relies on the CityJSON convention that exterior rings wind CCW seen
+    from outside, i.e. outward normals.
     """
-    Parses a single CityJSON file into a list of building graph dicts.
+    n = np.zeros(3)
+    for i in range(len(ring_coords)):
+        n += np.cross(ring_coords[i], ring_coords[(i + 1) % len(ring_coords)])
+    norm = np.linalg.norm(n)
+    if norm < 1e-12:
+        return WALL
+    nz = n[2] / norm
+    if abs(nz) > 0.9:
+        return ROOF if nz > 0 else GROUND
+    if abs(nz) < 0.1:
+        return WALL
+    return ROOF if nz > 0 else WALL
+
+
+def _iter_faces(geom):
+    """Yield (outer_ring, semantic_type_or_None) for each surface of a geometry."""
+    boundaries = geom.get("boundaries", [])
+    gtype = geom.get("type")
+    sem = geom.get("semantics") or {}
+    surfaces = sem.get("surfaces") or []
+    values = sem.get("values") or []
+    if gtype == "Solid":
+        faces = [f for shell in boundaries for f in shell]
+        vals = [v for shell_vals in values for v in shell_vals] if values else []
+    elif gtype in ("MultiSurface", "CompositeSurface"):
+        faces, vals = boundaries, values
+    else:
+        return
+    for i, face in enumerate(faces):
+        if not face or len(face[0]) < 3:
+            continue
+        stype = None
+        if i < len(vals) and vals[i] is not None and vals[i] < len(surfaces):
+            s = surfaces[vals[i]]
+            stype = s.get("type") if s else None
+        yield face[0], stype
+
+
+def parse_cityjson_file_to_graphs(filepath, normalize_coords=False):
+    """Parses a single CityJSON file into a dict of Levi building graphs.
+
+    Node order: the building's vertices (class VERTEX, 3D coords) followed by
+    one node per face outer ring (classes GROUND/ROOF/WALL, zero coords).
+    Edges: EDGE_VV ring adjacency, EDGE_VF face membership; both directions.
+    Face semantics come from the file, falling back to the face normal.
     """
     with open(filepath, "r", encoding="utf-8") as f:
         cj = json.load(f)
@@ -109,53 +173,49 @@ def parse_cityjson_file_to_graphs(filepath, normalize_coords=False):
         if not geom_list:
             continue
 
-        edges = set()
-        active_vertex_indices = set()
-
-        # Traverse geometry elements to retrieve active vertices and edges
+        faces = []  # (original-index ring, node class)
         for geom in geom_list:
-            boundaries = geom.get("boundaries", [])
-            if geom["type"] == "Solid":
-                boundaries = [surface for shell in boundaries for surface in shell]
-            elif geom["type"] not in ["MultiSurface", "CompositeSurface"]:
-                continue
-
-            for surface in boundaries:
-                if not surface:
-                    continue
-                # The outer boundary ring is surface[0]
-                ring = surface[0]
-                for i in range(len(ring)):
-                    u = ring[i]
-                    v = ring[(i + 1) % len(ring)]
-                    active_vertex_indices.add(u)
-                    active_vertex_indices.add(v)
-                    edges.add((u, v))
-                    edges.add((v, u))
-
-        if not active_vertex_indices:
+            for ring, stype in _iter_faces(geom):
+                cls = SURFACE_TO_CLASS.get(stype)
+                if cls is None:
+                    cls = surface_class_from_normal(v_raw[ring])
+                faces.append((ring, cls))
+        if not faces:
             continue
 
-        # Map original vertex indices to local indices 0..N-1
-        sorted_active_vids = sorted(active_vertex_indices)
-        idx_map = {old_idx: new_idx for new_idx, old_idx in enumerate(sorted_active_vids)}
+        active = sorted({vid for ring, _ in faces for vid in ring})
+        idx_map = {old: new for new, old in enumerate(active)}
+        n_vertices = len(active)
 
-        node_features = np.array([v_raw[old_idx] for old_idx in sorted_active_vids])
-
+        coords = v_raw[active]
         # Normalize coordinates relative to base footprint center
         if normalize_coords:
-            base_center = get_base_center(geom_list, v_raw, active_vertex_indices)
-            node_features = node_features - base_center
+            coords = coords - get_base_center(geom_list, v_raw, set(active))
 
-        edge_index = np.array([[idx_map[u], idx_map[v]] for u, v in edges]).T
-        if edge_index.size == 0:
-            edge_index = np.empty((2, 0), dtype=np.int64)
+        x = np.zeros((n_vertices + len(faces), 3))
+        x[:n_vertices] = coords
+        node_labels = [VERTEX] * n_vertices + [cls for _, cls in faces]
+
+        edges = {}
+        for f_i, (ring, _) in enumerate(faces):
+            f_node = n_vertices + f_i
+            for k in range(len(ring)):
+                u, v = idx_map[ring[k]], idx_map[ring[(k + 1) % len(ring)]]
+                edges[(u, v)] = EDGE_VV
+                edges[(v, u)] = EDGE_VV
+                edges[(f_node, u)] = EDGE_VF
+                edges[(u, f_node)] = EDGE_VF
+
+        edge_index = np.array(list(edges.keys()), dtype=np.int64).T
+        edge_attr = np.array(list(edges.values()), dtype=np.int64)
 
         graphs[obj_id] = {
             "id": obj_id,
-            "x": torch.tensor(node_features, dtype=torch.float32),
+            "x": torch.tensor(x, dtype=torch.float32),
+            "node_labels": torch.tensor(node_labels, dtype=torch.long),
             "edge_index": torch.tensor(edge_index, dtype=torch.long),
-            "type": city_obj.get("type", "Unknown")
+            "edge_attr": torch.tensor(edge_attr, dtype=torch.long),
+            "type": city_obj.get("type", "Unknown"),
         }
 
     return graphs
@@ -163,8 +223,6 @@ def parse_cityjson_file_to_graphs(filepath, normalize_coords=False):
 # ==============================================================================
 # PyTorch Dataset Object
 # ==============================================================================
-
-NUM_NODE_CLASSES = 2  # 0 = Active, 1 = Virtual
 
 class CityJSONDataset(Dataset):
     def __init__(self, dataset_dir, lods, normalize_coords=False, transform=None,
@@ -288,14 +346,17 @@ class CityJSONDataset(Dataset):
 
     def _pad_graph(self, graph):
         """
-        Pads a variable-size graph to fixed N_max size and produces dense tensors
-        with Active/Virtual node categories.
-        
+        Pads a variable-size Levi graph to fixed N_max size as dense tensors.
+
         Returns a dict with:
-            "x":               [N_max, 3]        — coordinates (zero for virtual)
-            "node_categories": [N_max, 2]        — one-hot: [1,0]=Active, [0,1]=Virtual
-            "y":               [N_max, N_max, 1]  — dense adjacency (0 for virtual-involving)
-            "node_mask":       [N_max]            — 1=Active, 0=Virtual
+            "x":               [N_max, 3]        — coords (zero for face/off nodes)
+            "node_categories": [N_max, 5]        — one-hot over
+                                                   (vertex, ground, roof, wall, off)
+            "y":               [N_max, N_max, 1] — edge class labels
+                                                   (0=off, 1=vertex-vertex, 2=vertex-face)
+            "node_mask":       [N_max]           — 1 for vertex (coordinate-carrying)
+                                                   nodes; consumed by coordinate
+                                                   centring/metrics/scale only
             "id":              str
             "type":            str
         """
@@ -303,28 +364,24 @@ class CityJSONDataset(Dataset):
         edge_index = graph["edge_index"]  # [2, E]
         N = x.size(0)
         N_max = self.n_max
-        
-        # 1. Pad coordinates: active nodes keep their coords, virtual nodes get zeros
+
+        # 1. Pad coordinates: vertex nodes keep their coords, the rest are zeros
         x_padded = torch.zeros((N_max, 3), dtype=torch.float32)
         x_padded[:N] = x
-        
-        # 2. Node categories: one-hot [Active, Virtual]
-        #    Active = [1, 0], Virtual = [0, 1]
-        node_categories = torch.zeros((N_max, NUM_NODE_CLASSES), dtype=torch.float32)
-        node_categories[:N, 0] = 1.0   # Active
-        node_categories[N:, 1] = 1.0   # Virtual
-        
-        # 3. Node mask: 1 for active, 0 for virtual
-        node_mask = torch.zeros(N_max, dtype=torch.float32)
-        node_mask[:N] = 1.0
-        
-        # 4. Dense adjacency matrix from sparse edge_index
+
+        # 2. Node categories: one-hot over the 5 Levi classes, OFF pads
+        labels_padded = torch.full((N_max,), OFF, dtype=torch.long)
+        labels_padded[:N] = graph["node_labels"]
+        node_categories = F.one_hot(labels_padded, NUM_NODE_CLASSES).float()
+
+        # 3. Node mask: 1 for coordinate-carrying (vertex) nodes
+        node_mask = (labels_padded == VERTEX).float()
+
+        # 4. Dense edge-class matrix from sparse labeled edges
         y = torch.zeros((N_max, N_max, 1), dtype=torch.float32)
         if edge_index.numel() > 0:
-            src = edge_index[0]  # [E]
-            dst = edge_index[1]  # [E]
-            y[src, dst, 0] = 1.0
-        
+            y[edge_index[0], edge_index[1], 0] = graph["edge_attr"].float()
+
         return {
             "x": x_padded,
             "node_categories": node_categories,
