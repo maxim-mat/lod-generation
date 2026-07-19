@@ -129,3 +129,77 @@ def test_pad_graph_shapes_and_masks(tmp_path):
     dense = item["y"].squeeze(-1)
     assert (dense[ei[0], ei[1]] == ea.float()).all()
     assert dense.sum() == ea.float().sum()          # nothing else set
+
+
+# ---------------------------------------------------------------- round trip
+
+def graph_to_dense(g):
+    n = g["x"].shape[0]
+    edge = np.zeros((n, n), dtype=np.int64)
+    ei, ea = g["edge_index"].numpy(), g["edge_attr"].numpy()
+    edge[ei[0], ei[1]] = ea
+    return g["x"].numpy().astype(float), g["node_labels"].numpy(), edge
+
+
+def canonical_graph(g):
+    """Index-permutation-invariant view: coord-keyed vertices, faces, vv edges."""
+    coords, labels, edge = graph_to_dense(g)
+    key = lambda i: tuple(round(c, 6) for c in coords[i])  # noqa: E731
+    vertex_ids = np.flatnonzero(labels == VERTEX)
+    faces = []
+    for f in np.flatnonzero(labels != VERTEX):
+        members = frozenset(key(v) for v in vertex_ids if edge[f, v] == EDGE_VF)
+        faces.append((int(labels[f]), members))
+    vv = frozenset(
+        frozenset((key(u), key(v)))
+        for u in vertex_ids for v in vertex_ids
+        if u < v and edge[u, v] == EDGE_VV
+    )
+    return frozenset(key(v) for v in vertex_ids), sorted(faces, key=repr), vv
+
+
+def solid_volume(cj):
+    """Signed volume via divergence theorem; positive iff rings are CCW-outward."""
+    obj = next(iter(cj["CityObjects"].values()))
+    verts = np.asarray(cj["vertices"], dtype=float)
+    vol = 0.0
+    for face in obj["geometry"][0]["boundaries"][0]:
+        ring = verts[face[0]]
+        for i in range(1, len(ring) - 1):
+            vol += np.dot(ring[0], np.cross(ring[i], ring[i + 1]))
+    return vol / 6.0
+
+
+@pytest.mark.parametrize(
+    "vertices, faces, volume",
+    [(CUBE_VERTICES, CUBE_FACES, 1.0), (HOUSE_VERTICES, HOUSE_FACES, 30.0)],
+    ids=["cube", "gable-house"],
+)
+def test_round_trip_is_identity_and_ccw_outward(tmp_path, vertices, faces, volume):
+    from src.post_process.post_process import graph_to_cityjson
+
+    g1 = write_and_parse(make_cityjson(vertices, faces), tmp_path)
+    cj2 = graph_to_cityjson(*graph_to_dense(g1), building_id="b1")
+
+    # parse o to_cityjson o parse == parse  (graph level)
+    g2 = write_and_parse(cj2, tmp_path, name="roundtrip.city.json")
+    assert canonical_graph(g2) == canonical_graph(g1)
+
+    # to_cityjson o parse is the identity on its own output  (file level)
+    cj3 = graph_to_cityjson(*graph_to_dense(g2), building_id="b1")
+    assert cj3 == cj2
+
+    # rings are CCW viewed from outside: positive enclosed volume, exact value
+    assert solid_volume(cj2) == pytest.approx(volume)
+
+
+def test_graph_to_cityjson_skips_malformed_faces():
+    from src.post_process.post_process import graph_to_cityjson
+
+    # a lone face node connected to only 2 vertices cannot form a ring
+    coords = np.array([[0.0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 0]])
+    labels = np.array([VERTEX, VERTEX, VERTEX, WALL])
+    edge = np.zeros((4, 4), dtype=np.int64)
+    edge[3, 0] = edge[0, 3] = EDGE_VF
+    edge[3, 1] = edge[1, 3] = EDGE_VF
+    assert graph_to_cityjson(coords, labels, edge) == {}
