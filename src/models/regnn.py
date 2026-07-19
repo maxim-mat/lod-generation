@@ -277,12 +277,40 @@ class XEyTransformerLayer(nn.Module):
         return X, E, y, new_pos
 
 
+class SinusoidalTimeEmbedding(nn.Module):
+    """Fourier lift of the scalar timestep t/T in [0, 1] to a `dim`-vector.
+
+    A bare scalar into an MLP is hard to learn a high-frequency function of,
+    because ReLU MLPs are biased toward low frequencies (Tancik et al. 2020,
+    "Fourier Features Let Networks Learn High Frequency Functions in Low
+    Dimensional Domains", arXiv:2006.10739). Lifting t onto a bank of
+    sines/cosines gives the downstream MLP the basis to resolve nearby steps.
+    """
+
+    def __init__(self, dim, max_freq=1000.0):
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"time embedding dim must be even, got {dim}.")
+        self.dim = dim
+        # ponytail: max_freq ~ T sets the finest step the lift can resolve
+        # (needs max_freq * (1/T) >~ pi). Raise it if T grows past ~500.
+        self.register_buffer(
+            "freqs",
+            torch.exp(torch.linspace(0.0, math.log(max_freq), dim // 2)),
+            persistent=False,
+        )
+
+    def forward(self, t_norm):
+        args = t_norm * self.freqs  # [B, 1] * [dim/2] -> [B, dim/2]
+        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+
+
 class rEGNNTransformer(nn.Module):
     """Denoising network predicting the clean (pos, E, X) from a noisy graph."""
 
     def __init__(self, num_node_classes=2, num_edge_classes=2, hidden_dim=64,
                  edge_dim=32, global_dim=32, n_head=8, num_layers=4, pos_mlp_dim=16,
-                 dropout=0.1, equivariance="so2"):
+                 dropout=0.1, equivariance="so2", time_embed="scalar"):
         """
         Args:
             num_node_classes (int): Node categories (Active / Virtual).
@@ -297,16 +325,28 @@ class rEGNNTransformer(nn.Module):
             equivariance (str): 'so2' (yaw only, buildings have a canonical
                 vertical), 'se2' (so2 features, xy-only CoM, absolute z) or
                 'o3' (faithful MiDi). See the module docstring.
+            time_embed (str): 'scalar' (raw t/T into the global-feature MLP,
+                MiDi's design) or 'sinusoidal' (Fourier lift of t/T first).
         """
         super().__init__()
         self.num_node_classes = num_node_classes
         self.num_edge_classes = num_edge_classes
         self.xy_only = equivariance == "se2"
 
+        if time_embed not in ("scalar", "sinusoidal"):
+            raise ValueError(
+                f"time_embed must be 'scalar' or 'sinusoidal', got {time_embed!r}."
+            )
+
         act = nn.ReLU()
-        # The global feature carries only the normalised timestep.
+        # The global feature carries only the timestep: either the raw scalar
+        # t/T (MiDi's design) or a sinusoidal Fourier lift of it.
+        self.time_embed = (
+            SinusoidalTimeEmbedding(global_dim) if time_embed == "sinusoidal" else None
+        )
+        y_in = global_dim if time_embed == "sinusoidal" else 1
         self.mlp_in_y = nn.Sequential(
-            nn.Linear(1, global_dim), act, nn.Linear(global_dim, global_dim), act
+            nn.Linear(y_in, global_dim), act, nn.Linear(global_dim, global_dim), act
         )
         self.mlp_in_X = nn.Sequential(
             nn.Linear(num_node_classes, hidden_dim), act, nn.Linear(hidden_dim, hidden_dim), act
@@ -367,7 +407,7 @@ class rEGNNTransformer(nn.Module):
             self.mlp_in_X(X_t), new_E, self.mlp_in_pos(R_t, node_mask), node_mask,
             xy_only=self.xy_only,
         )
-        y = self.mlp_in_y(t_norm)
+        y = self.mlp_in_y(self.time_embed(t_norm) if self.time_embed is not None else t_norm)
 
         for layer in self.tf_layers:
             X, E, y, pos = layer(X, E, y, pos, node_mask)

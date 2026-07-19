@@ -67,6 +67,7 @@ def create_model(cfg: Config, n_max: int, x_marginals=None, e_marginals=None,
         coord_scale=coord_scale,
         equivariance=cfg.model.equivariance,
         z_shift=z_shift,
+        time_embed=cfg.model.time_embed,
     )
 
 

@@ -27,6 +27,7 @@ class ModelConfig:
     num_node_classes: int = 5  # vertex, ground, roof, wall, off (Levi graph)
     num_edge_classes: int = 3  # off, vertex-vertex, vertex-face
     equivariance: str = "so2"  # "so2" | "se2" | "o3"
+    time_embed: str = "scalar"  # "scalar" (raw t/T) | "sinusoidal" (Fourier lift)
     hidden_dim: int = 64      # dx: node channel width, must be divisible by n_head
     edge_dim: int = 32        # de: edge channel width; drives [B,N,N,de] memory
     global_dim: int = 32      # dy: global feature width

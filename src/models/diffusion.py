@@ -35,7 +35,8 @@ class CityJSONDiffusionModule(L.LightningModule):
                  x_marginals=None, e_marginals=None,
                  nu_pos=2.5, nu_x=1.0, nu_e=1.5,
                  lambda_pos=3.0, lambda_x=0.4, lambda_e=2.0,
-                 coord_scale=1.0, equivariance="so2", z_shift=0.0):
+                 coord_scale=1.0, equivariance="so2", z_shift=0.0,
+                 time_embed="scalar"):
         """
         Args:
             discrete_noise_type (str): 'marginal' (limit distribution = training
@@ -60,6 +61,8 @@ class CityJSONDiffusionModule(L.LightningModule):
                 `CityJSONDataModule.compute_z_shift()`); added back by
                 `generate_cityjson`. Forced to 0.0 for non-se2 modes. Saved as
                 a hyperparameter like `coord_scale`.
+            time_embed (str): 'scalar' (raw t/T, MiDi's design) or 'sinusoidal'
+                (Fourier lift of t/T before the global-feature MLP).
         """
         super().__init__()
         self.save_hyperparameters()
@@ -112,6 +115,7 @@ class CityJSONDiffusionModule(L.LightningModule):
             num_layers=num_layers,
             dropout=dropout,
             equivariance=equivariance,
+            time_embed=time_embed,
         )
 
     # ------------------------------------------------------------------
