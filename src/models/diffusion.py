@@ -230,10 +230,17 @@ class CityJSONDiffusionModule(L.LightningModule):
 
         node_mask = batch["node_mask"]
         coord_mse = self._active_coord_mse(R_pred, R0, node_mask)
-        node_acc = (X_pred.argmax(dim=-1) == batch["node_categories"].argmax(dim=-1)).float().mean()
+        # Plain accuracy is inflated by the ~80% Virtual majority; report
+        # precision/recall of the minority Active class instead.
+        pred_active = X_pred.argmax(dim=-1) == 0
+        true_active = batch["node_categories"].argmax(dim=-1) == 0
+        tp = (pred_active & true_active).float().sum()
+        real_precision = tp / pred_active.float().sum().clamp(min=1)
+        real_recall = tp / true_active.float().sum().clamp(min=1)
 
         self.log(f"{prefix}_coord_mse", coord_mse, on_epoch=True, prog_bar=True)
-        self.log(f"{prefix}_node_acc", node_acc, on_epoch=True, prog_bar=True)
+        self.log(f"{prefix}_real_precision", real_precision, on_epoch=True, prog_bar=True)
+        self.log(f"{prefix}_real_recall", real_recall, on_epoch=True, prog_bar=True)
         self.log(f"{prefix}_edge_ce", edge_loss, on_epoch=True)
         self.log(f"{prefix}_loss", total, on_epoch=True)
         return coord_mse

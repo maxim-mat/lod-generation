@@ -45,3 +45,21 @@ def test_diffusion_module_shared_step():
     }
     total = model._shared_step(batch)[0]
     assert total.isfinite()
+
+
+def test_eval_step_logs_real_precision_recall():
+    model = CityJSONDiffusionModule(hidden_dim=8, edge_dim=4, global_dim=4,
+                                    n_head=2, num_layers=1, T=10, n_max=N)
+    batch = {
+        "x": torch.randn(B, N, 3),
+        "node_categories": torch.nn.functional.one_hot(torch.randint(0, 2, (B, N)), 2).float(),
+        "y": torch.randint(0, NUM_EDGE_CLASSES, (B, N, N, 1)),
+        "node_mask": torch.ones(B, N),
+    }
+    logged = {}
+    model.log = lambda name, value, **kw: logged.__setitem__(name, float(value))
+
+    model.validation_step(batch, 0)
+
+    for key in ("val_real_precision", "val_real_recall"):
+        assert 0.0 <= logged[key] <= 1.0
