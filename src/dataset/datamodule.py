@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import math
+
 import torch
 from torch.utils.data import DataLoader, random_split
 
@@ -16,6 +18,7 @@ class CityJSONDataModule(L.LightningDataModule):
         train_val_test_split=(0.8, 0.1, 0.1),
         normalize_coords=False,
         num_workers=0,
+        persistent_workers=False,
         seed=42,
         n_max=None,
         upper_limit_nodes=None,
@@ -30,6 +33,8 @@ class CityJSONDataModule(L.LightningDataModule):
             train_val_test_split (tuple of 3 floats): Split ratios for train, val, and test sets. Sum must be 1.0.
             normalize_coords (bool): If True, shifts nodes so base center is at (0, 0, 0).
             num_workers (int): Number of subprocesses to use for data loading.
+            persistent_workers (bool): Keep DataLoader workers alive across epochs.
+                Ignored when num_workers=0.
             seed (int): Random seed for reproducibility of splits.
             n_max (int, optional): Maximum number of nodes per graph. If None, auto-detected
                 from the dataset as the maximum observed node count.
@@ -41,6 +46,8 @@ class CityJSONDataModule(L.LightningDataModule):
         self.train_val_test_split = train_val_test_split
         self.normalize_coords = normalize_coords
         self.num_workers = num_workers
+        # torch raises if persistent_workers is set with num_workers=0.
+        self.persistent_workers = persistent_workers and num_workers > 0
         self.seed = seed
         self.n_max = n_max
         self.upper_limit_nodes = upper_limit_nodes
@@ -131,12 +138,62 @@ class CityJSONDataModule(L.LightningDataModule):
         e_marginals = (edge_counts / edge_counts.sum()).float()
         return x_marginals, e_marginals
 
+    def compute_coord_scale(self):
+        """Pooled standard deviation of the active-node coordinates, train split only.
+
+        Dividing the targets by this makes the position diffusion's unit-variance
+        Gaussian noise and its N(0, I) limit distribution match the data. Raw
+        metres leave the schedule badly skewed: with a std of ~4.3 m the SNR at
+        t = T/2 is 16.3 rather than 2.3, so the low-SNR regime the reverse chain
+        starts from is barely trained.
+
+        A single scalar, not per-building (that would erase building size and is
+        not invertible at sampling time) and not per-axis (that would break the
+        yaw-equivariance of the 'so2' network). Coordinates are centred exactly
+        as `CityJSONDiffusionModule._centre_positions` centres them, so the
+        statistic describes the tensor the model actually regresses.
+
+        Computed on the train split only, so val/test do not leak into it.
+
+        Returns:
+            float: the scale in metres, strictly positive.
+        """
+        if self.train_dataset is None:
+            raise RuntimeError("compute_coord_scale() requires setup() to have run first.")
+
+        count = 0
+        total = 0.0
+        total_sq = 0.0
+
+        for item in self.train_dataset:
+            # Multi-LOD datasets yield a tuple; the model trains on the first LOD.
+            if isinstance(item, tuple):
+                item = item[0]
+
+            active = item["x"][item["node_mask"].bool()]
+            if active.numel() == 0:
+                continue
+
+            centred = (active - active.mean(dim=0, keepdim=True)).double()
+            count += centred.numel()
+            total += centred.sum().item()
+            total_sq += (centred ** 2).sum().item()
+
+        if count == 0:
+            raise ValueError("No active nodes in the training split; cannot compute a coordinate scale.")
+
+        mean = total / count
+        variance = max(total_sq / count - mean * mean, 0.0)
+        # A degenerate split (every building a single point) would give 0.
+        return max(math.sqrt(variance), 1e-6)
+
     def train_dataloader(self):
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
+            persistent_workers=self.persistent_workers,
             collate_fn=graph_collate_fn,
             pin_memory=True,
         )
@@ -147,6 +204,7 @@ class CityJSONDataModule(L.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
+            persistent_workers=self.persistent_workers,
             collate_fn=graph_collate_fn,
             pin_memory=True,
         )
@@ -157,6 +215,7 @@ class CityJSONDataModule(L.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
+            persistent_workers=self.persistent_workers,
             collate_fn=graph_collate_fn,
             pin_memory=True,
         )

@@ -34,7 +34,8 @@ class CityJSONDiffusionModule(L.LightningModule):
                  edge_dim=32, global_dim=32, n_head=8, dropout=0.1,
                  x_marginals=None, e_marginals=None,
                  nu_pos=2.5, nu_x=1.0, nu_e=1.5,
-                 lambda_pos=3.0, lambda_x=0.4, lambda_e=2.0):
+                 lambda_pos=3.0, lambda_x=0.4, lambda_e=2.0,
+                 coord_scale=1.0):
         """
         Args:
             discrete_noise_type (str): 'marginal' (limit distribution = training
@@ -46,13 +47,26 @@ class CityJSONDiffusionModule(L.LightningModule):
             nu_pos, nu_x, nu_e (float): Cosine schedule exponents per feature.
                 nu_pos > nu_e destroys coordinates faster than graph structure.
             lambda_pos, lambda_x, lambda_e (float): Loss weights.
+            coord_scale (float): Metres per unit of the model's coordinate space.
+                Targets are divided by it so the data matches the unit-variance
+                Gaussian the position diffusion noises towards; `generate_cityjson`
+                multiplies by it to return metres. Obtain it from
+                `CityJSONDataModule.compute_coord_scale()`. Saved as a
+                hyperparameter, so inference restores it from the checkpoint.
         """
         super().__init__()
         self.save_hyperparameters()
 
+        if coord_scale <= 0:
+            raise ValueError(f"coord_scale must be positive, got {coord_scale}.")
+
         self.T = T
         self.lr = lr
         self.n_max = n_max
+        self.coord_scale = float(coord_scale)
+        # Batches dropped for a non-finite loss. Not a buffer: it describes this
+        # run, not the model, and must not travel with a checkpoint.
+        self._nonfinite_skips = 0
         self.num_node_classes = num_node_classes
         self.lr_scheduler = lr_scheduler
         self.lr_decay_steps = lr_decay_steps
@@ -110,8 +124,12 @@ class CityJSONDiffusionModule(L.LightningModule):
         return (R0 - mean) * mask
 
     def _prepare(self, batch):
-        """Unpack a batch into clean (pos, X, E) plus the network's node mask."""
-        R0 = self._centre_positions(batch["x"], batch["node_mask"])
+        """Unpack a batch into clean (pos, X, E) plus the network's node mask.
+
+        Positions come back in scaled units (metres / `coord_scale`), which is the
+        space the whole diffusion -- and therefore every coordinate metric -- lives in.
+        """
+        R0 = self._centre_positions(batch["x"], batch["node_mask"]) / self.coord_scale
         X0 = batch["node_categories"]
         E0 = zero_diagonal(
             F.one_hot(batch["y"].squeeze(-1).long(), NUM_EDGE_CLASSES).float()
@@ -160,13 +178,47 @@ class CityJSONDiffusionModule(L.LightningModule):
         sq_err = ((R_pred - R0) ** 2 * mask).sum()
         return sq_err / (mask.sum() * 3.0 + 1e-6)
 
+    def _skip_nonfinite_batch(self, batch_idx, total, coord_loss, node_loss, edge_loss):
+        """Drop a batch whose loss is not finite, loudly.
+
+        A single NaN or inf reaching backward fills every gradient with NaN, and
+        AdamW then writes NaN into every parameter and both moment buffers; the
+        model never recovers. Returning None makes Lightning skip backward and the
+        optimizer step, leaving the weights untouched.
+
+        Caveat: if the parameters are *already* non-finite, every subsequent batch
+        is skipped too and the run will make no progress while still looking alive.
+        `train_nonfinite_skips` climbing step-for-step is that failure.
+        """
+        self._nonfinite_skips += 1
+        logger.warning(
+            "Non-finite training loss at epoch %d, batch %d (global step %d): "
+            "total=%s coord_mse=%s node_ce=%s edge_ce=%s. "
+            "Skipping the optimizer step; %d batch(es) skipped so far.",
+            self.current_epoch, batch_idx, self.global_step,
+            total.item(), coord_loss.item(), node_loss.item(), edge_loss.item(),
+            self._nonfinite_skips,
+        )
+        self._log_nonfinite_skips()
+        return None
+
+    def _log_nonfinite_skips(self):
+        # Logged every step, not just on failure, so the wandb series is a
+        # continuous line that steps up rather than a scatter of isolated points.
+        self.log("train_nonfinite_skips", float(self._nonfinite_skips),
+                 on_step=True, on_epoch=False, prog_bar=True)
+
     def training_step(self, batch, batch_idx):
         total, coord_loss, node_loss, edge_loss, *_ = self._shared_step(batch)
+
+        if not torch.isfinite(total):
+            return self._skip_nonfinite_batch(batch_idx, total, coord_loss, node_loss, edge_loss)
 
         self.log("train_loss", total, on_step=True, on_epoch=True, prog_bar=True)
         self.log("train_coord_mse", coord_loss, on_epoch=True, prog_bar=True)
         self.log("train_edge_ce", edge_loss, on_epoch=True)
         self.log("train_node_ce", node_loss, on_epoch=True)
+        self._log_nonfinite_skips()
         return total
 
     def _eval_step(self, batch, prefix):
@@ -178,10 +230,17 @@ class CityJSONDiffusionModule(L.LightningModule):
 
         node_mask = batch["node_mask"]
         coord_mse = self._active_coord_mse(R_pred, R0, node_mask)
-        node_acc = (X_pred.argmax(dim=-1) == batch["node_categories"].argmax(dim=-1)).float().mean()
+        # Plain accuracy is inflated by the ~80% Virtual majority; report
+        # precision/recall of the minority Active class instead.
+        pred_active = X_pred.argmax(dim=-1) == 0
+        true_active = batch["node_categories"].argmax(dim=-1) == 0
+        tp = (pred_active & true_active).float().sum()
+        real_precision = tp / pred_active.float().sum().clamp(min=1)
+        real_recall = tp / true_active.float().sum().clamp(min=1)
 
         self.log(f"{prefix}_coord_mse", coord_mse, on_epoch=True, prog_bar=True)
-        self.log(f"{prefix}_node_acc", node_acc, on_epoch=True, prog_bar=True)
+        self.log(f"{prefix}_real_precision", real_precision, on_epoch=True, prog_bar=True)
+        self.log(f"{prefix}_real_recall", real_recall, on_epoch=True, prog_bar=True)
         self.log(f"{prefix}_edge_ce", edge_loss, on_epoch=True)
         self.log(f"{prefix}_loss", total, on_epoch=True)
         return coord_mse
@@ -231,7 +290,8 @@ class CityJSONDiffusionModule(L.LightningModule):
         """Run the reverse chain from the limit distribution.
 
         Returns:
-            pos (Tensor): [B, n_max, 3] coordinates.
+            pos (Tensor): [B, n_max, 3] coordinates, in scaled units. Multiply by
+                `coord_scale` for metres.
             edge_probs (Tensor): [B, n_max, n_max] the sampled adjacency, in {0, 1}.
             active_mask (Tensor): [B, n_max] bool, True where the node is Active.
         """
@@ -279,7 +339,8 @@ class CityJSONDiffusionModule(L.LightningModule):
                 logger.warning(f"Building {i} has only {len(active_indices)} active nodes, skipping.")
                 continue
 
-            nodes = Rt[i, active_indices].cpu().numpy()
+            # The chain runs in scaled units; CityJSON is metres.
+            nodes = (Rt[i, active_indices] * self.coord_scale).cpu().numpy()
             edges = edge_probs[i][active_indices][:, active_indices].cpu().numpy()
 
             cj = graph_to_cityjson(
