@@ -55,8 +55,15 @@ def train(cfg: Config):
     else:
         logger.info("Coordinate scale from config: %.6f m/unit", coord_scale)
 
+    z_shift = cfg.data.z_shift
+    if z_shift is None:
+        z_shift = datamodule.compute_z_shift() if cfg.model.equivariance == "se2" else 0.0
+    if cfg.model.equivariance == "se2":
+        logger.info("z shift (se2): %.6f m", z_shift)
+
     model = create_model(cfg, resolved_n_max, x_marginals=x_marginals,
-                         e_marginals=e_marginals, coord_scale=coord_scale)
+                         e_marginals=e_marginals, coord_scale=coord_scale,
+                         z_shift=z_shift)
     
     logger.info("Creating loggers and callbacks...")
     exp_loggers = create_loggers(cfg, save_dir)

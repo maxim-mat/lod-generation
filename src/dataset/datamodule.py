@@ -140,6 +140,26 @@ class CityJSONDataModule(L.LightningDataModule):
         e_marginals = (edge_counts / edge_counts.sum()).float()
         return x_marginals, e_marginals
 
+    def compute_z_shift(self):
+        """Pooled mean of vertex-node z over the train split (se2 only).
+
+        The se2 mode keeps absolute heights; subtracting the train-split mean
+        makes the z channel zero-mean so the N(0, 1) position prior matches
+        the data through the whole chain. Stored in checkpoint hparams like
+        `coord_scale`.
+        """
+        if self.train_dataset is None:
+            raise RuntimeError("compute_z_shift() requires setup() to have run first.")
+
+        total, count = 0.0, 0.0
+        for item in self.train_dataset:
+            if isinstance(item, tuple):
+                item = item[0]
+            mask = item["node_mask"].bool()
+            total += float(item["x"][mask][:, 2].double().sum())
+            count += float(mask.sum())
+        return total / max(count, 1.0)
+
     def compute_coord_scale(self):
         """Pooled standard deviation of the active-node coordinates, train split only.
 

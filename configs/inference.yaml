@@ -19,6 +19,7 @@ data:
 model:
   num_node_classes: 5
   num_edge_classes: 3
+  equivariance: so2
   hidden_dim: 64
   edge_dim: 32
   global_dim: 32

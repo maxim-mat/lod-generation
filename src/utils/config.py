@@ -16,12 +16,17 @@ class DataConfig:
     # Metres per unit of the model's coordinate space. None = compute the pooled
     # std of the train split. Set explicitly to reuse a scale across runs.
     coord_scale: Optional[float] = None
+    # se2 only: metres subtracted from z before scaling, so the absolute-height
+    # channel is zero-mean under the N(0,1) prior. None = train-split mean
+    # vertex z (ignored unless model.equivariance == "se2").
+    z_shift: Optional[float] = None
 
 @dataclass
 class ModelConfig:
     """Configuration for model architecture and the diffusion noise schedule."""
     num_node_classes: int = 5  # vertex, ground, roof, wall, off (Levi graph)
     num_edge_classes: int = 3  # off, vertex-vertex, vertex-face
+    equivariance: str = "so2"  # "so2" | "se2" | "o3"
     hidden_dim: int = 64      # dx: node channel width, must be divisible by n_head
     edge_dim: int = 32        # de: edge channel width; drives [B,N,N,de] memory
     global_dim: int = 32      # dy: global feature width

@@ -35,7 +35,7 @@ class CityJSONDiffusionModule(L.LightningModule):
                  x_marginals=None, e_marginals=None,
                  nu_pos=2.5, nu_x=1.0, nu_e=1.5,
                  lambda_pos=3.0, lambda_x=0.4, lambda_e=2.0,
-                 coord_scale=1.0):
+                 coord_scale=1.0, equivariance="so2", z_shift=0.0):
         """
         Args:
             discrete_noise_type (str): 'marginal' (limit distribution = training
@@ -53,6 +53,13 @@ class CityJSONDiffusionModule(L.LightningModule):
                 multiplies by it to return metres. Obtain it from
                 `CityJSONDataModule.compute_coord_scale()`. Saved as a
                 hyperparameter, so inference restores it from the checkpoint.
+            equivariance (str): 'so2' (default), 'se2' (xy-only CoM, absolute z)
+                or 'o3'. Threads into both the network and the noise model.
+            z_shift (float): se2 only — metres subtracted from z before
+                `coord_scale` scaling (train-split mean vertex height, from
+                `CityJSONDataModule.compute_z_shift()`); added back by
+                `generate_cityjson`. Forced to 0.0 for non-se2 modes. Saved as
+                a hyperparameter like `coord_scale`.
         """
         super().__init__()
         self.save_hyperparameters()
@@ -69,6 +76,8 @@ class CityJSONDiffusionModule(L.LightningModule):
         self._nonfinite_skips = 0
         self.num_node_classes = num_node_classes
         self.num_edge_classes = num_edge_classes
+        self.equivariance = equivariance
+        self.z_shift = float(z_shift) if equivariance == "se2" else 0.0
         self.lr_scheduler = lr_scheduler
         self.lr_decay_steps = lr_decay_steps
         self.lr_decay_rate = lr_decay_rate
@@ -90,6 +99,7 @@ class CityJSONDiffusionModule(L.LightningModule):
             T=T, x_marginals=x_marginals, e_marginals=e_marginals,
             transition_x=discrete_noise_type, transition_e=discrete_noise_type,
             nu_pos=nu_pos, nu_x=nu_x, nu_e=nu_e,
+            xy_only_com=equivariance == "se2",
         )
 
         self.network = rEGNNTransformer(
@@ -101,6 +111,7 @@ class CityJSONDiffusionModule(L.LightningModule):
             n_head=n_head,
             num_layers=num_layers,
             dropout=dropout,
+            equivariance=equivariance,
         )
 
     # ------------------------------------------------------------------
@@ -137,7 +148,10 @@ class CityJSONDiffusionModule(L.LightningModule):
         Positions come back in scaled units (metres / `coord_scale`), which is the
         space the whole diffusion -- and therefore every coordinate metric -- lives in.
         """
-        R0 = self._centre_positions(batch["x"], batch["node_categories"]) / self.coord_scale
+        R0 = self._centre_positions(
+            batch["x"], batch["node_categories"],
+            xy_only=self.equivariance == "se2", z_shift=self.z_shift,
+        ) / self.coord_scale
         X0 = batch["node_categories"]
         E0 = zero_diagonal(
             F.one_hot(batch["y"].squeeze(-1).long(), self.num_edge_classes).float()
@@ -347,8 +361,10 @@ class CityJSONDiffusionModule(L.LightningModule):
                 logger.warning(f"Building {i} has only {n_vertices} vertex nodes, skipping.")
                 continue
 
-            # The chain runs in scaled units; CityJSON is metres.
+            # The chain runs in scaled units; CityJSON is metres. se2 keeps
+            # absolute heights: restore the z offset the targets subtracted.
             coords = (pos[i] * self.coord_scale).cpu().numpy()
+            coords[:, 2] += self.z_shift
             cj = graph_to_cityjson(
                 coords,
                 node_labels[i].cpu().numpy(),

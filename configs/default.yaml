@@ -29,6 +29,7 @@ data:
 model:
   num_node_classes: 5  # vertex, ground, roof, wall, off (Levi graph)
   num_edge_classes: 3  # off, vertex-vertex, vertex-face
+  equivariance: so2    # so2 | se2 (xy-only CoM, absolute z) | o3
   hidden_dim: 64                 # dx, must be divisible by n_head
   edge_dim: 32                   # de, drives [B,N,N,de] memory — keep small
   global_dim: 32                 # dy
