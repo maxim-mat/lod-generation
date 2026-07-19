@@ -108,14 +108,17 @@ class CityJSONDataModule(L.LightningDataModule):
 
         Returns:
             tuple[Tensor, Tensor]: node marginals [num_node_classes] over
-            (Active, Virtual), and edge marginals [2] over (no-edge, edge)
-            counted across off-diagonal entries of the padded adjacency.
+            (vertex, ground, roof, wall, off), and edge marginals
+            [num_edge_classes] over (off, vertex-vertex, vertex-face) counted
+            across off-diagonal entries of the padded edge-class matrix.
         """
+        from src.dataset.dataset import NUM_EDGE_CLASSES
+
         if self.train_dataset is None:
             raise RuntimeError("compute_marginals() requires setup() to have run first.")
 
         node_counts = None
-        edge_counts = torch.zeros(2, dtype=torch.float64)
+        edge_counts = torch.zeros(NUM_EDGE_CLASSES, dtype=torch.float64)
 
         for item in self.train_dataset:
             # Multi-LOD datasets yield a tuple; the model trains on the first LOD.
@@ -130,9 +133,8 @@ class CityJSONDataModule(L.LightningDataModule):
             adjacency = item["y"].squeeze(-1)
             n = adjacency.shape[0]
             off_diag = ~torch.eye(n, dtype=torch.bool)
-            edges = adjacency[off_diag]
-            edge_counts[1] += edges.sum().double()
-            edge_counts[0] += edges.numel() - edges.sum().double()
+            edges = adjacency[off_diag].long()
+            edge_counts += torch.bincount(edges, minlength=NUM_EDGE_CLASSES).double()
 
         x_marginals = (node_counts / node_counts.sum()).float()
         e_marginals = (edge_counts / edge_counts.sum()).float()

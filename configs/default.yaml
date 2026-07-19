@@ -16,7 +16,7 @@ seed: 42
 data:
   dataset_dir: data/The Hague
   lods: 1
-  normalize_coords: true
+  normalize_coords: false
   n_max: null              # null = auto-detect from dataset
   num_workers: 0
   upper_limit_nodes: null  # null = no limit
@@ -27,7 +27,8 @@ data:
 
 # --- Model ------------------------------------------------------------------
 model:
-  num_node_classes: 2
+  num_node_classes: 5  # vertex, ground, roof, wall, off (Levi graph)
+  num_edge_classes: 3  # off, vertex-vertex, vertex-face
   hidden_dim: 64                 # dx, must be divisible by n_head
   edge_dim: 32                   # de, drives [B,N,N,de] memory — keep small
   global_dim: 32                 # dy
@@ -74,7 +75,6 @@ training:
 inference:
   checkpoint_path: null    # path to .ckpt file (required for inference mode)
   batch_size: 4            # number of buildings to generate
-  edge_threshold: 0.5      # edge probability threshold for adjacency
   output_dir: outputs/generated
 
 # --- WandB Logging ----------------------------------------------------------

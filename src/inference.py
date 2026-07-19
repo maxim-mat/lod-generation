@@ -33,20 +33,18 @@ def run_inference(cfg: Config):
     model.eval()
     
     batch_size = cfg.inference.batch_size
-    threshold = cfg.inference.edge_threshold
     output_dir = Path(cfg.inference.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     logger.info("Starting inference:")
     logger.info(f"  Checkpoint: {ckpt_path}")
     logger.info(f"  N_max:      {model.n_max}")
     logger.info(f"  Batch size: {batch_size}")
-    logger.info(f"  Threshold:  {threshold}")
     logger.info(f"  Output dir: {output_dir}")
-    
+
     # Generate
     logger.info(f"Generating {batch_size} building(s)...")
-    results = model.generate_cityjson(batch_size=batch_size, threshold=threshold)
+    results = model.generate_cityjson(batch_size=batch_size)
     
     logger.info(f"Successfully generated {len(results)} building(s).")
     

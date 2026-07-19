@@ -7,7 +7,7 @@ class DataConfig:
     """Configuration for dataset and datamodule."""
     dataset_dir: str = MISSING
     lods: List[int] = field(default_factory=lambda: [1, 2])
-    normalize_coords: bool = True
+    normalize_coords: bool = False
     num_workers: int = 4
     # Keep DataLoader workers alive across epochs (ignored when num_workers=0).
     persistent_workers: bool = False
@@ -20,7 +20,8 @@ class DataConfig:
 @dataclass
 class ModelConfig:
     """Configuration for model architecture and the diffusion noise schedule."""
-    num_node_classes: int = 2
+    num_node_classes: int = 5  # vertex, ground, roof, wall, off (Levi graph)
+    num_edge_classes: int = 3  # off, vertex-vertex, vertex-face
     hidden_dim: int = 64      # dx: node channel width, must be divisible by n_head
     edge_dim: int = 32        # de: edge channel width; drives [B,N,N,de] memory
     global_dim: int = 32      # dy: global feature width
@@ -98,7 +99,6 @@ class InferenceConfig:
     """Configuration for inference."""
     checkpoint_path: Optional[str] = None
     batch_size: int = 10
-    edge_threshold: float = 0.5
     output_dir: str = "outputs/generated"
 
 @dataclass

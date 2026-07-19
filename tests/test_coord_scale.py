@@ -14,7 +14,7 @@ The scale is a single dataset-wide scalar, computed on the train split only:
 import torch
 
 from src.dataset.datamodule import CityJSONDataModule
-from src.models.diffusion import NUM_EDGE_CLASSES, CityJSONDiffusionModule
+from src.models.diffusion import CityJSONDiffusionModule
 
 B, N = 2, 6
 
@@ -31,13 +31,15 @@ def _batch(scale=1.0):
     return {
         "x": x,
         "node_categories": node_categories,
-        "y": torch.randint(0, NUM_EDGE_CLASSES, (B, N, N, 1)),
+        "y": torch.randint(0, 2, (B, N, N, 1)),
         "node_mask": node_mask,
     }
 
 
 def _model(coord_scale):
-    return CityJSONDiffusionModule(hidden_dim=8, edge_dim=4, global_dim=4, n_head=2,
+    # 2-class fixtures: this file pins coordinate scaling, not the Levi classes.
+    return CityJSONDiffusionModule(num_node_classes=2, num_edge_classes=2,
+                                   hidden_dim=8, edge_dim=4, global_dim=4, n_head=2,
                                    num_layers=1, T=10, n_max=N, coord_scale=coord_scale)
 
 
@@ -109,14 +111,15 @@ def test_generate_cityjson_restores_metres(monkeypatch):
     model = _model(coord_scale=scale)
 
     pos = torch.arange(4 * 3, dtype=torch.float32).reshape(1, 4, 3)
-    edge_probs = torch.ones(1, 4, 4)
-    active_mask = torch.ones(1, 4, dtype=torch.bool)
-    monkeypatch.setattr(model, "sample", lambda batch_size=1: (pos, edge_probs, active_mask))
+    node_labels = torch.zeros(1, 4, dtype=torch.long)      # all vertices
+    edge_labels = torch.zeros(1, 4, 4, dtype=torch.long)
+    monkeypatch.setattr(model, "sample",
+                        lambda batch_size=1: (pos, node_labels, edge_labels))
 
     seen = {}
 
-    def fake_graph_to_cityjson(nodes, edges, threshold, building_id):
-        seen["nodes"] = nodes
+    def fake_graph_to_cityjson(coords, node_classes, edge_classes, building_id):
+        seen["coords"] = coords
         return {"type": "CityJSON"}
 
     monkeypatch.setattr(pp, "graph_to_cityjson", fake_graph_to_cityjson)
@@ -124,7 +127,7 @@ def test_generate_cityjson_restores_metres(monkeypatch):
     results = model.generate_cityjson(batch_size=1)
 
     assert len(results) == 1
-    assert torch.allclose(torch.as_tensor(seen["nodes"]), pos[0] * scale, atol=1e-6)
+    assert torch.allclose(torch.as_tensor(seen["coords"]), pos[0] * scale, atol=1e-6)
 
 
 def test_coord_scale_survives_a_checkpoint_roundtrip(tmp_path):

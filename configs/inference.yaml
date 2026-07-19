@@ -10,14 +10,15 @@ data:
   lods:
     - 1
     - 2
-  normalize_coords: true
+  normalize_coords: false
   num_workers: 4
   n_max: null
   upper_limit_nodes: null
 
 # Model settings
 model:
-  num_node_classes: 2
+  num_node_classes: 5
+  num_edge_classes: 3
   hidden_dim: 64
   edge_dim: 32
   global_dim: 32
@@ -42,5 +43,4 @@ trainer:
 inference:
   checkpoint_path: null
   batch_size: 10
-  edge_threshold: 0.5
   output_dir: outputs/generated

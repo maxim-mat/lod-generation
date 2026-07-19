@@ -4,14 +4,15 @@ Follows MiDi: Mixed Graph and 3D Denoising Diffusion for Molecule Generation
 (Vignac et al., arXiv:2302.09048), https://github.com/cvignac/MiDi
 
 Adaptations for this dataset:
-  * MiDi's atom types become node categories (Active / Virtual); its bond types
-    become binary edge classes (no-edge / edge). Formal charges are dropped.
+  * MiDi's atom types become the Levi graph's node classes (vertex / ground /
+    roof / wall face / off); its bond types become the three edge classes
+    (off / vertex-vertex / vertex-face). Formal charges are dropped.
   * MiDi samples the node count from the training distribution and pads with a
     node mask. Here every one of the n_max nodes takes part in message passing,
-    and the Virtual category is a genuinely diffused class that the network must
+    and the Off category is a genuinely diffused class that the network must
     predict -- that is how the generated building's size is chosen. The node
-    mask from the dataset is therefore only used to centre the coordinates and
-    to report metrics over real nodes.
+    mask from the dataset marks the vertex (coordinate-carrying) nodes and is
+    only used to centre the coordinates and to report coordinate metrics.
 """
 import logging
 
@@ -24,11 +25,10 @@ from src.models.regnn import rEGNNTransformer
 
 logger = logging.getLogger(__name__)
 
-NUM_EDGE_CLASSES = 2  # 0 = no edge, 1 = edge
-
 
 class CityJSONDiffusionModule(L.LightningModule):
-    def __init__(self, num_node_classes=2, hidden_dim=64, num_layers=4, T=500,
+    def __init__(self, num_node_classes=5, num_edge_classes=3,
+                 hidden_dim=64, num_layers=4, T=500,
                  lr=1e-3, discrete_noise_type="marginal", n_max=64,
                  lr_scheduler="none", lr_decay_steps=50, lr_decay_rate=0.5,
                  edge_dim=32, global_dim=32, n_head=8, dropout=0.1,
@@ -42,8 +42,8 @@ class CityJSONDiffusionModule(L.LightningModule):
                 class marginals, MiDi's default) or 'uniform'.
             x_marginals (Tensor, optional): [num_node_classes] class frequencies
                 of the training split. Defaults to uniform.
-            e_marginals (Tensor, optional): [2] edge class frequencies of the
-                training split. Defaults to uniform.
+            e_marginals (Tensor, optional): [num_edge_classes] edge class
+                frequencies of the training split. Defaults to uniform.
             nu_pos, nu_x, nu_e (float): Cosine schedule exponents per feature.
                 nu_pos > nu_e destroys coordinates faster than graph structure.
             lambda_pos, lambda_x, lambda_e (float): Loss weights.
@@ -68,6 +68,7 @@ class CityJSONDiffusionModule(L.LightningModule):
         # run, not the model, and must not travel with a checkpoint.
         self._nonfinite_skips = 0
         self.num_node_classes = num_node_classes
+        self.num_edge_classes = num_edge_classes
         self.lr_scheduler = lr_scheduler
         self.lr_decay_steps = lr_decay_steps
         self.lr_decay_rate = lr_decay_rate
@@ -78,7 +79,7 @@ class CityJSONDiffusionModule(L.LightningModule):
         if x_marginals is None:
             x_marginals = torch.ones(num_node_classes) / num_node_classes
         if e_marginals is None:
-            e_marginals = torch.ones(NUM_EDGE_CLASSES) / NUM_EDGE_CLASSES
+            e_marginals = torch.ones(num_edge_classes) / num_edge_classes
         x_marginals = torch.as_tensor(x_marginals, dtype=torch.float32)
         e_marginals = torch.as_tensor(e_marginals, dtype=torch.float32)
 
@@ -93,7 +94,7 @@ class CityJSONDiffusionModule(L.LightningModule):
 
         self.network = rEGNNTransformer(
             num_node_classes=num_node_classes,
-            num_edge_classes=NUM_EDGE_CLASSES,
+            num_edge_classes=num_edge_classes,
             hidden_dim=hidden_dim,
             edge_dim=edge_dim,
             global_dim=global_dim,
@@ -132,9 +133,9 @@ class CityJSONDiffusionModule(L.LightningModule):
         R0 = self._centre_positions(batch["x"], batch["node_mask"]) / self.coord_scale
         X0 = batch["node_categories"]
         E0 = zero_diagonal(
-            F.one_hot(batch["y"].squeeze(-1).long(), NUM_EDGE_CLASSES).float()
+            F.one_hot(batch["y"].squeeze(-1).long(), self.num_edge_classes).float()
         )
-        # Every node participates: Virtual is a class, not padding.
+        # Every node participates: Off is a class, not padding.
         net_mask = torch.ones_like(batch["node_mask"])
         return R0, X0, E0, net_mask
 
@@ -165,7 +166,7 @@ class CityJSONDiffusionModule(L.LightningModule):
         n = E0.shape[1]
         off_diag = ~torch.eye(n, dtype=torch.bool, device=E0.device)
         edge_loss = F.cross_entropy(
-            E_pred[:, off_diag].reshape(-1, NUM_EDGE_CLASSES),
+            E_pred[:, off_diag].reshape(-1, self.num_edge_classes),
             E0[:, off_diag].argmax(dim=-1).reshape(-1),
         )
 
@@ -230,8 +231,9 @@ class CityJSONDiffusionModule(L.LightningModule):
 
         node_mask = batch["node_mask"]
         coord_mse = self._active_coord_mse(R_pred, R0, node_mask)
-        # Plain accuracy is inflated by the ~80% Virtual majority; report
-        # precision/recall of the minority Active class instead.
+        # Plain accuracy is inflated by the Off-padding majority; report
+        # precision/recall of the minority vertex class (class 0) instead.
+        # Metric names kept for dashboard continuity: "real" == vertex.
         pred_active = X_pred.argmax(dim=-1) == 0
         true_active = batch["node_categories"].argmax(dim=-1) == 0
         tp = (pred_active & true_active).float().sum()
@@ -292,8 +294,8 @@ class CityJSONDiffusionModule(L.LightningModule):
         Returns:
             pos (Tensor): [B, n_max, 3] coordinates, in scaled units. Multiply by
                 `coord_scale` for metres.
-            edge_probs (Tensor): [B, n_max, n_max] the sampled adjacency, in {0, 1}.
-            active_mask (Tensor): [B, n_max] bool, True where the node is Active.
+            node_labels (Tensor): [B, n_max] long, sampled node class labels.
+            edge_labels (Tensor): [B, n_max, n_max] long, sampled edge class labels.
         """
         self.eval()
         N = self.n_max
@@ -313,40 +315,38 @@ class CityJSONDiffusionModule(L.LightningModule):
             )
 
         # The chain's final state is the sample; do not re-read the network head.
-        edge_probs = E_t[..., 1]
-        active_mask = X_t.argmax(dim=-1) == 0
-        return pos, edge_probs, active_mask
+        node_labels = X_t.argmax(dim=-1)
+        edge_labels = E_t.argmax(dim=-1)
+        return pos, node_labels, edge_labels
 
     # ------------------------------------------------------------------
     # CityJSON generation
     # ------------------------------------------------------------------
 
     @torch.no_grad()
-    def generate_cityjson(self, batch_size=1, threshold=0.5):
+    def generate_cityjson(self, batch_size=1):
         """
         Generates buildings via diffusion sampling and exports each as a CityJSON dict.
         """
+        from src.dataset.dataset import VERTEX
         from src.post_process.post_process import graph_to_cityjson
 
-        Rt, edge_probs, active_mask = self.sample(batch_size=batch_size)
+        pos, node_labels, edge_labels = self.sample(batch_size=batch_size)
 
         results = []
         for i in range(batch_size):
-            mask_i = active_mask[i]
-            active_indices = mask_i.nonzero(as_tuple=True)[0]
-
-            if len(active_indices) < 3:
-                logger.warning(f"Building {i} has only {len(active_indices)} active nodes, skipping.")
+            n_vertices = int((node_labels[i] == VERTEX).sum())
+            if n_vertices < 3:
+                logger.warning(f"Building {i} has only {n_vertices} vertex nodes, skipping.")
                 continue
 
             # The chain runs in scaled units; CityJSON is metres.
-            nodes = (Rt[i, active_indices] * self.coord_scale).cpu().numpy()
-            edges = edge_probs[i][active_indices][:, active_indices].cpu().numpy()
-
+            coords = (pos[i] * self.coord_scale).cpu().numpy()
             cj = graph_to_cityjson(
-                nodes, edges,
-                threshold=threshold,
-                building_id=f"generated_building_{i}"
+                coords,
+                node_labels[i].cpu().numpy(),
+                edge_labels[i].cpu().numpy(),
+                building_id=f"generated_building_{i}",
             )
             if cj:
                 results.append(cj)

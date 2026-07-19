@@ -40,6 +40,7 @@ def create_model(cfg: Config, n_max: int, x_marginals=None, e_marginals=None,
     """
     return CityJSONDiffusionModule(
         num_node_classes=cfg.model.num_node_classes,
+        num_edge_classes=cfg.model.num_edge_classes,
         hidden_dim=cfg.model.hidden_dim,
         edge_dim=cfg.model.edge_dim,
         global_dim=cfg.model.global_dim,
