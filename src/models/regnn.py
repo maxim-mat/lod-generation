@@ -10,7 +10,7 @@ the diffusion timestep. Positions are updated by an EGNN-style velocity
 (a weighted sum of relative displacements) normalised by SE3Norm, which keeps
 the update rotation-equivariant and scale-stable.
 
-Two symmetry groups are supported via `equivariance`:
+Three symmetry groups are supported via `equivariance`:
 
   "o3"  Faithful MiDi. Every positional feature is rotation-invariant, so the
         learned density satisfies p(G) = p(R.G) for any rotation/reflection R.
@@ -26,6 +26,11 @@ Two symmetry groups are supported via `equivariance`:
         (sec. 4.3: relaxing translation invariance is valid because zero-CoM defines
         a canonical pose for the translation group) from translations to the gravity
         subgroup.
+
+  "se2" so2's feature set, but the zero-CoM projections remove the xy mean
+        only: z is absolute (standardised upstream by the train-split `z_shift`).
+        The quotiented group is exactly SE(2) — yaw plus horizontal translation —
+        so ground height and building elevation become model-visible.
 """
 import math
 
@@ -45,7 +50,7 @@ from src.models.layers import (
 )
 
 
-def mask_graph(X, E, pos, node_mask):
+def mask_graph(X, E, pos, node_mask, xy_only=False):
     """Apply node/edge masks, drop self-loops, and re-centre positions."""
     x_mask = node_mask.unsqueeze(-1)                 # [B, N, 1]
     e_mask1 = x_mask.unsqueeze(2)                    # [B, N, 1, 1]
@@ -56,7 +61,7 @@ def mask_graph(X, E, pos, node_mask):
 
     X = X * x_mask
     E = E * e_mask1 * e_mask2 * diag_mask
-    pos = remove_mean_with_mask(pos * x_mask, node_mask)
+    pos = remove_mean_with_mask(pos * x_mask, node_mask, xy_only=xy_only)
     return X, E, pos
 
 
@@ -66,8 +71,10 @@ class NodeEdgeBlock(nn.Module):
     def __init__(self, dx, de, dy, n_head, equivariance="so2"):
         super().__init__()
         assert dx % n_head == 0, f"dx: {dx} -- n_head: {n_head}"
-        if equivariance not in ("o3", "so2"):
-            raise ValueError(f"Unknown equivariance: {equivariance!r}. Must be 'o3' or 'so2'.")
+        if equivariance not in ("o3", "so2", "se2"):
+            raise ValueError(
+                f"Unknown equivariance: {equivariance!r}. Must be 'o3', 'so2' or 'se2'."
+            )
         self.dx, self.de, self.dy = dx, de, dy
         self.df = int(dx / n_head)
         self.n_head = n_head
@@ -79,10 +86,10 @@ class NodeEdgeBlock(nn.Module):
         self.x_e_mul1 = Linear(dx, de)
         self.x_e_mul2 = Linear(dx, de)
 
-        # Geometry encoding. "so2" adds the height z_i and the vertical/horizontal
-        # split of each displacement, which are yaw-invariant but not O(3)-invariant.
-        node_geom_dim = 2 if equivariance == "so2" else 1
-        pair_geom_dim = 4 if equivariance == "so2" else 2
+        # Geometry encoding. "so2"/"se2" add the height z_i and the vertical/
+        # horizontal split of each displacement: yaw-invariant, not O(3)-invariant.
+        node_geom_dim = 2 if equivariance in ("so2", "se2") else 1
+        pair_geom_dim = 4 if equivariance in ("so2", "se2") else 2
         self.lin_dist1 = Linear(pair_geom_dim, de)
         self.lin_norm_pos1 = Linear(node_geom_dim, de)
         self.lin_norm_pos2 = Linear(node_geom_dim, de)
@@ -138,7 +145,7 @@ class NodeEdgeBlock(nn.Module):
         pos_info = torch.cat((pairwise_dist, cosines), dim=-1)
         node_info = norm_pos
 
-        if self.equivariance == "so2":
+        if self.equivariance in ("so2", "se2"):
             # Yaw-invariant, but not O(3)-invariant: the height of a node and the
             # vertical/horizontal split of each displacement. |dz| rather than dz
             # keeps the pair features symmetric in (i, j), as E must be.
@@ -204,7 +211,7 @@ class NodeEdgeBlock(nn.Module):
 
         messages = self.e_pos2(F.relu(self.e_pos1(Y)))                   # [B, N, N, 1]
         vel = (messages * delta_pos).sum(dim=2) * x_mask
-        vel = remove_mean_with_mask(vel, node_mask)
+        vel = remove_mean_with_mask(vel, node_mask, xy_only=self.equivariance == "se2")
 
         return Xout, Eout, yout, vel
 
@@ -264,7 +271,9 @@ class XEyTransformerLayer(nn.Module):
         ff_output_y = self.dropout_y3(self.lin_y2(self.dropout_y2(self.activation(self.lin_y1(y)))))
         y = self.norm_y2(y + ff_output_y)
 
-        X, E, new_pos = mask_graph(X, E, new_pos, node_mask)
+        X, E, new_pos = mask_graph(
+            X, E, new_pos, node_mask, xy_only=self.self_attn.equivariance == "se2"
+        )
         return X, E, y, new_pos
 
 
@@ -286,11 +295,13 @@ class rEGNNTransformer(nn.Module):
             num_layers (int): Number of XEyTransformerLayer blocks.
             pos_mlp_dim (int): Hidden width of the input/output PositionsMLP.
             equivariance (str): 'so2' (yaw only, buildings have a canonical
-                vertical) or 'o3' (faithful MiDi). See the module docstring.
+                vertical), 'se2' (so2 features, xy-only CoM, absolute z) or
+                'o3' (faithful MiDi). See the module docstring.
         """
         super().__init__()
         self.num_node_classes = num_node_classes
         self.num_edge_classes = num_edge_classes
+        self.xy_only = equivariance == "se2"
 
         act = nn.ReLU()
         # The global feature carries only the normalised timestep.
@@ -303,7 +314,7 @@ class rEGNNTransformer(nn.Module):
         self.mlp_in_E = nn.Sequential(
             nn.Linear(num_edge_classes, edge_dim), act, nn.Linear(edge_dim, edge_dim), act
         )
-        self.mlp_in_pos = PositionsMLP(pos_mlp_dim)
+        self.mlp_in_pos = PositionsMLP(pos_mlp_dim, xy_only=self.xy_only)
 
         self.tf_layers = nn.ModuleList([
             XEyTransformerLayer(
@@ -320,7 +331,7 @@ class rEGNNTransformer(nn.Module):
         self.mlp_out_E = nn.Sequential(
             nn.Linear(edge_dim, edge_dim), act, nn.Linear(edge_dim, num_edge_classes)
         )
-        self.mlp_out_pos = PositionsMLP(pos_mlp_dim)
+        self.mlp_out_pos = PositionsMLP(pos_mlp_dim, xy_only=self.xy_only)
 
     def forward(self, X_t, R_t, Y_t, t_norm, node_mask=None):
         """
@@ -353,7 +364,8 @@ class rEGNNTransformer(nn.Module):
         new_E = (new_E + new_E.transpose(1, 2)) / 2
 
         X, E, pos = mask_graph(
-            self.mlp_in_X(X_t), new_E, self.mlp_in_pos(R_t, node_mask), node_mask
+            self.mlp_in_X(X_t), new_E, self.mlp_in_pos(R_t, node_mask), node_mask,
+            xy_only=self.xy_only,
         )
         y = self.mlp_in_y(t_norm)
 
@@ -365,5 +377,5 @@ class rEGNNTransformer(nn.Module):
         E = 0.5 * (E + torch.transpose(E, 1, 2))
         pos = self.mlp_out_pos(pos, node_mask)
 
-        X, E, pos = mask_graph(X, E, pos, node_mask)
+        X, E, pos = mask_graph(X, E, pos, node_mask, xy_only=self.xy_only)
         return pos, E, X

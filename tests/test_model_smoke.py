@@ -16,7 +16,7 @@ from src.models.regnn import rEGNNTransformer
 B, N = 2, 6
 
 
-@pytest.mark.parametrize("equivariance", ["so2", "o3"])
+@pytest.mark.parametrize("equivariance", ["so2", "se2", "o3"])
 def test_network_forward_shapes(equivariance):
     net = rEGNNTransformer(num_node_classes=NUM_NODE_CLASSES,
                            num_edge_classes=NUM_EDGE_CLASSES,

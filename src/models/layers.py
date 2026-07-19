@@ -19,16 +19,20 @@ from torch.nn import init
 _VAR_EPS = 1e-6
 
 
-def remove_mean_with_mask(x, node_mask):
+def remove_mean_with_mask(x, node_mask, xy_only=False):
     """Project onto the zero centre-of-mass subspace, ignoring padded nodes.
 
     Args:
         x (Tensor): [B, N, D]
         node_mask (Tensor): [B, N], 1 for active nodes.
+        xy_only (bool): se2 mode — remove the mean of the first two components
+            only; the last (z) passes through untouched.
     """
     mask = node_mask.unsqueeze(-1).to(x.dtype)
     num_nodes = mask.sum(dim=1, keepdim=True).clamp(min=1)
     mean = (x * mask).sum(dim=1, keepdim=True) / num_nodes
+    if xy_only:
+        mean = torch.cat((mean[..., :2], torch.zeros_like(mean[..., 2:])), dim=-1)
     return (x - mean) * mask
 
 
@@ -71,9 +75,10 @@ class SE3Norm(nn.Module):
 class PositionsMLP(nn.Module):
     """Rescale each position by an MLP of its norm, then re-centre."""
 
-    def __init__(self, hidden_dim, eps=1e-5):
+    def __init__(self, hidden_dim, eps=1e-5, xy_only=False):
         super().__init__()
         self.eps = eps
+        self.xy_only = xy_only
         self.mlp = nn.Sequential(nn.Linear(1, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, 1))
 
     def forward(self, pos, node_mask):
@@ -81,7 +86,7 @@ class PositionsMLP(nn.Module):
         new_norm = self.mlp(norm)                                        # [B, N, 1]
         new_pos = pos * new_norm / (norm + self.eps)
         new_pos = new_pos * node_mask.unsqueeze(-1)
-        return remove_mean_with_mask(new_pos, node_mask)
+        return remove_mean_with_mask(new_pos, node_mask, xy_only=self.xy_only)
 
 
 class Xtoy(nn.Module):
