@@ -88,9 +88,9 @@ def test_generate_cityjson_restores_z_shift(monkeypatch):
     model.generate_cityjson(batch_size=1)
 
     assert torch.allclose(torch.as_tensor(seen["coords"][:, :2]),
-                          torch.full((4, 2), 2.0), atol=1e-6)
+                          torch.full((4, 2), 2.0, dtype=torch.float64), atol=1e-6)
     assert torch.allclose(torch.as_tensor(seen["coords"][:, 2]),
-                          torch.full((4,), 9.0), atol=1e-6)   # 1 * 2 + 7
+                          torch.full((4,), 9.0, dtype=torch.float64), atol=1e-6)   # 1 * 2 + 7
 
 
 def test_z_shift_survives_checkpoint(tmp_path):

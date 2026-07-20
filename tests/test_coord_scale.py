@@ -127,7 +127,7 @@ def test_generate_cityjson_restores_metres(monkeypatch):
     results = model.generate_cityjson(batch_size=1)
 
     assert len(results) == 1
-    assert torch.allclose(torch.as_tensor(seen["coords"]), pos[0] * scale, atol=1e-6)
+    assert torch.allclose(torch.as_tensor(seen["coords"]), (pos[0] * scale).double(), atol=1e-6)
 
 
 def test_coord_scale_survives_a_checkpoint_roundtrip(tmp_path):

@@ -358,6 +358,13 @@ class CityJSONDiffusionModule(L.LightningModule):
     # CityJSON generation
     # ------------------------------------------------------------------
 
+    def _denormalize_coords(self, pos_i):
+        """Scaled-unit positions [N,3] -> metres. Inverse of the target normalization:
+        multiply by coord_scale, then restore the se2 z offset."""
+        coords = (pos_i * self.coord_scale).detach().cpu().numpy().astype(float)
+        coords[:, 2] += self.z_shift
+        return coords
+
     @torch.no_grad()
     def generate_cityjson(self, batch_size=1):
         """
@@ -377,8 +384,7 @@ class CityJSONDiffusionModule(L.LightningModule):
 
             # The chain runs in scaled units; CityJSON is metres. se2 keeps
             # absolute heights: restore the z offset the targets subtracted.
-            coords = (pos[i] * self.coord_scale).cpu().numpy()
-            coords[:, 2] += self.z_shift
+            coords = self._denormalize_coords(pos[i])
             cj = graph_to_cityjson(
                 coords,
                 node_labels[i].cpu().numpy(),
