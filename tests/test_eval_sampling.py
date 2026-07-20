@@ -1,6 +1,8 @@
 import numpy as np
 import torch
 
+from src.dataset.dataset import VERTEX, WALL, EDGE_VF, EDGE_VV
+from src.eval.sampling import draw_samples
 from src.models.diffusion import CityJSONDiffusionModule
 
 
@@ -20,10 +22,6 @@ def test_denormalize_applies_scale_and_zshift():
     # x,y scaled by 2 (still 0); z = 1*2 + 5 = 7
     assert np.allclose(out[:, :2], 0.0)
     assert np.allclose(out[:, 2], 7.0)
-
-
-from src.dataset.dataset import VERTEX, WALL, EDGE_VF, EDGE_VV
-from src.eval.sampling import draw_samples
 
 
 def test_draw_samples_counts_drops(monkeypatch):
@@ -54,3 +52,4 @@ def test_draw_samples_counts_drops(monkeypatch):
     assert len(records) == 1
     assert records[0]["cityjson"]["type"] == "CityJSON"
     assert records[0]["coords"].shape[1] == 3
+    assert records[0]["coords"].shape[0] == 6
