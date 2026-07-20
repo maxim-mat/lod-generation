@@ -212,22 +212,22 @@ def test_graph_to_cityjson_skips_malformed_faces():
     assert graph_to_cityjson(coords, labels, edge) == {}
 
 
-# ---------------------------------------------------------------- real-fixture round trip
+# ---------------------------------------------------------------- synthetic-fixture round trip
 
-# tests/fixtures/real_lod2_building.city.json is HAND-AUTHORED: a rectangular
+# tests/fixtures/synthetic_lod2_building.city.json is HAND-AUTHORED: a rectangular
 # 8x6m footprint, 3m eaves, gable roof to 5m ridge, at a realistic metric
 # offset (tens of metres) -- not captured survey data. It stays skippable so
 # a genuine dataset building can be dropped in at this path later without
 # touching the test.
-REAL = Path(__file__).parent / "fixtures" / "real_lod2_building.city.json"
+SYNTH = Path(__file__).parent / "fixtures" / "synthetic_lod2_building.city.json"
 
 
-@pytest.mark.skipif(not REAL.exists(), reason="real LoD2 fixture absent")
-def test_real_lod2_round_trip_is_identity(tmp_path):
+@pytest.mark.skipif(not SYNTH.exists(), reason="synthetic LoD2 fixture absent")
+def test_synthetic_lod2_round_trip_is_identity(tmp_path):
     from src.post_process.post_process import graph_to_cityjson
-    g1 = write_and_parse(json.loads(REAL.read_text()), tmp_path, name="real_in.city.json")
+    g1 = write_and_parse(json.loads(SYNTH.read_text()), tmp_path, name="synth_in.city.json")
     cj2 = graph_to_cityjson(*graph_to_dense(g1), building_id="b1")
-    g2 = write_and_parse(cj2, tmp_path, name="real_rt.city.json")
+    g2 = write_and_parse(cj2, tmp_path, name="synth_rt.city.json")
     assert canonical_graph(g2) == canonical_graph(g1)
 
 
