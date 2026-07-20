@@ -1,0 +1,10 @@
+{
+  "type": "val3dity report",
+  "val3dity_version": "2.5.0",
+  "validity": false,
+  "features": [
+    {"id": "building_A", "type": "Building", "validity": true, "errors": []},
+    {"id": "building_B", "type": "Building", "validity": false,
+     "errors": [{"code": 302, "description": "TOO_FEW_POINTS"}]}
+  ]
+}
