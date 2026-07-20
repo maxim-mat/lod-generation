@@ -49,6 +49,12 @@ def reference_features(datamodule, split, feature_set):
 
 
 def run_generative_eval(model, datamodule, cfg, loggers, save_dir):
+    """Sample buildings end-to-end and score them. Returns a dict of scalar metrics.
+
+    Standalone (checkpoint-callable) body; the callback is a thin Lightning adapter.
+    Wires the validity, distribution, novelty and face-coherence arms together and
+    saves/logs the results via `_save_and_log`. Keys are prefixed `gen/`.
+    """
     L.seed_everything(cfg.seed)
     records, stats = draw_samples(model, cfg.num_batches, cfg.batch_size)
 
@@ -72,12 +78,12 @@ def run_generative_eval(model, datamodule, cfg, loggers, save_dir):
     # Wasserstein/MMD/novelty need >=2 samples on each side (variance-based
     # stats divide by n-1 / pairwise distances collapse with a single point).
     # Skip the arm rather than crash when sampling yields too few buildings.
-    if records and datamodule is not None:
+    if records and datamodule is not None and len(records) >= 2:
         gen_X_raw, names = feature_matrix([r["cityjson"] for r in records], cfg.feature_set)
         gen_X = log1p_normalize(gen_X_raw)
         ref_X_raw, ref_names = reference_features(datamodule, "test", cfg.feature_set)
 
-        if len(records) >= 2 and len(ref_X_raw) >= 2:
+        if len(ref_X_raw) >= 2:
             ref_X = log1p_normalize(ref_X_raw)
             metrics.update(per_feature_wasserstein(gen_X, ref_X, names))
             metrics["gen/mmd"] = kernel_mmd(gen_X, ref_X)
@@ -111,8 +117,8 @@ def _save_and_log(records, metrics, loggers, save_dir, cfg):
     for i, rec in enumerate(records[:cfg.log_n_samples]):
         obj = wandb.Object3D(_io_from_obj(cityjson_to_obj(rec["cityjson"])))
         n_v = int((rec["node_labels"] == VERTEX).sum())
-        n_f = len(rec["cityjson"]["CityObjects"]) and \
-            len(next(iter(rec["cityjson"]["CityObjects"].values()))["geometry"][0]["boundaries"][0])
+        city_objects = rec["cityjson"]["CityObjects"]
+        n_f = len(next(iter(city_objects.values()))["geometry"][0]["boundaries"][0]) if city_objects else 0
         table.add_data(f"gen_{i}", n_v, n_f, obj)
     exp.log({"gen/samples": table})
 
