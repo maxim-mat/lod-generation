@@ -36,7 +36,8 @@ class CityJSONDiffusionModule(L.LightningModule):
                  nu_pos=2.5, nu_x=1.0, nu_e=1.5,
                  lambda_pos=3.0, lambda_x=0.4, lambda_e=2.0,
                  coord_scale=1.0, equivariance="so2", z_shift=0.0,
-                 time_embed="scalar"):
+                 time_embed="scalar", dist_embed="raw", dist_embed_dim=16,
+                 dist_r_max=None):
         """
         Args:
             discrete_noise_type (str): 'marginal' (limit distribution = training
@@ -63,6 +64,12 @@ class CityJSONDiffusionModule(L.LightningModule):
                 a hyperparameter like `coord_scale`.
             time_embed (str): 'scalar' (raw t/T, MiDi's design) or 'sinusoidal'
                 (Fourier lift of t/T before the global-feature MLP).
+            dist_embed (str): pairwise-distance featurization -- 'raw' (MiDi),
+                'sinusoidal', 'mlp' or 'bessel'. See `rEGNNTransformer`.
+            dist_embed_dim (int): feature width of the distance lift (ignored for
+                'raw'). dist_r_max (float): Bessel cutoff in normalised units,
+                from `CityJSONDataModule.compute_dist_r_max`. Both saved as
+                hyperparameters, so inference restores them from the checkpoint.
         """
         super().__init__()
         self.save_hyperparameters()
@@ -116,6 +123,9 @@ class CityJSONDiffusionModule(L.LightningModule):
             dropout=dropout,
             equivariance=equivariance,
             time_embed=time_embed,
+            dist_embed=dist_embed,
+            dist_embed_dim=dist_embed_dim,
+            dist_r_max=dist_r_max,
         )
 
     # ------------------------------------------------------------------

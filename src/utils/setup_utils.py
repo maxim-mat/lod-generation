@@ -29,7 +29,8 @@ def create_datamodule(cfg: Config) -> CityJSONDataModule:
 
 
 def create_model(cfg: Config, n_max: int, x_marginals=None, e_marginals=None,
-                 coord_scale: float = 1.0, z_shift: float = 0.0) -> CityJSONDiffusionModule:
+                 coord_scale: float = 1.0, z_shift: float = 0.0,
+                 dist_r_max=None) -> CityJSONDiffusionModule:
     """Create CityJSON Diffusion Module from configuration.
 
     Args:
@@ -68,6 +69,9 @@ def create_model(cfg: Config, n_max: int, x_marginals=None, e_marginals=None,
         equivariance=cfg.model.equivariance,
         z_shift=z_shift,
         time_embed=cfg.model.time_embed,
+        dist_embed=cfg.model.dist_embed,
+        dist_embed_dim=cfg.model.dist_embed_dim,
+        dist_r_max=dist_r_max,
     )
 
 

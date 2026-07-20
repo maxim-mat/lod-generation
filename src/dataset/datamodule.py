@@ -209,6 +209,48 @@ class CityJSONDataModule(L.LightningDataModule):
         # A degenerate split (every building a single point) would give 0.
         return max(math.sqrt(variance), 1e-6)
 
+    def compute_dist_r_max(self, coord_scale, quantile=0.999):
+        """Cutoff radius r_max for the Bessel distance basis, in the model's
+        normalised coordinate units, from the train split.
+
+        The DimeNet Bessel basis needs a length scale to place its zeros across.
+        Rather than a preset molecular default, take a high quantile of the
+        per-building maximum pairwise distance (robust to a few oversized
+        footprints) and divide by `coord_scale` to match the normalised
+        coordinates the network sees. Pairwise distances are translation- and
+        z-shift-invariant, so no centring is needed.
+
+        Efficient on the fly: one pass over the (already in-memory) train split,
+        a small `cdist` per building -- the same order of work as
+        `compute_coord_scale`, not a new heavyweight traversal. Computed on the
+        train split only, so val/test do not leak in.
+
+        Args:
+            coord_scale (float): metres per normalised unit, from
+                `compute_coord_scale`.
+            quantile (float): distance quantile used as the cutoff.
+
+        Returns:
+            float: r_max in normalised units, strictly positive.
+        """
+        if self.train_dataset is None:
+            raise RuntimeError("compute_dist_r_max() requires setup() to have run first.")
+
+        per_building = []
+        for item in self.train_dataset:
+            if isinstance(item, tuple):
+                item = item[0]
+            active = item["x"][item["node_mask"].bool()]
+            if active.shape[0] < 2:
+                continue
+            per_building.append(float(torch.cdist(active, active).max()))
+
+        if not per_building:
+            raise ValueError("No multi-node buildings in the train split; cannot compute r_max.")
+
+        r_max_metres = float(torch.tensor(per_building).quantile(quantile))
+        return max(r_max_metres / coord_scale, 1e-6)
+
     def train_dataloader(self):
         return DataLoader(
             self.train_dataset,

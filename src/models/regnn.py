@@ -39,6 +39,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Dropout, LayerNorm, Linear
 
+from src.models.embeddings import SinusoidalTimeEmbedding, build_dist_embed
 from src.models.layers import (
     EtoX,
     Etoy,
@@ -68,7 +69,8 @@ def mask_graph(X, E, pos, node_mask, xy_only=False):
 class NodeEdgeBlock(nn.Module):
     """Self-attention over nodes that also updates edges, positions and globals."""
 
-    def __init__(self, dx, de, dy, n_head, equivariance="so2"):
+    def __init__(self, dx, de, dy, n_head, equivariance="so2",
+                 dist_embed="raw", dist_embed_dim=16, dist_r_max=None):
         super().__init__()
         assert dx % n_head == 0, f"dx: {dx} -- n_head: {n_head}"
         if equivariance not in ("o3", "so2", "se2"):
@@ -86,10 +88,14 @@ class NodeEdgeBlock(nn.Module):
         self.x_e_mul1 = Linear(dx, de)
         self.x_e_mul2 = Linear(dx, de)
 
-        # Geometry encoding. "so2"/"se2" add the height z_i and the vertical/
-        # horizontal split of each displacement: yaw-invariant, not O(3)-invariant.
+        # Geometry encoding. The pairwise distance is lifted by `dist_embed`
+        # (raw = MiDi's single channel). "so2"/"se2" add the height z_i and the
+        # vertical/horizontal split of each displacement: yaw-invariant, not
+        # O(3)-invariant.
+        self.dist_embed, dist_feat_dim = build_dist_embed(dist_embed, dist_embed_dim, dist_r_max)
         node_geom_dim = 2 if equivariance in ("so2", "se2") else 1
-        pair_geom_dim = 4 if equivariance in ("so2", "se2") else 2
+        # distance features + cosine, plus (dz, horiz_dist) under so2/se2.
+        pair_geom_dim = dist_feat_dim + (3 if equivariance in ("so2", "se2") else 1)
         self.lin_dist1 = Linear(pair_geom_dim, de)
         self.lin_norm_pos1 = Linear(node_geom_dim, de)
         self.lin_norm_pos2 = Linear(node_geom_dim, de)
@@ -141,8 +147,9 @@ class NodeEdgeBlock(nn.Module):
         normalized_pos = pos / (norm_pos + 1e-7)
 
         pairwise_dist = torch.cdist(pos, pos).unsqueeze(-1).float()
+        dist_feat = self.dist_embed(pairwise_dist)                       # [B, N, N, K]
         cosines = torch.sum(normalized_pos.unsqueeze(1) * normalized_pos.unsqueeze(2), dim=-1, keepdim=True)
-        pos_info = torch.cat((pairwise_dist, cosines), dim=-1)
+        pos_info = torch.cat((dist_feat, cosines), dim=-1)
         node_info = norm_pos
 
         if self.equivariance in ("so2", "se2"):
@@ -220,9 +227,13 @@ class XEyTransformerLayer(nn.Module):
     """Pre-attention block + feed-forward, with SE3Norm on the position update."""
 
     def __init__(self, dx, de, dy, n_head, dim_ffX=256, dim_ffE=64, dim_ffy=256,
-                 dropout=0.1, layer_norm_eps=1e-5, equivariance="so2"):
+                 dropout=0.1, layer_norm_eps=1e-5, equivariance="so2",
+                 dist_embed="raw", dist_embed_dim=16, dist_r_max=None):
         super().__init__()
-        self.self_attn = NodeEdgeBlock(dx, de, dy, n_head, equivariance=equivariance)
+        self.self_attn = NodeEdgeBlock(
+            dx, de, dy, n_head, equivariance=equivariance,
+            dist_embed=dist_embed, dist_embed_dim=dist_embed_dim, dist_r_max=dist_r_max,
+        )
 
         self.linX1 = Linear(dx, dim_ffX)
         self.linX2 = Linear(dim_ffX, dx)
@@ -277,40 +288,13 @@ class XEyTransformerLayer(nn.Module):
         return X, E, y, new_pos
 
 
-class SinusoidalTimeEmbedding(nn.Module):
-    """Fourier lift of the scalar timestep t/T in [0, 1] to a `dim`-vector.
-
-    A bare scalar into an MLP is hard to learn a high-frequency function of,
-    because ReLU MLPs are biased toward low frequencies (Tancik et al. 2020,
-    "Fourier Features Let Networks Learn High Frequency Functions in Low
-    Dimensional Domains", arXiv:2006.10739). Lifting t onto a bank of
-    sines/cosines gives the downstream MLP the basis to resolve nearby steps.
-    """
-
-    def __init__(self, dim, max_freq=1000.0):
-        super().__init__()
-        if dim % 2 != 0:
-            raise ValueError(f"time embedding dim must be even, got {dim}.")
-        self.dim = dim
-        # ponytail: max_freq ~ T sets the finest step the lift can resolve
-        # (needs max_freq * (1/T) >~ pi). Raise it if T grows past ~500.
-        self.register_buffer(
-            "freqs",
-            torch.exp(torch.linspace(0.0, math.log(max_freq), dim // 2)),
-            persistent=False,
-        )
-
-    def forward(self, t_norm):
-        args = t_norm * self.freqs  # [B, 1] * [dim/2] -> [B, dim/2]
-        return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-
-
 class rEGNNTransformer(nn.Module):
     """Denoising network predicting the clean (pos, E, X) from a noisy graph."""
 
     def __init__(self, num_node_classes=2, num_edge_classes=2, hidden_dim=64,
                  edge_dim=32, global_dim=32, n_head=8, num_layers=4, pos_mlp_dim=16,
-                 dropout=0.1, equivariance="so2", time_embed="scalar"):
+                 dropout=0.1, equivariance="so2", time_embed="scalar",
+                 dist_embed="raw", dist_embed_dim=16, dist_r_max=None):
         """
         Args:
             num_node_classes (int): Node categories (Active / Virtual).
@@ -327,6 +311,15 @@ class rEGNNTransformer(nn.Module):
                 'o3' (faithful MiDi). See the module docstring.
             time_embed (str): 'scalar' (raw t/T into the global-feature MLP,
                 MiDi's design) or 'sinusoidal' (Fourier lift of t/T first).
+            dist_embed (str): pairwise-distance featurization feeding `lin_dist1`.
+                'raw' (MiDi's single raw-distance channel), 'sinusoidal' (Fourier
+                lift), 'mlp' (small learned MLP) or 'bessel' (DimeNet radial Bessel
+                basis with cutoff; needs `dist_r_max`).
+            dist_embed_dim (int): feature width K of the distance lift (even for
+                'sinusoidal'); ignored for 'raw'.
+            dist_r_max (float, optional): Bessel cutoff radius in normalised
+                coordinate units, from `CityJSONDataModule.compute_dist_r_max`.
+                Required for 'bessel', ignored otherwise.
         """
         super().__init__()
         self.num_node_classes = num_node_classes
@@ -361,6 +354,7 @@ class rEGNNTransformer(nn.Module):
                 dx=hidden_dim, de=edge_dim, dy=global_dim, n_head=n_head,
                 dim_ffX=hidden_dim, dim_ffE=edge_dim, dim_ffy=2 * global_dim,
                 dropout=dropout, equivariance=equivariance,
+                dist_embed=dist_embed, dist_embed_dim=dist_embed_dim, dist_r_max=dist_r_max,
             )
             for _ in range(num_layers)
         ])

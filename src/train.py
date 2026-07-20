@@ -61,9 +61,14 @@ def train(cfg: Config):
     if cfg.model.equivariance == "se2":
         logger.info("z shift (se2): %.6f m", z_shift)
 
+    dist_r_max = cfg.data.dist_r_max
+    if cfg.model.dist_embed == "bessel" and dist_r_max is None:
+        dist_r_max = datamodule.compute_dist_r_max(coord_scale)
+        logger.info("Bessel r_max from train split: %.6f (normalised units)", dist_r_max)
+
     model = create_model(cfg, resolved_n_max, x_marginals=x_marginals,
                          e_marginals=e_marginals, coord_scale=coord_scale,
-                         z_shift=z_shift)
+                         z_shift=z_shift, dist_r_max=dist_r_max)
     
     logger.info("Creating loggers and callbacks...")
     exp_loggers = create_loggers(cfg, save_dir)

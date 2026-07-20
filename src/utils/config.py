@@ -20,6 +20,10 @@ class DataConfig:
     # channel is zero-mean under the N(0,1) prior. None = train-split mean
     # vertex z (ignored unless model.equivariance == "se2").
     z_shift: Optional[float] = None
+    # Bessel distance basis (model.dist_embed == "bessel") only: cutoff radius in
+    # normalised coord units. None = compute a high quantile of train-split
+    # pairwise distance on the fly. Ignored for other dist_embed modes.
+    dist_r_max: Optional[float] = None
 
 @dataclass
 class ModelConfig:
@@ -28,6 +32,10 @@ class ModelConfig:
     num_edge_classes: int = 3  # off, vertex-vertex, vertex-face
     equivariance: str = "so2"  # "so2" | "se2" | "o3"
     time_embed: str = "scalar"  # "scalar" (raw t/T) | "sinusoidal" (Fourier lift)
+    # Pairwise-distance featurization into lin_dist1. "raw" = MiDi's single
+    # linear channel; the others lift distance for multi-scale resolution.
+    dist_embed: str = "raw"  # "raw" | "sinusoidal" | "mlp" | "bessel"
+    dist_embed_dim: int = 16  # feature width of the lift (even for sinusoidal); ignored for "raw"
     hidden_dim: int = 64      # dx: node channel width, must be divisible by n_head
     edge_dim: int = 32        # de: edge channel width; drives [B,N,N,de] memory
     global_dim: int = 32      # dy: global feature width
