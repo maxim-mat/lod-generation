@@ -1,5 +1,7 @@
 """Levi representation: parsing and the parse <-> graph_to_cityjson inverse pair."""
 import json
+import shutil
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -208,3 +210,85 @@ def test_graph_to_cityjson_skips_malformed_faces():
     edge[3, 0] = edge[0, 3] = EDGE_VF
     edge[3, 1] = edge[1, 3] = EDGE_VF
     assert graph_to_cityjson(coords, labels, edge) == {}
+
+
+# ---------------------------------------------------------------- real-fixture round trip
+
+# tests/fixtures/real_lod2_building.city.json is HAND-AUTHORED: a rectangular
+# 8x6m footprint, 3m eaves, gable roof to 5m ridge, at a realistic metric
+# offset (tens of metres) -- not captured survey data. It stays skippable so
+# a genuine dataset building can be dropped in at this path later without
+# touching the test.
+REAL = Path(__file__).parent / "fixtures" / "real_lod2_building.city.json"
+
+
+@pytest.mark.skipif(not REAL.exists(), reason="real LoD2 fixture absent")
+def test_real_lod2_round_trip_is_identity(tmp_path):
+    from src.post_process.post_process import graph_to_cityjson
+    g1 = write_and_parse(json.loads(REAL.read_text()), tmp_path, name="real_in.city.json")
+    cj2 = graph_to_cityjson(*graph_to_dense(g1), building_id="b1")
+    g2 = write_and_parse(cj2, tmp_path, name="real_rt.city.json")
+    assert canonical_graph(g2) == canonical_graph(g1)
+
+
+# ---------------------------------------------------------------- non-convex order recovery
+
+# L-shaped (concave) floor face; convex angular sort would cross-link it.
+L_VERTICES = [
+    [0, 0, 0], [2, 0, 0], [2, 1, 0], [1, 1, 0], [1, 2, 0], [0, 2, 0],
+    [0, 0, 1], [2, 0, 1], [2, 1, 1], [1, 1, 1], [1, 2, 1], [0, 2, 1],
+]
+L_FACES = [
+    ([0, 5, 4, 3, 2, 1], "GroundSurface"),
+    ([6, 7, 8, 9, 10, 11], "RoofSurface"),
+    ([0, 1, 7, 6], "WallSurface"), ([1, 2, 8, 7], "WallSurface"),
+    ([2, 3, 9, 8], "WallSurface"), ([3, 4, 10, 9], "WallSurface"),
+    ([4, 5, 11, 10], "WallSurface"), ([5, 0, 6, 11], "WallSurface"),
+]
+
+
+def test_non_convex_face_order_recovered(tmp_path):
+    from src.post_process.post_process import graph_to_cityjson
+    g1 = write_and_parse(make_cityjson(L_VERTICES, L_FACES), tmp_path, name="L.city.json")
+    cj2 = graph_to_cityjson(*graph_to_dense(g1), building_id="b1")
+    g2 = write_and_parse(cj2, tmp_path, name="L_rt.city.json")
+    assert canonical_graph(g2) == canonical_graph(g1)
+    assert solid_volume(cj2) == pytest.approx(3.0)  # L-prism volume
+
+
+# ---------------------------------------------------------------- adversarial generated topology
+
+def test_broken_cycle_falls_back_without_crash():
+    from src.post_process.post_process import graph_to_cityjson
+    # 4 vertices in a face but vv edges form a path, not a cycle -> angle-sort fallback
+    coords = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0], [0.5, 0.5, 0]])
+    labels = np.array([VERTEX, VERTEX, VERTEX, VERTEX, WALL])
+    edge = np.zeros((5, 5), dtype=np.int64)
+    for v in range(4):
+        edge[4, v] = edge[v, 4] = EDGE_VF
+    for a, b in [(0, 1), (1, 2), (2, 3)]:  # open path, no closing edge
+        edge[a, b] = edge[b, a] = EDGE_VV
+    cj = graph_to_cityjson(coords, labels, edge)
+    assert cj["CityObjects"]  # produced a face via fallback, did not crash
+
+
+def test_disconnected_graph_returns_empty():
+    from src.post_process.post_process import graph_to_cityjson
+    coords = np.array([[0, 0, 0], [1, 0, 0]])
+    labels = np.array([VERTEX, VERTEX])          # <3 vertices, no faces
+    edge = np.zeros((2, 2), dtype=np.int64)
+    assert graph_to_cityjson(coords, labels, edge) == {}
+
+
+# ---------------------------------------------------------------- gated val3dity check
+
+@pytest.mark.skipif(shutil.which("val3dity") is None, reason="val3dity not on PATH")
+def test_converted_cube_is_val3dity_valid(tmp_path):
+    import subprocess
+    from src.post_process.post_process import graph_to_cityjson, save_to_file
+    g1 = write_and_parse(make_cityjson(CUBE_VERTICES, CUBE_FACES), tmp_path)
+    cj2 = graph_to_cityjson(*graph_to_dense(g1), building_id="b1")
+    out = tmp_path / "cube.city.json"
+    save_to_file(cj2, out)
+    proc = subprocess.run(["val3dity", str(out), "--report"], capture_output=True, text=True)
+    assert '"validity": true' in proc.stdout or proc.returncode == 0
