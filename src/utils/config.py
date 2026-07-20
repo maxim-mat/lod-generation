@@ -116,6 +116,19 @@ class InferenceConfig:
     output_dir: str = "outputs/generated"
 
 @dataclass
+class GenerativeEvalConfig:
+    """End-of-pipeline full-generation evaluation (fires on test end)."""
+    enabled: bool = False
+    num_batches: int = 4          # batches sampled through the full reverse chain
+    batch_size: int = 16
+    seed: int = 1234              # fixed -> comparable buildings across runs
+    log_n_samples: int = 8        # graphs+geometries persisted locally and to WandB
+    save_dir: Optional[str] = None  # None -> <run_save_dir>/generative_eval
+    feature_set: str = "full"     # "full" | "welldefined"
+    val3dity_path: Optional[str] = None  # None -> shutil.which("val3dity")
+    novelty_tol: float = 0.1      # feature-space distance for a "novel" sample
+
+@dataclass
 class Config:
     """Root configuration class."""
     mode: str = "train"  # "train" or "inference"
@@ -126,5 +139,6 @@ class Config:
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
-    
+    generative_eval: GenerativeEvalConfig = field(default_factory=GenerativeEvalConfig)
+
     resume_from: Optional[str] = None
