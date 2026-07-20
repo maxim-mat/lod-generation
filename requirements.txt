@@ -6,6 +6,7 @@ omegaconf>=2.3.0
 # Data handling & geometry
 numpy>=1.24.0
 pandas>=2.0.0
+scipy>=1.10.0  # ConvexHull + wasserstein_distance for generative eval features/distribution
 
 # Experiment tracking
 tensorboard>=2.12.0
