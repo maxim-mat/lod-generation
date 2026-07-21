@@ -1,5 +1,6 @@
 """Core building geometric feature extraction on synthetic CityJSON fixtures."""
 import numpy as np
+import pytest
 
 from src.eval.building_features import building_features, feature_matrix, mesh_from_cityjson
 
@@ -38,3 +39,29 @@ def test_feature_matrix_stacks():
     X, names = feature_matrix([CUBE, CUBE])
     assert X.shape[0] == 2 and X.shape[1] == len(names)
     assert "volume" in names
+
+
+def test_cube_shape_descriptors():
+    f = building_features(CUBE, feature_set="full")
+    # a cube is maximally cube-like; cubeness ~ 1 (6*V^(2/3)/A = 6*1/6)
+    assert 0.95 <= f["cubeness"] <= 1.0
+    # isotropic point cloud -> equal PCA eigenvalues -> elongation 1
+    assert np.isclose(f["elongation"], 1.0, atol=0.05)
+    # fractality of a unit cube: 1 - log(1)/(1.5 log 6) = 1
+    assert np.isclose(f["fractality"], 1.0)
+    # perimeter is the ground ring (4 unit edges)
+    assert np.isclose(f["perimeter"], 4.0)
+    assert np.isclose(f["num_floors"], 2.0)  # two distinct z levels
+
+
+def test_welldefined_drops_lod1_ambiguous():
+    f = building_features(CUBE, feature_set="welldefined")
+    for dropped in ("num_floors", "fractality", "circumference"):
+        assert dropped not in f
+    # but the well-defined descriptors survive
+    assert "cubeness" in f and "shape_index" in f
+
+
+def test_unknown_feature_set_raises():
+    with pytest.raises(ValueError):
+        building_features(CUBE, feature_set="bogus")
