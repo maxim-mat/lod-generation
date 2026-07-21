@@ -499,11 +499,11 @@ git commit -m "feat(eval): core building geometric features"
 **Interfaces:**
 - Produces: `FULL_FEATURES: list[str]` (17), `WELLDEFINED_FEATURES: list[str]` (drops `num_floors, fractality, circumference`); `building_features(cj, feature_set)` returns the selected set; `feature_matrix` honors `feature_set`.
 
-- [ ] **Step 1: Fetch the formulas**
+- [x] **Step 1: Fetch the formulas**
 
 Retrieve 3dSAGER Table 1 (arXiv:2511.06300) and the four ported descriptors from `tudelft3d/3d-building-metrics`. Record each formula in a comment above its implementation with attribution.
 
-- [ ] **Step 2: Write failing analytic tests**
+- [x] **Step 2: Write failing analytic tests**
 
 ```python
 # tests/test_eval_features.py — append
@@ -523,21 +523,21 @@ def test_welldefined_drops_lod1_ambiguous():
         assert dropped not in f
 ```
 
-- [ ] **Step 3: Run to verify it fails**
+- [x] **Step 3: Run to verify it fails**
 
 Run: `python -m pytest tests/test_eval_features.py -k descriptors -v`
 Expected: FAIL (`KeyError: 'cubeness'`).
 
-- [ ] **Step 4: Implement the descriptors + selection**
+- [x] **Step 4: Implement the descriptors + selection**
 
 Add each descriptor function (with the fetched formula + attribution), define `FULL_FEATURES`/`WELLDEFINED_FEATURES`, and make `building_features`/`feature_matrix` select by `feature_set` (`"full"` default, `"welldefined"` subset; unknown → raise `ValueError`).
 
-- [ ] **Step 5: Run to verify it passes**
+- [x] **Step 5: Run to verify it passes**
 
 Run: `python -m pytest tests/test_eval_features.py -v`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/eval/building_features.py tests/test_eval_features.py
