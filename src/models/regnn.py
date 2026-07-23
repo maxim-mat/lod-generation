@@ -10,7 +10,7 @@ the diffusion timestep. Positions are updated by an EGNN-style velocity
 (a weighted sum of relative displacements) normalised by SE3Norm, which keeps
 the update rotation-equivariant and scale-stable.
 
-Two symmetry groups are supported via `equivariance`:
+Three symmetry groups are supported via `equivariance`:
 
   "o3"  Faithful MiDi. Every positional feature is rotation-invariant, so the
         learned density satisfies p(G) = p(R.G) for any rotation/reflection R.
@@ -26,6 +26,11 @@ Two symmetry groups are supported via `equivariance`:
         (sec. 4.3: relaxing translation invariance is valid because zero-CoM defines
         a canonical pose for the translation group) from translations to the gravity
         subgroup.
+
+  "se2" so2's feature set, but the zero-CoM projections remove the xy mean
+        only: z is absolute (standardised upstream by the train-split `z_shift`).
+        The quotiented group is exactly SE(2) — yaw plus horizontal translation —
+        so ground height and building elevation become model-visible.
 """
 import math
 
@@ -34,6 +39,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Dropout, LayerNorm, Linear
 
+from src.models.embeddings import SinusoidalTimeEmbedding, build_dist_embed
 from src.models.layers import (
     EtoX,
     Etoy,
@@ -45,7 +51,7 @@ from src.models.layers import (
 )
 
 
-def mask_graph(X, E, pos, node_mask):
+def mask_graph(X, E, pos, node_mask, xy_only=False):
     """Apply node/edge masks, drop self-loops, and re-centre positions."""
     x_mask = node_mask.unsqueeze(-1)                 # [B, N, 1]
     e_mask1 = x_mask.unsqueeze(2)                    # [B, N, 1, 1]
@@ -56,18 +62,21 @@ def mask_graph(X, E, pos, node_mask):
 
     X = X * x_mask
     E = E * e_mask1 * e_mask2 * diag_mask
-    pos = remove_mean_with_mask(pos * x_mask, node_mask)
+    pos = remove_mean_with_mask(pos * x_mask, node_mask, xy_only=xy_only)
     return X, E, pos
 
 
 class NodeEdgeBlock(nn.Module):
     """Self-attention over nodes that also updates edges, positions and globals."""
 
-    def __init__(self, dx, de, dy, n_head, equivariance="so2"):
+    def __init__(self, dx, de, dy, n_head, equivariance="so2",
+                 dist_embed="raw", dist_embed_dim=16, dist_r_max=None):
         super().__init__()
         assert dx % n_head == 0, f"dx: {dx} -- n_head: {n_head}"
-        if equivariance not in ("o3", "so2"):
-            raise ValueError(f"Unknown equivariance: {equivariance!r}. Must be 'o3' or 'so2'.")
+        if equivariance not in ("o3", "so2", "se2"):
+            raise ValueError(
+                f"Unknown equivariance: {equivariance!r}. Must be 'o3', 'so2' or 'se2'."
+            )
         self.dx, self.de, self.dy = dx, de, dy
         self.df = int(dx / n_head)
         self.n_head = n_head
@@ -79,10 +88,14 @@ class NodeEdgeBlock(nn.Module):
         self.x_e_mul1 = Linear(dx, de)
         self.x_e_mul2 = Linear(dx, de)
 
-        # Geometry encoding. "so2" adds the height z_i and the vertical/horizontal
-        # split of each displacement, which are yaw-invariant but not O(3)-invariant.
-        node_geom_dim = 2 if equivariance == "so2" else 1
-        pair_geom_dim = 4 if equivariance == "so2" else 2
+        # Geometry encoding. The pairwise distance is lifted by `dist_embed`
+        # (raw = MiDi's single channel). "so2"/"se2" add the height z_i and the
+        # vertical/horizontal split of each displacement: yaw-invariant, not
+        # O(3)-invariant.
+        self.dist_embed, dist_feat_dim = build_dist_embed(dist_embed, dist_embed_dim, dist_r_max)
+        node_geom_dim = 2 if equivariance in ("so2", "se2") else 1
+        # distance features + cosine, plus (dz, horiz_dist) under so2/se2.
+        pair_geom_dim = dist_feat_dim + (3 if equivariance in ("so2", "se2") else 1)
         self.lin_dist1 = Linear(pair_geom_dim, de)
         self.lin_norm_pos1 = Linear(node_geom_dim, de)
         self.lin_norm_pos2 = Linear(node_geom_dim, de)
@@ -134,11 +147,12 @@ class NodeEdgeBlock(nn.Module):
         normalized_pos = pos / (norm_pos + 1e-7)
 
         pairwise_dist = torch.cdist(pos, pos).unsqueeze(-1).float()
+        dist_feat = self.dist_embed(pairwise_dist)                       # [B, N, N, K]
         cosines = torch.sum(normalized_pos.unsqueeze(1) * normalized_pos.unsqueeze(2), dim=-1, keepdim=True)
-        pos_info = torch.cat((pairwise_dist, cosines), dim=-1)
+        pos_info = torch.cat((dist_feat, cosines), dim=-1)
         node_info = norm_pos
 
-        if self.equivariance == "so2":
+        if self.equivariance in ("so2", "se2"):
             # Yaw-invariant, but not O(3)-invariant: the height of a node and the
             # vertical/horizontal split of each displacement. |dz| rather than dz
             # keeps the pair features symmetric in (i, j), as E must be.
@@ -204,7 +218,7 @@ class NodeEdgeBlock(nn.Module):
 
         messages = self.e_pos2(F.relu(self.e_pos1(Y)))                   # [B, N, N, 1]
         vel = (messages * delta_pos).sum(dim=2) * x_mask
-        vel = remove_mean_with_mask(vel, node_mask)
+        vel = remove_mean_with_mask(vel, node_mask, xy_only=self.equivariance == "se2")
 
         return Xout, Eout, yout, vel
 
@@ -213,9 +227,13 @@ class XEyTransformerLayer(nn.Module):
     """Pre-attention block + feed-forward, with SE3Norm on the position update."""
 
     def __init__(self, dx, de, dy, n_head, dim_ffX=256, dim_ffE=64, dim_ffy=256,
-                 dropout=0.1, layer_norm_eps=1e-5, equivariance="so2"):
+                 dropout=0.1, layer_norm_eps=1e-5, equivariance="so2",
+                 dist_embed="raw", dist_embed_dim=16, dist_r_max=None):
         super().__init__()
-        self.self_attn = NodeEdgeBlock(dx, de, dy, n_head, equivariance=equivariance)
+        self.self_attn = NodeEdgeBlock(
+            dx, de, dy, n_head, equivariance=equivariance,
+            dist_embed=dist_embed, dist_embed_dim=dist_embed_dim, dist_r_max=dist_r_max,
+        )
 
         self.linX1 = Linear(dx, dim_ffX)
         self.linX2 = Linear(dim_ffX, dx)
@@ -264,7 +282,9 @@ class XEyTransformerLayer(nn.Module):
         ff_output_y = self.dropout_y3(self.lin_y2(self.dropout_y2(self.activation(self.lin_y1(y)))))
         y = self.norm_y2(y + ff_output_y)
 
-        X, E, new_pos = mask_graph(X, E, new_pos, node_mask)
+        X, E, new_pos = mask_graph(
+            X, E, new_pos, node_mask, xy_only=self.self_attn.equivariance == "se2"
+        )
         return X, E, y, new_pos
 
 
@@ -273,7 +293,8 @@ class rEGNNTransformer(nn.Module):
 
     def __init__(self, num_node_classes=2, num_edge_classes=2, hidden_dim=64,
                  edge_dim=32, global_dim=32, n_head=8, num_layers=4, pos_mlp_dim=16,
-                 dropout=0.1, equivariance="so2"):
+                 dropout=0.1, equivariance="so2", time_embed="scalar",
+                 dist_embed="raw", dist_embed_dim=16, dist_r_max=None):
         """
         Args:
             num_node_classes (int): Node categories (Active / Virtual).
@@ -286,16 +307,39 @@ class rEGNNTransformer(nn.Module):
             num_layers (int): Number of XEyTransformerLayer blocks.
             pos_mlp_dim (int): Hidden width of the input/output PositionsMLP.
             equivariance (str): 'so2' (yaw only, buildings have a canonical
-                vertical) or 'o3' (faithful MiDi). See the module docstring.
+                vertical), 'se2' (so2 features, xy-only CoM, absolute z) or
+                'o3' (faithful MiDi). See the module docstring.
+            time_embed (str): 'scalar' (raw t/T into the global-feature MLP,
+                MiDi's design) or 'sinusoidal' (Fourier lift of t/T first).
+            dist_embed (str): pairwise-distance featurization feeding `lin_dist1`.
+                'raw' (MiDi's single raw-distance channel), 'sinusoidal' (Fourier
+                lift), 'mlp' (small learned MLP) or 'bessel' (DimeNet radial Bessel
+                basis with cutoff; needs `dist_r_max`).
+            dist_embed_dim (int): feature width K of the distance lift (even for
+                'sinusoidal'); ignored for 'raw'.
+            dist_r_max (float, optional): Bessel cutoff radius in normalised
+                coordinate units, from `CityJSONDataModule.compute_dist_r_max`.
+                Required for 'bessel', ignored otherwise.
         """
         super().__init__()
         self.num_node_classes = num_node_classes
         self.num_edge_classes = num_edge_classes
+        self.xy_only = equivariance == "se2"
+
+        if time_embed not in ("scalar", "sinusoidal"):
+            raise ValueError(
+                f"time_embed must be 'scalar' or 'sinusoidal', got {time_embed!r}."
+            )
 
         act = nn.ReLU()
-        # The global feature carries only the normalised timestep.
+        # The global feature carries only the timestep: either the raw scalar
+        # t/T (MiDi's design) or a sinusoidal Fourier lift of it.
+        self.time_embed = (
+            SinusoidalTimeEmbedding(global_dim) if time_embed == "sinusoidal" else None
+        )
+        y_in = global_dim if time_embed == "sinusoidal" else 1
         self.mlp_in_y = nn.Sequential(
-            nn.Linear(1, global_dim), act, nn.Linear(global_dim, global_dim), act
+            nn.Linear(y_in, global_dim), act, nn.Linear(global_dim, global_dim), act
         )
         self.mlp_in_X = nn.Sequential(
             nn.Linear(num_node_classes, hidden_dim), act, nn.Linear(hidden_dim, hidden_dim), act
@@ -303,13 +347,14 @@ class rEGNNTransformer(nn.Module):
         self.mlp_in_E = nn.Sequential(
             nn.Linear(num_edge_classes, edge_dim), act, nn.Linear(edge_dim, edge_dim), act
         )
-        self.mlp_in_pos = PositionsMLP(pos_mlp_dim)
+        self.mlp_in_pos = PositionsMLP(pos_mlp_dim, xy_only=self.xy_only)
 
         self.tf_layers = nn.ModuleList([
             XEyTransformerLayer(
                 dx=hidden_dim, de=edge_dim, dy=global_dim, n_head=n_head,
                 dim_ffX=hidden_dim, dim_ffE=edge_dim, dim_ffy=2 * global_dim,
                 dropout=dropout, equivariance=equivariance,
+                dist_embed=dist_embed, dist_embed_dim=dist_embed_dim, dist_r_max=dist_r_max,
             )
             for _ in range(num_layers)
         ])
@@ -320,7 +365,7 @@ class rEGNNTransformer(nn.Module):
         self.mlp_out_E = nn.Sequential(
             nn.Linear(edge_dim, edge_dim), act, nn.Linear(edge_dim, num_edge_classes)
         )
-        self.mlp_out_pos = PositionsMLP(pos_mlp_dim)
+        self.mlp_out_pos = PositionsMLP(pos_mlp_dim, xy_only=self.xy_only)
 
     def forward(self, X_t, R_t, Y_t, t_norm, node_mask=None):
         """
@@ -353,9 +398,10 @@ class rEGNNTransformer(nn.Module):
         new_E = (new_E + new_E.transpose(1, 2)) / 2
 
         X, E, pos = mask_graph(
-            self.mlp_in_X(X_t), new_E, self.mlp_in_pos(R_t, node_mask), node_mask
+            self.mlp_in_X(X_t), new_E, self.mlp_in_pos(R_t, node_mask), node_mask,
+            xy_only=self.xy_only,
         )
-        y = self.mlp_in_y(t_norm)
+        y = self.mlp_in_y(self.time_embed(t_norm) if self.time_embed is not None else t_norm)
 
         for layer in self.tf_layers:
             X, E, y, pos = layer(X, E, y, pos, node_mask)
@@ -365,5 +411,5 @@ class rEGNNTransformer(nn.Module):
         E = 0.5 * (E + torch.transpose(E, 1, 2))
         pos = self.mlp_out_pos(pos, node_mask)
 
-        X, E, pos = mask_graph(X, E, pos, node_mask)
+        X, E, pos = mask_graph(X, E, pos, node_mask, xy_only=self.xy_only)
         return pos, E, X

@@ -7,7 +7,7 @@ class DataConfig:
     """Configuration for dataset and datamodule."""
     dataset_dir: str = MISSING
     lods: List[int] = field(default_factory=lambda: [1, 2])
-    normalize_coords: bool = True
+    normalize_coords: bool = False
     num_workers: int = 4
     # Keep DataLoader workers alive across epochs (ignored when num_workers=0).
     persistent_workers: bool = False
@@ -16,11 +16,26 @@ class DataConfig:
     # Metres per unit of the model's coordinate space. None = compute the pooled
     # std of the train split. Set explicitly to reuse a scale across runs.
     coord_scale: Optional[float] = None
+    # se2 only: metres subtracted from z before scaling, so the absolute-height
+    # channel is zero-mean under the N(0,1) prior. None = train-split mean
+    # vertex z (ignored unless model.equivariance == "se2").
+    z_shift: Optional[float] = None
+    # Bessel distance basis (model.dist_embed == "bessel") only: cutoff radius in
+    # normalised coord units. None = compute a high quantile of train-split
+    # pairwise distance on the fly. Ignored for other dist_embed modes.
+    dist_r_max: Optional[float] = None
 
 @dataclass
 class ModelConfig:
     """Configuration for model architecture and the diffusion noise schedule."""
-    num_node_classes: int = 2
+    num_node_classes: int = 5  # vertex, ground, roof, wall, off (Levi graph)
+    num_edge_classes: int = 3  # off, vertex-vertex, vertex-face
+    equivariance: str = "so2"  # "so2" | "se2" | "o3"
+    time_embed: str = "scalar"  # "scalar" (raw t/T) | "sinusoidal" (Fourier lift)
+    # Pairwise-distance featurization into lin_dist1. "raw" = MiDi's single
+    # linear channel; the others lift distance for multi-scale resolution.
+    dist_embed: str = "raw"  # "raw" | "sinusoidal" | "mlp" | "bessel"
+    dist_embed_dim: int = 16  # feature width of the lift (even for sinusoidal); ignored for "raw"
     hidden_dim: int = 64      # dx: node channel width, must be divisible by n_head
     edge_dim: int = 32        # de: edge channel width; drives [B,N,N,de] memory
     global_dim: int = 32      # dy: global feature width
@@ -98,8 +113,20 @@ class InferenceConfig:
     """Configuration for inference."""
     checkpoint_path: Optional[str] = None
     batch_size: int = 10
-    edge_threshold: float = 0.5
     output_dir: str = "outputs/generated"
+
+@dataclass
+class GenerativeEvalConfig:
+    """End-of-pipeline full-generation evaluation (fires on test end)."""
+    enabled: bool = False
+    num_batches: int = 4          # batches sampled through the full reverse chain
+    batch_size: int = 16
+    seed: int = 1234              # fixed -> comparable buildings across runs
+    log_n_samples: int = 8        # graphs+geometries persisted locally and to WandB
+    save_dir: Optional[str] = None  # None -> <run_save_dir>/generative_eval
+    feature_set: str = "full"     # "full" | "welldefined"
+    val3dity_path: Optional[str] = None  # None -> shutil.which("val3dity")
+    novelty_tol: float = 0.1      # feature-space distance for a "novel" sample
 
 @dataclass
 class Config:
@@ -112,5 +139,6 @@ class Config:
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
-    
+    generative_eval: GenerativeEvalConfig = field(default_factory=GenerativeEvalConfig)
+
     resume_from: Optional[str] = None

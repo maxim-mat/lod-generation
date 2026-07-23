@@ -3,71 +3,9 @@ import logging
 from pathlib import Path
 import numpy as np
 
+from src.dataset.dataset import EDGE_VF, EDGE_VV, GROUND, ROOF, VERTEX, WALL
+
 logger = logging.getLogger(__name__)
-
-# ==============================================================================
-# Cycle Extraction (Polygonal Face Reconstruction)
-# ==============================================================================
-
-def find_cycles_dfs(adj_list, max_len=8):
-    """
-    Finds simple cycles in the adjacency list of length between 3 and max_len.
-    Returns: List of lists (cycles represented as sequences of node indices)
-    """
-    cycles = []
-    
-    # Store visited and path tracking
-    visited = set()
-    
-    def dfs(start_node, curr_node, path, depth):
-        if depth > max_len:
-            return
-            
-        for neighbor in adj_list.get(curr_node, []):
-            if neighbor == start_node and depth >= 3:
-                # Cycle found, normalize representation (smallest index first, direction-agnostic)
-                cycle = path[:]
-                min_idx = np.argmin(cycle)
-                cycle = cycle[min_idx:] + cycle[:min_idx]
-                
-                # Check orientation & canonicalize
-                if cycle[1] > cycle[-1]:
-                    cycle = [cycle[0]] + cycle[1:][::-1]
-                    
-                if cycle not in cycles:
-                    cycles.append(cycle)
-            elif neighbor not in visited and neighbor not in path:
-                dfs(start_node, neighbor, path + [neighbor], depth + 1)
-
-    nodes = sorted(list(adj_list.keys()))
-    for node in nodes:
-        # DFS starting from each node
-        dfs(node, node, [node], 1)
-        visited.add(node)  # Prevent finding permutations starting at other nodes
-        
-    # Filter cycles to retain only chordless cycles
-    chordless_cycles = []
-    for cycle in cycles:
-        is_chordless = True
-        n = len(cycle)
-        cycle_set = set(cycle)
-        
-        # Check if there are any edges between non-adjacent cycle nodes
-        for i in range(n):
-            for j in range(i + 2, n):
-                if i == 0 and j == n - 1:
-                    continue  # adjacent
-                u, v = cycle[i], cycle[j]
-                if v in adj_list.get(u, []):
-                    is_chordless = False
-                    break
-            if not is_chordless:
-                break
-                
-        if is_chordless:
-            chordless_cycles.append(cycle)
-            
-    return chordless_cycles
 
 # ==============================================================================
 # SVD Plane Fitting & Node Projections
@@ -145,42 +83,112 @@ def regularize_building_geometry(nodes, faces):
 # CityJSON Format Exporter
 # ==============================================================================
 
-def graph_to_cityjson(nodes, edge_probs, threshold=0.5, building_id="generated_building"):
+# CityJSON semantic surface table used by graph_to_cityjson
+_SEMANTIC_SURFACES = [
+    {"type": "GroundSurface"}, {"type": "RoofSurface"}, {"type": "WallSurface"}
+]
+_CLASS_TO_SEMANTIC = {GROUND: 0, ROOF: 1, WALL: 2}
+
+
+def _newell_normal(pts):
+    """Area vector of a closed polygon (origin-independent), 2x the face normal."""
+    n = np.zeros(3)
+    for i in range(len(pts)):
+        n += np.cross(pts[i], pts[(i + 1) % len(pts)])
+    return n
+
+
+def _order_ring(members, vv_adj, coords):
+    """Recover the boundary order of a face's vertices.
+
+    Walks the vertex-vertex cycle restricted to the member set. When that is not
+    a clean cycle (malformed generated graph, or a chord contributed by another
+    face), falls back to sorting by angle on the best-fit plane.
     """
-    Converts raw generated nodes and edge probability matrices into a valid CityJSON dictionary.
+    mset = set(members)
+    nbrs = {v: [u for u in vv_adj.get(v, []) if u in mset] for v in members}
+    if all(len(ns) == 2 for ns in nbrs.values()):
+        ring = [members[0]]
+        prev, cur = None, members[0]
+        while len(ring) < len(members):
+            a, b = nbrs[cur]
+            nxt = b if a == prev else a
+            if nxt == ring[0]:
+                break
+            ring.append(nxt)
+            prev, cur = cur, nxt
+        if len(ring) == len(members) and ring[0] in nbrs[ring[-1]]:
+            return ring
+    # ponytail: angle sort assumes a star-shaped ring; wrong for strongly
+    # non-convex faces -- upgrade to a cycle search on the subgraph if those appear.
+    pts = coords[members]
+    centered = pts - pts.mean(axis=0)
+    _, vecs = np.linalg.eigh(centered.T @ centered)
+    a1 = vecs[:, 2]
+    a2 = np.cross(vecs[:, 0], a1)
+    ang = np.arctan2(centered @ a2, centered @ a1)
+    return [m for _, m in sorted(zip(ang, members))]
+
+
+def _orient_outward(ring, coords, centroid):
+    """Flip the ring if its normal points toward the building centroid.
+
+    ponytail: centroid heuristic; can misjudge faces of strongly concave
+    buildings -- switch to ray casting if that shows up in generated output.
     """
-    N = len(nodes)
-    
-    # 1. Build adjacency list based on threshold
-    adj_list = {i: [] for i in range(N)}
-    for i in range(N):
-        for j in range(i + 1, N):
-            if edge_probs[i, j] > threshold:
-                adj_list[i].append(j)
-                adj_list[j].append(i)
-                
-    # 2. Extract polygonal faces
-    faces = find_cycles_dfs(adj_list, max_len=8)
-    if not faces:
-        # Fallback to a simple floor footprint if no cycles found
-        logger.warning("No closed cycles found in graph. Creating a fallback geometry.")
+    pts = coords[ring]
+    if np.dot(_newell_normal(pts), pts.mean(axis=0) - centroid) < 0:
+        ring = ring[::-1]
+    return ring
+
+
+def graph_to_cityjson(coords, node_classes, edge_classes, building_id="generated_building"):
+    """Converts a Levi graph back into a CityJSON dictionary.
+
+    Exact inverse of `parse_cityjson_file_to_graphs` (no regularization here;
+    apply `regularize_building_geometry` separately to generated output).
+    Face rings are ordered CCW viewed from outside, i.e. outward normals.
+
+    Args:
+        coords: [N, 3] float array, metres. Only vertex-node rows are read.
+        node_classes: [N] int array of node class labels.
+        edge_classes: [N, N] int array of edge class labels (symmetric).
+    """
+    coords = np.asarray(coords, dtype=float)
+    node_classes = np.asarray(node_classes)
+    edge_classes = np.asarray(edge_classes)
+
+    vertex_ids = np.flatnonzero(node_classes == VERTEX)
+    face_ids = np.flatnonzero(np.isin(node_classes, (GROUND, ROOF, WALL)))
+    if len(vertex_ids) < 3 or len(face_ids) == 0:
+        logger.warning("Graph has %d vertices and %d faces; cannot build a geometry.",
+                       len(vertex_ids), len(face_ids))
         return {}
-        
-    # 3. Regularize geometry (straighten out faces & average shared vertices)
-    nodes_reg, surface_types = regularize_building_geometry(nodes, faces)
-    
-    # 4. Format into CityJSON structure
-    semantic_surfaces = [
-        {"type": "GroundSurface"},
-        {"type": "RoofSurface"},
-        {"type": "WallSurface"}
-    ]
-    sem_map = {"GroundSurface": 0, "RoofSurface": 1, "WallSurface": 2}
-    
-    cj_faces = [[face] for face in faces]
-    cj_semantics_values = [sem_map[stype] for stype in surface_types]
-    
-    cityjson_dict = {
+
+    vid_map = {int(g): i for i, g in enumerate(vertex_ids)}
+    vv_adj = {
+        int(v): [int(u) for u in vertex_ids if u != v and edge_classes[v, u] == EDGE_VV]
+        for v in vertex_ids
+    }
+    centroid = coords[vertex_ids].mean(axis=0)
+
+    cj_faces, sem_values = [], []
+    for f in face_ids:
+        members = [int(v) for v in vertex_ids if edge_classes[f, v] == EDGE_VF]
+        if len(members) < 3:
+            logger.warning("Face node %d has only %d member vertices, skipping.",
+                           f, len(members))
+            continue
+        ring = _order_ring(members, vv_adj, coords)
+        ring = _orient_outward(ring, coords, centroid)
+        cj_faces.append([[vid_map[v] for v in ring]])
+        sem_values.append(_CLASS_TO_SEMANTIC[int(node_classes[f])])
+
+    if not cj_faces:
+        logger.warning("No reconstructable faces in graph.")
+        return {}
+
+    return {
         "type": "CityJSON",
         "version": "1.1",
         "CityObjects": {
@@ -189,23 +197,19 @@ def graph_to_cityjson(nodes, edge_probs, threshold=0.5, building_id="generated_b
                 "geometry": [
                     {
                         "type": "Solid",
-                        "lod": "1",
+                        "lod": "2",
                         "boundaries": [cj_faces],
                         "semantics": {
-                            "surfaces": semantic_surfaces,
-                            "values": [cj_semantics_values]
-                        }
+                            "surfaces": _SEMANTIC_SURFACES,
+                            "values": [sem_values],
+                        },
                     }
-                ]
+                ],
             }
         },
-        "vertices": nodes_reg.tolist(),
-        "metadata": {
-            "datasetLod": "1"
-        }
+        "vertices": coords[vertex_ids].tolist(),
+        "metadata": {"datasetLod": "2"},
     }
-    
-    return cityjson_dict
 
 
 def save_to_file(cityjson_dict, output_path):

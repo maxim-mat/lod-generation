@@ -109,6 +109,7 @@ def _drifted_model(weight_scale):
 
     torch.manual_seed(0)
     model = CityJSONDiffusionModule(
+        num_node_classes=2, num_edge_classes=2,   # 2-class fixtures; overflow regression
         n_max=N_MAX, hidden_dim=64, edge_dim=32, global_dim=32, n_head=8,
         num_layers=4, T=500, dropout=0.0,
         x_marginals=torch.tensor([0.2001, 0.7999]),

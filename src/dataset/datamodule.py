@@ -108,14 +108,17 @@ class CityJSONDataModule(L.LightningDataModule):
 
         Returns:
             tuple[Tensor, Tensor]: node marginals [num_node_classes] over
-            (Active, Virtual), and edge marginals [2] over (no-edge, edge)
-            counted across off-diagonal entries of the padded adjacency.
+            (vertex, ground, roof, wall, off), and edge marginals
+            [num_edge_classes] over (off, vertex-vertex, vertex-face) counted
+            across off-diagonal entries of the padded edge-class matrix.
         """
+        from src.dataset.dataset import NUM_EDGE_CLASSES
+
         if self.train_dataset is None:
             raise RuntimeError("compute_marginals() requires setup() to have run first.")
 
         node_counts = None
-        edge_counts = torch.zeros(2, dtype=torch.float64)
+        edge_counts = torch.zeros(NUM_EDGE_CLASSES, dtype=torch.float64)
 
         for item in self.train_dataset:
             # Multi-LOD datasets yield a tuple; the model trains on the first LOD.
@@ -130,13 +133,32 @@ class CityJSONDataModule(L.LightningDataModule):
             adjacency = item["y"].squeeze(-1)
             n = adjacency.shape[0]
             off_diag = ~torch.eye(n, dtype=torch.bool)
-            edges = adjacency[off_diag]
-            edge_counts[1] += edges.sum().double()
-            edge_counts[0] += edges.numel() - edges.sum().double()
+            edges = adjacency[off_diag].long()
+            edge_counts += torch.bincount(edges, minlength=NUM_EDGE_CLASSES).double()
 
         x_marginals = (node_counts / node_counts.sum()).float()
         e_marginals = (edge_counts / edge_counts.sum()).float()
         return x_marginals, e_marginals
+
+    def compute_z_shift(self):
+        """Pooled mean of vertex-node z over the train split (se2 only).
+
+        The se2 mode keeps absolute heights; subtracting the train-split mean
+        makes the z channel zero-mean so the N(0, 1) position prior matches
+        the data through the whole chain. Stored in checkpoint hparams like
+        `coord_scale`.
+        """
+        if self.train_dataset is None:
+            raise RuntimeError("compute_z_shift() requires setup() to have run first.")
+
+        total, count = 0.0, 0.0
+        for item in self.train_dataset:
+            if isinstance(item, tuple):
+                item = item[0]
+            mask = item["node_mask"].bool()
+            total += float(item["x"][mask][:, 2].double().sum())
+            count += float(mask.sum())
+        return total / max(count, 1.0)
 
     def compute_coord_scale(self):
         """Pooled standard deviation of the active-node coordinates, train split only.
@@ -186,6 +208,48 @@ class CityJSONDataModule(L.LightningDataModule):
         variance = max(total_sq / count - mean * mean, 0.0)
         # A degenerate split (every building a single point) would give 0.
         return max(math.sqrt(variance), 1e-6)
+
+    def compute_dist_r_max(self, coord_scale, quantile=0.999):
+        """Cutoff radius r_max for the Bessel distance basis, in the model's
+        normalised coordinate units, from the train split.
+
+        The DimeNet Bessel basis needs a length scale to place its zeros across.
+        Rather than a preset molecular default, take a high quantile of the
+        per-building maximum pairwise distance (robust to a few oversized
+        footprints) and divide by `coord_scale` to match the normalised
+        coordinates the network sees. Pairwise distances are translation- and
+        z-shift-invariant, so no centring is needed.
+
+        Efficient on the fly: one pass over the (already in-memory) train split,
+        a small `cdist` per building -- the same order of work as
+        `compute_coord_scale`, not a new heavyweight traversal. Computed on the
+        train split only, so val/test do not leak in.
+
+        Args:
+            coord_scale (float): metres per normalised unit, from
+                `compute_coord_scale`.
+            quantile (float): distance quantile used as the cutoff.
+
+        Returns:
+            float: r_max in normalised units, strictly positive.
+        """
+        if self.train_dataset is None:
+            raise RuntimeError("compute_dist_r_max() requires setup() to have run first.")
+
+        per_building = []
+        for item in self.train_dataset:
+            if isinstance(item, tuple):
+                item = item[0]
+            active = item["x"][item["node_mask"].bool()]
+            if active.shape[0] < 2:
+                continue
+            per_building.append(float(torch.cdist(active, active).max()))
+
+        if not per_building:
+            raise ValueError("No multi-node buildings in the train split; cannot compute r_max.")
+
+        r_max_metres = float(torch.tensor(per_building).quantile(quantile))
+        return max(r_max_metres / coord_scale, 1e-6)
 
     def train_dataloader(self):
         return DataLoader(

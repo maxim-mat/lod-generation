@@ -14,7 +14,8 @@ import logging
 import pytest
 import torch
 
-from src.models.diffusion import NUM_EDGE_CLASSES, CityJSONDiffusionModule
+from src.dataset.dataset import NUM_EDGE_CLASSES, NUM_NODE_CLASSES
+from src.models.diffusion import CityJSONDiffusionModule
 
 B, N = 2, 6
 DIFFUSION_LOGGER = "src.models.diffusion"
@@ -30,7 +31,8 @@ def model():
 def batch():
     return {
         "x": torch.randn(B, N, 3),
-        "node_categories": torch.nn.functional.one_hot(torch.randint(0, 2, (B, N)), 2).float(),
+        "node_categories": torch.nn.functional.one_hot(
+            torch.randint(0, NUM_NODE_CLASSES, (B, N)), NUM_NODE_CLASSES).float(),
         "y": torch.randint(0, NUM_EDGE_CLASSES, (B, N, N, 1)),
         "node_mask": torch.ones(B, N),
     }

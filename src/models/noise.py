@@ -111,8 +111,13 @@ class GraphNoiseModel(nn.Module):
     """Forward noising and reverse posterior sampling for (pos, X, E)."""
 
     def __init__(self, T, x_marginals, e_marginals, transition_x="marginal",
-                 transition_e="marginal", nu_pos=2.5, nu_x=1.0, nu_e=1.5):
+                 transition_e="marginal", nu_pos=2.5, nu_x=1.0, nu_e=1.5,
+                 xy_only_com=False):
+        """`xy_only_com`: se2 mode — position noise and limit samples are
+        projected onto the zero-xy-mean subspace only; z keeps its mean
+        (absolute heights, standardised upstream by z_shift)."""
         super().__init__()
+        self.xy_only_com = xy_only_com
         for name, value in (("transition_x", transition_x), ("transition_e", transition_e)):
             if value not in ("marginal", "uniform"):
                 raise ValueError(
@@ -235,7 +240,7 @@ class GraphNoiseModel(nn.Module):
         E_t = zero_diagonal(F.one_hot(E_idx, num_classes=self.E_classes).float())
 
         noise = torch.randn_like(pos) * node_mask.unsqueeze(-1)
-        noise = remove_mean_with_mask(noise, node_mask)
+        noise = remove_mean_with_mask(noise, node_mask, xy_only=self.xy_only_com)
 
         a = self.get_alpha_bar(t_int, "p").unsqueeze(-1)             # [B, 1, 1]
         s = self.get_sigma_bar(t_int, "p").unsqueeze(-1)
@@ -263,7 +268,7 @@ class GraphNoiseModel(nn.Module):
 
         node_mask = torch.ones(n_samples, n_nodes, device=device)
         pos = torch.randn(n_samples, n_nodes, 3, device=device)
-        pos = remove_mean_with_mask(pos, node_mask)
+        pos = remove_mean_with_mask(pos, node_mask, xy_only=self.xy_only_com)
         return pos, U_X.to(device), U_E.to(device)
 
     # ------------------------------------------------------------------
@@ -286,7 +291,7 @@ class GraphNoiseModel(nn.Module):
         noise_prefactor = torch.sqrt((sigma2_t_s * sigma_sq_ratio).clamp(min=0)).unsqueeze(-1)
 
         noise = torch.randn_like(pos_t) * node_mask.unsqueeze(-1)
-        noise = remove_mean_with_mask(noise, node_mask)
+        noise = remove_mean_with_mask(noise, node_mask, xy_only=self.xy_only_com)
         pos_s = mu + noise_prefactor * noise
 
         # --- categorical: exact posterior, marginalised over x0

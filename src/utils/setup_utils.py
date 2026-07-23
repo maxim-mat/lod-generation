@@ -29,7 +29,8 @@ def create_datamodule(cfg: Config) -> CityJSONDataModule:
 
 
 def create_model(cfg: Config, n_max: int, x_marginals=None, e_marginals=None,
-                 coord_scale: float = 1.0) -> CityJSONDiffusionModule:
+                 coord_scale: float = 1.0, z_shift: float = 0.0,
+                 dist_r_max=None) -> CityJSONDiffusionModule:
     """Create CityJSON Diffusion Module from configuration.
 
     Args:
@@ -37,9 +38,12 @@ def create_model(cfg: Config, n_max: int, x_marginals=None, e_marginals=None,
             the 'marginal' transition. Fall back to uniform when omitted.
         coord_scale: metres per unit of the model's coordinate space, from
             `CityJSONDataModule.compute_coord_scale()`.
+        z_shift: se2 only — train-split mean vertex z in metres, from
+            `CityJSONDataModule.compute_z_shift()`.
     """
     return CityJSONDiffusionModule(
         num_node_classes=cfg.model.num_node_classes,
+        num_edge_classes=cfg.model.num_edge_classes,
         hidden_dim=cfg.model.hidden_dim,
         edge_dim=cfg.model.edge_dim,
         global_dim=cfg.model.global_dim,
@@ -62,6 +66,12 @@ def create_model(cfg: Config, n_max: int, x_marginals=None, e_marginals=None,
         lambda_x=cfg.model.lambda_x,
         lambda_e=cfg.model.lambda_e,
         coord_scale=coord_scale,
+        equivariance=cfg.model.equivariance,
+        z_shift=z_shift,
+        time_embed=cfg.model.time_embed,
+        dist_embed=cfg.model.dist_embed,
+        dist_embed_dim=cfg.model.dist_embed_dim,
+        dist_r_max=dist_r_max,
     )
 
 
@@ -144,5 +154,11 @@ def create_callbacks(cfg: Config, save_dir: Path) -> list:
         callbacks.append(RichProgressBar())
     except Exception:
         pass
-        
+
+    # Generative Eval
+    ge_cfg = cfg.generative_eval
+    if ge_cfg.enabled:
+        from src.eval.callback import GenerativeEvalCallback
+        callbacks.append(GenerativeEvalCallback(ge_cfg, save_dir))
+
     return callbacks

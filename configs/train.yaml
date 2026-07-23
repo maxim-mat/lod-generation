@@ -9,14 +9,16 @@ data:
   dataset_dir: data/The Hague
   lods:
     - 2
-  normalize_coords: true
+  normalize_coords: false
   num_workers: 1
   n_max: null
   upper_limit_nodes: null
 
 # Model settings
 model:
-  num_node_classes: 2
+  num_node_classes: 5
+  num_edge_classes: 3
+  equivariance: so2
   hidden_dim: 64
   edge_dim: 32
   global_dim: 32
