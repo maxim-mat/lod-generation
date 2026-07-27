@@ -114,6 +114,9 @@ class InferenceConfig:
     checkpoint_path: Optional[str] = None
     batch_size: int = 10
     output_dir: str = "outputs/generated"
+    # Attach the generative-eval metrics/samples to an existing WandB run instead of
+    # logging locally only. Use when training ran without generative_eval.enabled.
+    wandb_run_id: Optional[str] = None
 
 @dataclass
 class GenerativeEvalConfig:
