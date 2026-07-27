@@ -6,6 +6,8 @@ import json
 import logging
 import shutil
 import subprocess
+import tempfile
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -30,19 +32,45 @@ def parse_val3dity_report(report):
     return {"valid_flags": flags, "error_histogram": hist, "valid_fraction": valid_fraction}
 
 
+_SEQ_HEADER = {
+    "type": "CityJSON", "version": "1.1",
+    "transform": {"scale": [1.0, 1.0, 1.0], "translate": [0.0, 0.0, 0.0]},
+    "CityObjects": {}, "vertices": [],
+}
+
+
 def _to_cityjsonseq(cjs):
-    """One JSON object per line (CityJSONSeq) for val3dity stdin streaming."""
-    return "\n".join(json.dumps(cj) for cj in cjs)
+    """CityJSONSeq for val3dity stdin streaming: a CityJSON header line, then one
+    CityJSONFeature per line. Streaming whole CityJSON documents instead makes
+    val3dity reject every line after the first.
+    """
+    lines = [json.dumps(_SEQ_HEADER)]
+    for cj in cjs:
+        lines.append(json.dumps({
+            "type": "CityJSONFeature",
+            "id": next(iter(cj["CityObjects"])),
+            "CityObjects": cj["CityObjects"],
+            "vertices": cj["vertices"],
+        }))
+    return "\n".join(lines)
 
 
 def check_validity(cjs, val3dity_path=None):
-    """Run val3dity on CityJSON objects `cjs`; None if the binary is absent."""
+    """Run val3dity on CityJSON objects `cjs`; None if the binary is absent or
+    the run fails (the validity arm is optional, so it must not kill the eval).
+    """
     exe = val3dity_path or shutil.which("val3dity")
     if not exe:
         logger.warning("val3dity not found; skipping the validity arm.")
         return None
-    proc = subprocess.run(
-        [exe, "stdin", "--report"], input=_to_cityjsonseq(cjs),
-        capture_output=True, text=True, check=True,
-    )
-    return parse_val3dity_report(json.loads(proc.stdout))
+    with tempfile.TemporaryDirectory() as tmp:
+        report = Path(tmp) / "report.json"
+        proc = subprocess.run(
+            [exe, "stdin", "--report", str(report)], input=_to_cityjsonseq(cjs),
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0 or not report.exists():
+            logger.error("val3dity failed (rc=%d): %s", proc.returncode,
+                         (proc.stderr or proc.stdout).strip()[:2000])
+            return None
+        return parse_val3dity_report(json.loads(report.read_text(encoding="utf-8")))

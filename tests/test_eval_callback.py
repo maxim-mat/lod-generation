@@ -56,7 +56,8 @@ def test_run_generative_eval_smoke(tmp_path, monkeypatch):
     monkeypatch.setattr(cb, "check_validity", lambda cjs, path=None: None)
 
     cfg = GenerativeEvalConfig(enabled=True, num_batches=1, batch_size=1, log_n_samples=1)
-    metrics = run_generative_eval(model, datamodule=None, cfg=cfg, loggers=[], save_dir=tmp_path)
+    metrics = run_generative_eval(model, datamodule=None, cfg=cfg, loggers=[],
+                                  save_dir=tmp_path, seed=7)
 
     assert "gen/rejection_rate" in metrics
     assert "gen/face_centroid_consistency" in metrics

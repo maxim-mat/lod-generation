@@ -106,11 +106,26 @@ class LoggingConfig:
     save_dir: str = "outputs"
     wandb_entity: Optional[str] = None
     wandb_offline: bool = False
-    log_model: bool = False
+    log_model: bool = True
 
 @dataclass
 class InferenceConfig:
     """Configuration for inference."""
+    # Weights to sample from. Resolved by `src.inference._resolve_checkpoint`, which
+    # dispatches on the prefix:
+    #   local path      "outputs/regnn_diffusion/default/checkpoints/last.ckpt"
+    #                   Relative to the cwd. Must exist, or inference exits.
+    #   WandB artifact  "wandb://[entity/]project/name:alias"
+    #                   e.g. "wandb://me/lod-generation/model-abc123:best". A bare
+    #                   "wandb://name:alias" is qualified from logging.wandb_entity
+    #                   and logging.project_name. Downloaded to
+    #                   <logging.save_dir>/wandb_artifacts/ and the .ckpt inside is
+    #                   loaded. Artifacts written by logging.log_model hold one
+    #                   model.ckpt; aliases "best"/"latest"/"v<N>" all work.
+    #   fsspec URL      "https://...", "s3://...", "gs://..."
+    #                   Anything with a "://" that isn't wandb:// is handed to
+    #                   Lightning unchanged; it opens the URL itself. Needs the
+    #                   matching fsspec backend installed (s3fs, gcsfs, ...).
     checkpoint_path: Optional[str] = None
     batch_size: int = 10
     output_dir: str = "outputs/generated"
@@ -121,10 +136,9 @@ class InferenceConfig:
 @dataclass
 class GenerativeEvalConfig:
     """End-of-pipeline full-generation evaluation (fires on test end)."""
-    enabled: bool = False
+    enabled: bool = True
     num_batches: int = 4          # batches sampled through the full reverse chain
     batch_size: int = 16
-    seed: int = 1234              # fixed -> comparable buildings across runs
     log_n_samples: int = 8        # graphs+geometries persisted locally and to WandB
     save_dir: Optional[str] = None  # None -> <run_save_dir>/generative_eval
     feature_set: str = "full"     # "full" | "welldefined"

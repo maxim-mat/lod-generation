@@ -159,6 +159,6 @@ def create_callbacks(cfg: Config, save_dir: Path) -> list:
     ge_cfg = cfg.generative_eval
     if ge_cfg.enabled:
         from src.eval.callback import GenerativeEvalCallback
-        callbacks.append(GenerativeEvalCallback(ge_cfg, save_dir))
+        callbacks.append(GenerativeEvalCallback(ge_cfg, save_dir, cfg.seed))
 
     return callbacks

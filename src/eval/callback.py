@@ -48,14 +48,18 @@ def reference_features(datamodule, split, feature_set):
     return feature_matrix(cjs, feature_set)
 
 
-def run_generative_eval(model, datamodule, cfg, loggers, save_dir):
+def run_generative_eval(model, datamodule, cfg, loggers, save_dir, seed=1234):
     """Sample buildings end-to-end and score them. Returns a dict of scalar metrics.
 
     Standalone (checkpoint-callable) body; the callback is a thin Lightning adapter.
     Wires the validity, distribution, novelty and face-coherence arms together and
     saves/logs the results via `_save_and_log`. Keys are prefixed `gen/`.
+
+    `seed` is re-applied here so sampling starts from a known RNG state: training has
+    consumed an arbitrary amount of randomness by the time the callback fires, so
+    without it the sampled buildings are not comparable across runs.
     """
-    L.seed_everything(cfg.seed)
+    L.seed_everything(seed)
     records, stats = draw_samples(model, cfg.num_batches, cfg.batch_size)
 
     metrics = {}
@@ -135,13 +139,15 @@ def _io_from_obj(obj_str):
 
 
 class GenerativeEvalCallback(L.Callback):
-    def __init__(self, cfg, save_dir):
+    def __init__(self, cfg, save_dir, seed=1234):
         super().__init__()
         self.cfg = cfg
         self.save_dir = Path(save_dir)
+        self.seed = seed
 
     def on_test_end(self, trainer, pl_module):
         if not self.cfg.enabled:
             return
         out_dir = Path(self.cfg.save_dir) if self.cfg.save_dir else self.save_dir / "generative_eval"
-        run_generative_eval(pl_module, trainer.datamodule, self.cfg, trainer.loggers, out_dir)
+        run_generative_eval(pl_module, trainer.datamodule, self.cfg, trainer.loggers,
+                            out_dir, self.seed)

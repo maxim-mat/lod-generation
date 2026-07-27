@@ -41,8 +41,8 @@ def test_run_inference_routes_through_generative_eval(tmp_path, monkeypatch):
     monkeypatch.setattr(inf, "_load_datamodule", lambda c: None)
 
     seen = {}
-    def fake_eval(model, datamodule, eval_cfg, loggers, save_dir):
-        seen.update(cfg=eval_cfg, loggers=loggers, save_dir=save_dir)
+    def fake_eval(model, datamodule, eval_cfg, loggers, save_dir, seed):
+        seen.update(cfg=eval_cfg, loggers=loggers, save_dir=save_dir, seed=seed)
         return {"gen/rejection_rate": 0.0}
 
     monkeypatch.setattr(inf, "run_generative_eval", fake_eval)
@@ -55,4 +55,56 @@ def test_run_inference_routes_through_generative_eval(tmp_path, monkeypatch):
     assert seen["cfg"].batch_size == 3
     assert seen["cfg"].log_n_samples == 3            # every graph in the batch persisted
     assert seen["cfg"].save_dir == cfg.inference.output_dir
+    assert seen["seed"] == cfg.seed                  # root seed drives sampling
     assert cfg.generative_eval.num_batches == 99     # caller's config untouched
+
+
+def test_resolve_checkpoint_local(tmp_path):
+    ckpt = tmp_path / "last.ckpt"
+    ckpt.touch()
+    cfg = Config()
+    cfg.inference.checkpoint_path = str(ckpt)
+    assert inf._resolve_checkpoint(cfg) == str(ckpt)
+
+
+def test_resolve_checkpoint_missing_local_exits(tmp_path):
+    import pytest
+    cfg = Config()
+    cfg.inference.checkpoint_path = str(tmp_path / "nope.ckpt")
+    with pytest.raises(SystemExit):
+        inf._resolve_checkpoint(cfg)
+
+
+def test_resolve_checkpoint_passes_url_through():
+    cfg = Config()
+    cfg.inference.checkpoint_path = "https://example.com/model.ckpt"
+    # fsspec URLs go straight to Lightning, no existence check
+    assert inf._resolve_checkpoint(cfg) == "https://example.com/model.ckpt"
+
+
+def test_resolve_checkpoint_wandb_downloads(tmp_path, monkeypatch):
+    art_dir = tmp_path / "downloaded"
+    art_dir.mkdir()
+    (art_dir / "model.ckpt").touch()
+
+    class FakeArtifact:
+        def download(self, root):
+            return str(art_dir)
+
+    class FakeApi:
+        def artifact(self, ref):
+            seen["ref"] = ref
+            return FakeArtifact()
+
+    seen = {}
+    monkeypatch.setitem(__import__("sys").modules, "wandb",
+                        type("wandb", (), {"Api": FakeApi})())
+
+    cfg = Config()
+    cfg.logging.wandb_entity = "me"
+    cfg.logging.project_name = "lod-generation"
+    cfg.inference.checkpoint_path = "wandb://model-abc123:best"
+
+    assert inf._resolve_checkpoint(cfg) == str(art_dir / "model.ckpt")
+    # bare name:alias gets qualified from cfg.logging
+    assert seen["ref"] == "me/lod-generation/model-abc123:best"

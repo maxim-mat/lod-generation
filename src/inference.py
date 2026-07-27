@@ -22,18 +22,13 @@ def run_inference(cfg: Config):
     generated graph and scores the batch with the src/eval metrics. Optionally attaches
     the results to an existing WandB run (for runs trained without the eval callback).
     """
-    ckpt_path = cfg.inference.checkpoint_path
-    if ckpt_path is None:
+    if cfg.inference.checkpoint_path is None:
         logger.error("inference.checkpoint_path must be specified for inference mode.")
         sys.exit(1)
 
-    ckpt_path_obj = Path(ckpt_path)
-    if not ckpt_path_obj.exists():
-        logger.error(f"Checkpoint not found: {ckpt_path}")
-        sys.exit(1)
-
+    ckpt_path = _resolve_checkpoint(cfg)
     logger.info(f"Loading model from: {ckpt_path}")
-    model = CityJSONDiffusionModule.load_from_checkpoint(str(ckpt_path))
+    model = CityJSONDiffusionModule.load_from_checkpoint(ckpt_path)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
@@ -63,7 +58,7 @@ def run_inference(cfg: Config):
     loggers = _resume_wandb_logger(cfg, output_dir)
 
     try:
-        metrics = run_generative_eval(model, datamodule, eval_cfg, loggers, output_dir)
+        metrics = run_generative_eval(model, datamodule, eval_cfg, loggers, output_dir, cfg.seed)
     finally:
         if loggers:
             import wandb
@@ -75,6 +70,60 @@ def run_inference(cfg: Config):
     _write_combined(output_dir)
     logger.info("Inference complete.")
     return metrics
+
+
+def _resolve_checkpoint(cfg: Config) -> str:
+    """inference.checkpoint_path -> something `load_from_checkpoint` can open.
+
+    Three forms:
+      - local path              outputs/.../last.ckpt
+      - WandB model artifact    wandb://[entity/]project/model-<run_id>:best
+      - any fsspec URL          https://..., s3://..., gs://...  (passed straight
+                                through; Lightning opens these itself)
+    """
+    ref = cfg.inference.checkpoint_path
+
+    if ref.startswith("wandb://"):
+        return _download_wandb_checkpoint(ref[len("wandb://"):], cfg)
+
+    if "://" in ref:
+        return ref
+
+    if not Path(ref).exists():
+        logger.error(f"Checkpoint not found: {ref}")
+        sys.exit(1)
+    return ref
+
+
+def _download_wandb_checkpoint(artifact_ref: str, cfg: Config) -> str:
+    """Pull a WandB model artifact and return the local .ckpt path.
+
+    `artifact_ref` is `[entity/]project/name:alias`; a bare `name:alias` is qualified
+    from cfg.logging. Lightning's `log_model` writes one model.ckpt per artifact.
+    """
+    import wandb
+
+    if "/" not in artifact_ref:  # bare name:alias -> qualify from the logging config
+        prefix = f"{cfg.logging.wandb_entity}/" if cfg.logging.wandb_entity else ""
+        artifact_ref = f"{prefix}{cfg.logging.project_name}/{artifact_ref}"
+
+    cache_dir = Path(cfg.logging.save_dir, "wandb_artifacts", artifact_ref.replace("/", "_").replace(":", "_"))
+    logger.info("Downloading WandB artifact %s -> %s", artifact_ref, cache_dir)
+    try:
+        artifact = wandb.Api().artifact(artifact_ref)
+        root = Path(artifact.download(root=str(cache_dir)))
+    except Exception as exc:
+        logger.error("Could not download WandB artifact %s: %s", artifact_ref, exc)
+        sys.exit(1)
+
+    ckpts = sorted(root.rglob("*.ckpt"))
+    if not ckpts:
+        logger.error("No .ckpt file inside WandB artifact %s (got: %s)",
+                     artifact_ref, [p.name for p in root.rglob("*")])
+        sys.exit(1)
+    if len(ckpts) > 1:
+        logger.warning("Artifact holds %d checkpoints; using %s", len(ckpts), ckpts[0].name)
+    return str(ckpts[0])
 
 
 def _load_datamodule(cfg: Config):
