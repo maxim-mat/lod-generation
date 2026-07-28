@@ -57,6 +57,11 @@ class ModelConfig:
     lambda_x: float = 0.4
     lambda_e: float = 2.0
 
+    # Weight of the Off-slot coordinate term. The coord MSE is normalised over
+    # real slots only; Off keeps a smaller anchor because the zero-CoM projection
+    # spans every slot, so unheld Off positions rigidly translate the building.
+    off_anchor_weight: float = 0.1
+
 @dataclass
 class EarlyStoppingConfig:
     """Configuration for early stopping callback."""
@@ -144,6 +149,11 @@ class GenerativeEvalConfig:
     feature_set: str = "full"     # "full" | "welldefined"
     val3dity_path: Optional[str] = None  # None -> shutil.which("val3dity")
     novelty_tol: float = 0.1      # feature-space distance for a "novel" sample
+    # Reference buildings drawn per split for the Wasserstein/MMD/novelty arms.
+    # The splits hold O(1e5) buildings and kernel_mmd is O(n^2) in the reference
+    # set, so the full test split is both minutes of conversion and a ~80GB
+    # gram matrix. A few thousand samples estimate these statistics fine.
+    ref_max_samples: int = 2000
 
 @dataclass
 class Config:

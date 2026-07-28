@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from src.utils.config import Config, GenerativeEvalConfig
 from src.utils.setup_utils import create_callbacks
@@ -34,6 +35,44 @@ def test_face_centroid_consistency_zero_when_centered():
     assert face_centroid_consistency(coords, labels, edge) > 1.0
 
 
+class _StubSplit:
+    """Dataset stand-in that records which indices the reference pass touched."""
+
+    def __init__(self, n):
+        self.n = n
+        self.touched = []
+
+    def __len__(self):
+        return self.n
+
+    def __getitem__(self, i):
+        self.touched.append(i)
+        return {"x": torch.zeros(3, 3), "node_categories": torch.zeros(3, 5),
+                "y": torch.zeros(3, 3, 1)}
+
+
+def test_reference_features_subsamples_and_is_deterministic(monkeypatch):
+    """The splits hold O(1e5) graphs; the cap must bound the conversion work
+    and draw the same reference set every run, or the metrics drift."""
+    import src.eval.callback as cb
+    monkeypatch.setattr(cb, "graph_to_cityjson", lambda *a, **k: None)
+
+    dm = type("DM", (), {})()
+    dm.test_dataset = _StubSplit(1000)
+    cb.reference_features(dm, "test", "full", max_samples=25)
+    first = dm.test_dataset.touched
+    assert len(first) == 25 and first == sorted(first)
+
+    dm.test_dataset = _StubSplit(1000)
+    cb.reference_features(dm, "test", "full", max_samples=25)
+    assert dm.test_dataset.touched == first
+
+    # Below the cap, every graph is used.
+    dm.test_dataset = _StubSplit(10)
+    cb.reference_features(dm, "test", "full", max_samples=25)
+    assert len(dm.test_dataset.touched) == 10
+
+
 def test_run_generative_eval_smoke(tmp_path, monkeypatch):
     from src.models.diffusion import CityJSONDiffusionModule
     import src.eval.callback as cb
@@ -51,7 +90,7 @@ def test_run_generative_eval_smoke(tmp_path, monkeypatch):
                             "boundaries": [[[[0, 1, 2]]]]}]}},
                         "vertices": [[0, 0, 0], [1, 0, 0], [0, 1, 0]]}}
     monkeypatch.setattr(cb, "draw_samples", lambda m, nb, bs: ([rec], {"attempted": 1, "dropped": 0}))
-    monkeypatch.setattr(cb, "reference_features", lambda dm, split, fs: (np.array([[1.0, 2.0]]), ["a", "b"]))
+    monkeypatch.setattr(cb, "reference_features", lambda *a, **k: (np.array([[1.0, 2.0]]), ["a", "b"]))
     monkeypatch.setattr(cb, "building_features", lambda cj, feature_set="full": {"a": 1.0, "b": 2.0})
     monkeypatch.setattr(cb, "check_validity", lambda cjs, path=None: None)
 

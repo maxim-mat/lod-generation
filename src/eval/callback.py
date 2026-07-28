@@ -1,4 +1,6 @@
 import logging
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import lightning as L
@@ -13,6 +15,23 @@ from src.eval.validity import check_validity
 from src.post_process.post_process import graph_to_cityjson
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _stage(label, *args):
+    """Log a generative-eval stage entry/exit with its wall-clock cost.
+
+    The arms differ by orders of magnitude (sampling is GPU-minutes, the
+    reference conversion is CPU-minutes, val3dity shells out), so a stalled
+    run is unreadable without knowing which one is running.
+    """
+    name = label % args if args else label
+    logger.info("[gen-eval] %s ...", name)
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        logger.info("[gen-eval] %s done in %.1fs", name, time.perf_counter() - t0)
 
 
 def face_centroid_consistency(coords, node_labels, edge_labels):
@@ -32,11 +51,25 @@ def face_centroid_consistency(coords, node_labels, edge_labels):
     return float(np.mean(drifts)) if drifts else 0.0
 
 
-def reference_features(datamodule, split, feature_set):
-    """Test/train graphs -> the same converter -> feature matrix."""
+def reference_features(datamodule, split, feature_set, max_samples=None, seed=1234):
+    """Test/train graphs -> the same converter -> feature matrix.
+
+    Subsampled to `max_samples` because the splits hold O(1e5) buildings: the
+    conversion is minutes of Python per split and `kernel_mmd` is O(n^2) in the
+    reference count. The draw is seeded so the reference distribution is the
+    same set across runs and the metrics stay comparable.
+    """
     ds = getattr(datamodule, f"{split}_dataset")
+    idx = range(len(ds))
+    if max_samples is not None and len(ds) > max_samples:
+        idx = np.sort(np.random.default_rng(seed).choice(
+            len(ds), max_samples, replace=False))
+    logger.info("Reference features: converting %d/%d %s graphs.",
+                len(idx), len(ds), split)
+
     cjs = []
-    for item in ds:
+    for i in idx:
+        item = ds[int(i)]
         if isinstance(item, tuple):
             item = item[0]
         coords = item["x"].numpy().astype(float)
@@ -45,6 +78,8 @@ def reference_features(datamodule, split, feature_set):
         cj = graph_to_cityjson(coords, node_classes, edge_classes)
         if cj:
             cjs.append(cj)
+    logger.info("Reference features: %d/%d %s graphs converted cleanly.",
+                len(cjs), len(idx), split)
     return feature_matrix(cjs, feature_set)
 
 
@@ -60,12 +95,17 @@ def run_generative_eval(model, datamodule, cfg, loggers, save_dir, seed=1234):
     without it the sampled buildings are not comparable across runs.
     """
     L.seed_everything(seed)
-    records, stats = draw_samples(model, cfg.num_batches, cfg.batch_size)
+    with _stage("sampling (%d x %d through the reverse chain)",
+                cfg.num_batches, cfg.batch_size):
+        records, stats = draw_samples(model, cfg.num_batches, cfg.batch_size)
+    logger.info("Sampled %d/%d reconstructable buildings (%d dropped).",
+                len(records), stats["attempted"], stats["dropped"])
 
     metrics = {}
     n_invalid = 0
     if records:
-        val = check_validity([r["cityjson"] for r in records], cfg.val3dity_path)
+        with _stage("val3dity validity"):
+            val = check_validity([r["cityjson"] for r in records], cfg.val3dity_path)
         if val is not None:
             metrics["gen/valid_fraction"] = val["valid_fraction"]
             n_invalid = sum(1 for v in val["valid_flags"] if not v)
@@ -83,22 +123,31 @@ def run_generative_eval(model, datamodule, cfg, loggers, save_dir, seed=1234):
     # stats divide by n-1 / pairwise distances collapse with a single point).
     # Skip the arm rather than crash when sampling yields too few buildings.
     if records and datamodule is not None and len(records) >= 2:
-        gen_X_raw, names = feature_matrix([r["cityjson"] for r in records], cfg.feature_set)
+        with _stage("generated features (%d buildings)", len(records)):
+            gen_X_raw, names = feature_matrix([r["cityjson"] for r in records], cfg.feature_set)
         gen_X = log1p_normalize(gen_X_raw)
-        ref_X_raw, ref_names = reference_features(datamodule, "test", cfg.feature_set)
+        with _stage("test reference features"):
+            ref_X_raw, ref_names = reference_features(
+                datamodule, "test", cfg.feature_set, cfg.ref_max_samples, seed)
 
         if len(ref_X_raw) >= 2:
             ref_X = log1p_normalize(ref_X_raw)
-            metrics.update(per_feature_wasserstein(gen_X, ref_X, names))
-            metrics["gen/mmd"] = kernel_mmd(gen_X, ref_X)
+            with _stage("wasserstein + mmd (gen=%d, ref=%d)", len(gen_X), len(ref_X)):
+                metrics.update(per_feature_wasserstein(gen_X, ref_X, names))
+                metrics["gen/mmd"] = kernel_mmd(gen_X, ref_X)
 
-            train_X_raw, _ = reference_features(datamodule, "train", cfg.feature_set)
+            with _stage("train reference features"):
+                train_X_raw, _ = reference_features(
+                    datamodule, "train", cfg.feature_set, cfg.ref_max_samples, seed)
             if len(train_X_raw) >= 2:
-                metrics.update({f"gen/{k}": v for k, v in
-                                novelty_uniqueness(gen_X, log1p_normalize(train_X_raw),
-                                                    cfg.novelty_tol).items()})
+                with _stage("novelty + uniqueness"):
+                    metrics.update({f"gen/{k}": v for k, v in
+                                    novelty_uniqueness(gen_X, log1p_normalize(train_X_raw),
+                                                        cfg.novelty_tol).items()})
 
-    _save_and_log(records, metrics, loggers, save_dir, cfg)
+    with _stage("saving records + logging"):
+        _save_and_log(records, metrics, loggers, save_dir, cfg)
+    logger.info("[gen-eval] finished with %d metrics.", len(metrics))
     return metrics
 
 

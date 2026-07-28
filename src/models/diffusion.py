@@ -34,7 +34,7 @@ class CityJSONDiffusionModule(L.LightningModule):
                  edge_dim=32, global_dim=32, n_head=8, dropout=0.1,
                  x_marginals=None, e_marginals=None,
                  nu_pos=2.5, nu_x=1.0, nu_e=1.5,
-                 lambda_pos=3.0, lambda_x=0.4, lambda_e=2.0,
+                 lambda_pos=3.0, lambda_x=0.4, lambda_e=2.0, off_anchor_weight=0.1,
                  coord_scale=1.0, equivariance="so2", z_shift=0.0,
                  time_embed="scalar", dist_embed="raw", dist_embed_dim=16,
                  dist_r_max=None):
@@ -49,6 +49,14 @@ class CityJSONDiffusionModule(L.LightningModule):
             nu_pos, nu_x, nu_e (float): Cosine schedule exponents per feature.
                 nu_pos > nu_e destroys coordinates faster than graph structure.
             lambda_pos, lambda_x, lambda_e (float): Loss weights.
+            off_anchor_weight (float): Weight of the Off-slot coordinate term
+                relative to the real-node one. The coordinate MSE is normalised
+                over real slots only (Off is ~74% of n_max with an all-zero
+                target, which otherwise dilutes the real-node gradient ~4x), but
+                Off positions still need holding at the origin: the zero-CoM
+                projection spans every slot, so drift there rigidly translates
+                the generated building. 0.0 drops the anchor entirely -- expect
+                the shift to reappear. Ablation lever.
             coord_scale (float): Metres per unit of the model's coordinate space.
                 Targets are divided by it so the data matches the unit-variance
                 Gaussian the position diffusion noises towards; `generate_cityjson`
@@ -94,6 +102,7 @@ class CityJSONDiffusionModule(L.LightningModule):
         self.lambda_pos = lambda_pos
         self.lambda_x = lambda_x
         self.lambda_e = lambda_e
+        self.off_anchor_weight = off_anchor_weight
 
         if x_marginals is None:
             x_marginals = torch.ones(num_node_classes) / num_node_classes
@@ -190,8 +199,23 @@ class CityJSONDiffusionModule(L.LightningModule):
             z["X_t"], z["pos_t"], z["E_t"], z["t_int"], node_mask=net_mask
         )
 
-        # Positions: MiDi predicts x0 directly and regresses it with an MSE.
-        coord_loss = F.mse_loss(R_pred, R0)
+        # Positions: MiDi predicts x0 directly and regresses it with an MSE, but
+        # over *real* slots only rather than all n_max. Off is ~74% of slots and
+        # `_centre_positions` pins its target to exactly 0, so a plain mean spends
+        # three quarters of the coordinate gradient teaching the model to emit the
+        # origin and dilutes the real-node signal ~4x.
+        #
+        # The Off term is kept at `off_anchor_weight` rather than dropped. The
+        # zero-CoM projection spans every slot, so sum(real) == -sum(off) in xy and
+        # any drift in the Off positions translates the real building by
+        # -sum(off)/n_real. Measured on run levi-1: Off slots sat 1.13 m from the
+        # origin and reconstructions came out shifted 1.03 m, against 1.18 m
+        # predicted by that identity (direction cosine +0.82). Masking Off out of
+        # the loss entirely would remove the only thing holding them down.
+        real = (1.0 - X0[..., -1]).unsqueeze(-1)                  # [B, N, 1]
+        sq_err = (R_pred - R0) ** 2
+        coord_loss = (sq_err * real).sum() / (real.sum() * 3).clamp(min=1.0)
+        off_anchor = (sq_err * (1 - real)).sum() / ((1 - real).sum() * 3).clamp(min=1.0)
 
         node_loss = F.cross_entropy(
             X_pred.reshape(-1, self.num_node_classes), X0.argmax(dim=-1).reshape(-1)
@@ -205,7 +229,11 @@ class CityJSONDiffusionModule(L.LightningModule):
             E0[:, off_diag].argmax(dim=-1).reshape(-1),
         )
 
-        total = self.lambda_pos * coord_loss + self.lambda_x * node_loss + self.lambda_e * edge_loss
+        # `coord_loss` is returned (and logged) as the real-node MSE alone, so the
+        # dashboard series is directly comparable to `val_coord_mse` from
+        # `_active_coord_mse`; the anchor rides only in the optimised total.
+        total = (self.lambda_pos * (coord_loss + self.off_anchor_weight * off_anchor)
+                 + self.lambda_x * node_loss + self.lambda_e * edge_loss)
         return total, coord_loss, node_loss, edge_loss, X_pred, R_pred, R0
 
     def _active_coord_mse(self, R_pred, R0, node_mask):
