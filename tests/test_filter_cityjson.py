@@ -1,0 +1,182 @@
+"""Unit tests for the CityJSON dataset filter.
+
+Small hand-built CityJSON dicts only -- never the real dataset.
+"""
+import json
+from pathlib import Path
+
+import numpy as np
+
+from src.filter_cityjson import (
+    filter_city_objects, is_sliver, select_solid, world_vertices,
+)
+
+
+def box(x0, y0, w, d, h, base=0.0):
+    """Axis-aligned box as (vertices, Solid boundaries, semantics)."""
+    v = [(x0, y0, base), (x0 + w, y0, base), (x0 + w, y0 + d, base), (x0, y0 + d, base),
+         (x0, y0, base + h), (x0 + w, y0, base + h), (x0 + w, y0 + d, base + h), (x0, y0 + d, base + h)]
+    faces = [[[0, 3, 2, 1]], [[4, 5, 6, 7]], [[0, 1, 5, 4]],
+             [[1, 2, 6, 5]], [[2, 3, 7, 6]], [[3, 0, 4, 7]]]
+    sem = {"surfaces": [{"type": "GroundSurface"}, {"type": "RoofSurface"}, {"type": "WallSurface"}],
+           "values": [[0, 1, 2, 2, 2, 2]]}
+    return [list(p) for p in v], [faces], sem
+
+
+def solid(lod, n_extra_faces=0):
+    """A Solid geometry with a controllable face count (for tie-break tests)."""
+    _, boundaries, sem = box(0, 0, 4, 5, 3)
+    boundaries[0] = boundaries[0] + [[[0, 1, 2]]] * n_extra_faces
+    sem = {"surfaces": sem["surfaces"], "values": [sem["values"][0] + [2] * n_extra_faces]}
+    return {"type": "Solid", "lod": lod, "boundaries": boundaries, "semantics": sem}
+
+
+def cityjson(objects, vertices):
+    return {"type": "CityJSON", "version": "1.1", "CityObjects": objects, "vertices": vertices}
+
+
+# --- geometry selection ---------------------------------------------------
+
+def test_selects_tagged_lod2_solid_over_lod1_variants():
+    obj = {"type": "BuildingPart", "geometry": [solid("1.2"), solid("1.3"), solid("2.2", 4)]}
+    assert select_solid(obj, 2)["lod"] == "2.2"
+
+
+def test_selects_finest_when_lod2_tags_are_flattened():
+    obj = {"type": "BuildingPart", "geometry": [solid("2", 0), solid("2", 8)]}
+    assert len(select_solid(obj, 2)["boundaries"][0]) == 14
+
+
+def test_rejects_lod0_footprint_parent():
+    obj = {"type": "Building", "geometry": [{"type": "MultiSurface", "lod": "0",
+                                             "boundaries": [[[0, 1, 2, 3]]]}]}
+    assert select_solid(obj, 2) is None
+
+
+def test_rejects_wrong_integer_lod():
+    obj = {"type": "BuildingPart", "geometry": [solid("1.2"), solid("1.3")]}
+    assert select_solid(obj, 2) is None
+
+
+# --- object filtering -----------------------------------------------------
+
+def test_drops_parent_keeps_part_and_strips_dangling_refs():
+    verts, boundaries, sem = box(0, 0, 4, 5, 3)
+    cj = cityjson({
+        "pand": {"type": "Building", "children": ["pand-0"], "attributes": {"year": 1900},
+                 "geometry": [{"type": "MultiSurface", "lod": "0", "boundaries": [[[0, 1, 2, 3]]]}]},
+        "pand-0": {"type": "BuildingPart", "parents": ["pand"],
+                   "geometry": [{"type": "Solid", "lod": "2.2", "boundaries": boundaries, "semantics": sem}]},
+    }, verts)
+    kept, _ = filter_city_objects(cj, lod=2)
+    assert set(kept) == {"pand-0"}
+    assert "parents" not in kept["pand-0"]
+    assert len(kept["pand-0"]["geometry"]) == 1
+
+
+def test_compacts_vertices_and_preserves_world_coordinates():
+    verts_a, bounds_a, sem = box(0, 0, 4, 5, 3)
+    verts_b, bounds_b, _ = box(50, 50, 4, 5, 3)
+    shift = len(verts_a)
+    bounds_b = [[[[i + shift for i in r] for r in f] for f in sh] for sh in bounds_b]
+    cj = cityjson({
+        "keep": {"type": "Building", "geometry": [{"type": "Solid", "lod": "2", "boundaries": bounds_b, "semantics": sem}]},
+        "drop": {"type": "Building", "geometry": [{"type": "Solid", "lod": "1", "boundaries": bounds_a, "semantics": sem}]},
+    }, verts_a + verts_b)
+    kept, _ = filter_city_objects(cj, lod=2)
+    out = {**cj, "CityObjects": kept}
+    from src.filter_cityjson import compact_vertices
+    out = compact_vertices(out)
+
+    assert len(out["vertices"]) == 8
+    before = world_vertices(cj)[sorted({i for sh in bounds_b for f in sh for i in f[0]})]
+    after = world_vertices(out)[sorted({i for sh in out["CityObjects"]["keep"]["geometry"][0]["boundaries"]
+                                        for f in sh for i in f[0]})]
+    np.testing.assert_allclose(np.sort(before, axis=0), np.sort(after, axis=0))
+
+
+def test_applies_transform_when_present():
+    cj = {"type": "CityJSON", "CityObjects": {}, "vertices": [[0, 0, 0], [1000, 2000, 3000]],
+          "transform": {"scale": [0.001, 0.001, 0.001], "translate": [100.0, 200.0, 0.0]}}
+    np.testing.assert_allclose(world_vertices(cj)[1], [101.0, 202.0, 3.0])
+
+
+# --- sliver screen --------------------------------------------------------
+
+def test_flags_thin_tall_pillar():
+    verts, boundaries, sem = box(0, 0, 0.6, 0.6, 12.5)
+    v = world_vertices(cityjson({}, verts))
+    assert is_sliver(v, {"boundaries": boundaries, "semantics": sem}, max_slenderness=5.0, min_extent=1.0)
+
+
+def test_keeps_ordinary_building():
+    verts, boundaries, sem = box(0, 0, 8, 12, 6)
+    v = world_vertices(cityjson({}, verts))
+    assert not is_sliver(v, {"boundaries": boundaries, "semantics": sem}, max_slenderness=5.0, min_extent=1.0)
+
+
+def test_sliver_screen_removes_object():
+    verts, boundaries, sem = box(0, 0, 0.6, 0.6, 12.5)
+    cj = cityjson({"pillar": {"type": "BuildingPart",
+                              "geometry": [{"type": "Solid", "lod": "2.2", "boundaries": boundaries, "semantics": sem}]}},
+                  verts)
+    kept, stats = filter_city_objects(cj, lod=2, max_slenderness=5.0, min_extent=1.0)
+    assert kept == {}
+    assert stats["slivers"] == 1
+
+
+# --- end to end -----------------------------------------------------------
+
+def test_filtered_fixture_still_parses_to_a_levi_graph(tmp_path):
+    from src.dataset.dataset import parse_cityjson_file_to_graphs
+    from src.filter_cityjson import filter_cityjson
+
+    fixture = Path(__file__).parent / "fixtures" / "synthetic_lod2_building.city.json"
+    cj = json.loads(fixture.read_text(encoding="utf-8"))
+    out = filter_cityjson(cj, lod=2)
+    assert out is not None
+    path = tmp_path / "filtered.city.json"
+    path.write_text(json.dumps(out), encoding="utf-8")
+
+    # The fixture is already a single clean LOD2 Solid, so filtering must not
+    # change the graph it produces.
+    before = next(iter(parse_cityjson_file_to_graphs(fixture).values()))
+    after = next(iter(parse_cityjson_file_to_graphs(path).values()))
+    assert after["x"].shape == before["x"].shape
+    np.testing.assert_allclose(np.sort(after["x"].numpy(), axis=0),
+                               np.sort(before["x"].numpy(), axis=0), atol=1e-6)
+    assert sorted(after["node_labels"].tolist()) == sorted(before["node_labels"].tolist())
+    assert after["edge_index"].shape == before["edge_index"].shape
+
+
+def test_lod1_is_regenerated_from_the_filtered_lod2(tmp_path):
+    """The LOD1 folder is derived, so ids must align 1:1 with the LOD2 output."""
+    from src.dataset.dataset import parse_cityjson_file_to_graphs
+    from src.filter_cityjson import process_dataset
+
+    fixture = Path(__file__).parent / "fixtures" / "synthetic_lod2_building.city.json"
+    src = tmp_path / "ds" / "LOD2" / "Source A"
+    src.mkdir(parents=True)
+    (src / "tile.city.json").write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
+    (src / "description.txt").write_text("notes", encoding="utf-8")
+
+    out = tmp_path / "out"
+    totals = process_dataset(tmp_path / "ds", out, max_slenderness=None, min_extent=0.0)
+
+    assert totals["lod2"]["files"] == 1
+    assert totals["lod1_generated"]["files"] == 1
+    assert (out / "LOD1" / "Source A" / "description.txt").exists()
+
+    lod2 = parse_cityjson_file_to_graphs(out / "LOD2" / "Source A" / "tile.city.json")
+    lod1 = parse_cityjson_file_to_graphs(out / "LOD1" / "Source A" / "tile.city.json")
+    assert set(lod1) == set(lod2)
+    g1, g2 = next(iter(lod1.values())), next(iter(lod2.values()))
+    assert g1["x"].shape[0] < g2["x"].shape[0]        # LOD1 is the coarser of the pair
+
+
+def test_returns_none_when_nothing_survives():
+    from src.filter_cityjson import filter_cityjson
+    cj = cityjson({"pand": {"type": "Building",
+                            "geometry": [{"type": "MultiSurface", "lod": "0", "boundaries": [[[0, 1, 2]]]}]}},
+                  [[0, 0, 0], [1, 0, 0], [0, 1, 0]])
+    assert filter_cityjson(cj, lod=2) is None
