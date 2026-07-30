@@ -453,7 +453,10 @@ def scan_file(path, source, acc, kind, collect_full=True):
             acc.reservoirs[f"nz_{stype}"].extend([float(n[2])])
 
         for check in object_defects(obj, verts):
-            acc.note_outlier(check, source, path.name, oid)
+            # Carry the vertex count so the explorer can sort by size -- the
+            # worst offenders run to 1700+ faces and are painful to render.
+            acc.note_outlier(check, source, path.name, oid,
+                             "n_vertices", m["n_vertices"])
 
     return n_seen
 

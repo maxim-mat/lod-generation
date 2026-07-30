@@ -28,6 +28,8 @@ st.set_page_config(page_title="CityObject outliers", layout="wide")
 def read_outliers(path):
     df = pd.read_csv(path)
     df["oid"] = df["object_id"].str.split(":", n=1).str[-1]
+    # Written by the analysis as metric="n_vertices"; older csvs lack it.
+    df["n_vertices"] = pd.to_numeric(df.get("value"), errors="coerce")
     return df
 
 
@@ -62,9 +64,29 @@ with left:
     if source != "(all)":
         subset = subset[subset["source"] == source]
 
+    has_counts = subset["n_vertices"].notna().any()
+    if has_counts:
+        # Smallest first: big buildings are slow to draw and hard to read, and
+        # the interesting defect is usually just as visible on a small one.
+        biggest = int(subset["n_vertices"].max())
+        cap = st.slider("max LOD2 vertices", 8, biggest, biggest) if biggest > 8 else biggest
+        subset = subset[subset["n_vertices"] <= cap].sort_values("n_vertices")
+    else:
+        st.info("No vertex counts in this csv — re-run the analysis to sort by size.")
+
     st.caption(f"{len(subset)} flagged objects (csv caps each check at 500)")
+    sizes = dict(zip(subset["object_id"], subset["n_vertices"]))
+
+    def label_of(s):
+        n = sizes.get(s)
+        suffix = f"  —  {int(n)} verts" if pd.notna(n) else ""
+        return f"{s.split(':', 1)[-1][:34]}{suffix}"
+
     labels = subset["object_id"].tolist()
-    picked = st.selectbox("building", labels, format_func=lambda s: s.split(":", 1)[-1][:40])
+    if not labels:
+        st.warning("Nothing left after filtering; raise the vertex cap.")
+        st.stop()
+    picked = st.selectbox("building", labels, format_func=label_of)
 
     row = subset[subset["object_id"] == picked].iloc[0]
     oid, fname, src = row["oid"], row["file"], row["source"]
