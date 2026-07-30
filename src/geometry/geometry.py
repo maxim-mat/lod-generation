@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
+from math import sqrt
 from statistics import median
+
+# Calibrated so a converted LOD1 stands in the same relation to its LOD2 as
+# real 3DBAG lod1.2 does to lod2.2 -- a volume ratio of 1.0725, measured over
+# 4266 buildings. Matching that relation, rather than 3DBAG's published
+# ``b3_h_dak_70p`` height directly, is what keeps synthetic pairs consistent
+# with the real pairs they are trained alongside.
+DEFAULT_ROOF_PERCENTILE = 0.64
+
+# An LOD1 solid has exactly three kinds of face, so it gets a fresh minimal
+# semantics block rather than the source's -- per-plane roof attributes like
+# azimuth and slope describe LOD2 geometry that no longer exists here.
+LOD1_GROUND, LOD1_ROOF, LOD1_WALL = 0, 1, 2
+LOD1_SURFACES = ({"type": "GroundSurface"}, {"type": "RoofSurface"}, {"type": "WallSurface"})
+
 
 def signed_area_2d(ring, _vertices):
     """
@@ -32,12 +47,59 @@ def ensure_orientation(ring, _vertices, ccw=True):
     return ring
 
 
-def convert_to_lod1(_cj):
+def _face_area(ring, _vertices, scale):
+    """Area of a planar ring in world units, via the Newell area vector.
+
+    Only ``scale`` is applied: the area vector of a closed ring is invariant
+    under translation, so ``transform.translate`` cannot affect the result.
+    """
+    nx = ny = nz = 0.0
+    n = len(ring)
+    for i in range(n):
+        x1, y1, z1 = (c * s for c, s in zip(_vertices[ring[i]], scale))
+        x2, y2, z2 = (c * s for c, s in zip(_vertices[ring[(i + 1) % n]], scale))
+        nx += y1 * z2 - z1 * y2
+        ny += z1 * x2 - x1 * z2
+        nz += x1 * y2 - y1 * x2
+    return sqrt(nx * nx + ny * ny + nz * nz) / 2.0
+
+
+def _weighted_percentile(values, weights, q):
+    """Value at quantile ``q``, interpolated over midpoint cumulative weight."""
+    pairs = sorted(zip(values, weights))
+    total = sum(w for _, w in pairs)
+    if total <= 0:
+        return median([v for v, _ in pairs])
+
+    target = q * total
+    acc = 0.0
+    prev_c = prev_v = None
+    for v, w in pairs:
+        c = acc + 0.5 * w
+        if c >= target:
+            if prev_c is None or c == prev_c:
+                return v
+            f = (target - prev_c) / (c - prev_c)
+            return prev_v + f * (v - prev_v)
+        prev_c, prev_v = c, v
+        acc += w
+    return pairs[-1][0]
+
+
+def convert_to_lod1(_cj, roof_percentile=DEFAULT_ROOF_PERCENTILE):
     """
     Converts a single CityJSON dictionary from LOD2 representation to LOD1.
+
+    LOD1 is not LOD2 with the roof deleted -- that would leave an open shell.
+    The footprint is reused verbatim and extruded to a single flat cap, so the
+    cap height is the only quantity this conversion actually decides. It is the
+    ``roof_percentile`` quantile of roof-vertex height, each vertex weighted by
+    its share of its face's area; weighting by vertex count instead lets a
+    cluster of small facets outvote the main roof plane.
     """
     # Make a copy of the vertices to modify them safely
     _vertices = list(_cj["vertices"])
+    scale = (_cj.get("transform") or {}).get("scale", (1.0, 1.0, 1.0))
 
     for obj_id, city_obj in _cj.get("CityObjects", {}).items():
         new_geometries = []
@@ -55,53 +117,56 @@ def convert_to_lod1(_cj):
             surfaces = semantics.get("surfaces", [])
             values = semantics.get("values", [])
 
-            # Find indices
-            ground_idx = None
-            roof_idx = None
-            wall_idx = None
+            # A type maps to a *set* of indices: 3DBAG declares one
+            # RoofSurface per roof plane, carrying that plane's azimuth and
+            # slope, and separate WallSurface entries per wall kind. Keeping
+            # only the last index of each type would collect a fraction of the
+            # roof and cap the building at the wrong height.
+            ground_ids = {i for i, s in enumerate(surfaces)
+                          if s and s.get("type") == "GroundSurface"}
+            roof_ids = {i for i, s in enumerate(surfaces)
+                        if s and s.get("type") == "RoofSurface"}
 
-            for i, s in enumerate(surfaces):
-                stype = s.get("type")
-                if stype == "GroundSurface":
-                    ground_idx = i
-                elif stype == "RoofSurface":
-                    roof_idx = i
-                elif stype == "WallSurface":
-                    wall_idx = i
-
-            if ground_idx is None or roof_idx is None:
+            if not ground_ids or not roof_ids:
                 new_geometries.append(geom)
                 continue
-
-            if wall_idx is None:
-                wall_idx = len(surfaces)
-                surfaces = list(surfaces)
-                surfaces.append({"type": "WallSurface"})
 
             # --------------------------------------------------
             # Collect ground faces and roof heights
             # --------------------------------------------------
             ground_faces = []
-            roof_heights = []
+            roof_faces = []
 
             for shell_i, shell in enumerate(geom["boundaries"]):
-                sem_shell = values[shell_i]
+                # Semantics may be ragged or absent for a shell; a face without
+                # a value is simply unclassified, not a reason to crash.
+                sem_shell = values[shell_i] if shell_i < len(values) else []
                 for face_i, face in enumerate(shell):
-                    sem = sem_shell[face_i]
-                    if sem == ground_idx:
+                    sem = sem_shell[face_i] if face_i < len(sem_shell) else None
+                    if sem in ground_ids:
                         ground_faces.append(face)
-                    elif sem == roof_idx:
-                        for ring in face:
-                            for vid in ring:
-                                roof_heights.append(
-                                    _vertices[vid][2]
-                                )
+                    elif sem in roof_ids:
+                        roof_faces.append(face)
 
-            if not ground_faces or not roof_heights:
+            if not ground_faces or not roof_faces:
                 new_geometries.append(geom)
                 continue
 
-            lod1_height = median(roof_heights)
+            # Sample roof height per vertex, each carrying an equal share of
+            # its face's area. Collapsing a face to its mean z instead caps the
+            # reachable height at the highest face *average*, which cannot
+            # reproduce the ridge-height end of the real LOD1 distribution.
+            # Heights stay in the file's own vertex units so the new roof
+            # vertices below can be appended as-is; only the area weights need
+            # world units, and a quantile is invariant to their common factor.
+            roof_z, roof_w = [], []
+            for face in roof_faces:
+                ring = face[0]
+                share = _face_area(ring, _vertices, scale) / len(ring)
+                for vid in ring:
+                    roof_z.append(_vertices[vid][2])
+                    roof_w.append(share)
+            lod1_height = _weighted_percentile(roof_z, roof_w, roof_percentile)
 
             # --------------------------------------------------
             # Vertex cache
@@ -138,20 +203,21 @@ def convert_to_lod1(_cj):
 
                 ground_face = [outer_ring] + hole_rings
                 shell.append(ground_face)
-                sem_values.append(ground_idx)
+                sem_values.append(LOD1_GROUND)
 
-                roof_face = []
-                roof_face.append(
-                    [get_roof_vertex(v) for v in outer_ring]  # keep CCW → outward normal points up
-                )
+                # The roof is the footprint lifted, so it inherits the ground's
+                # CW winding and with it a downward normal. Reverse every ring
+                # to turn it back up; holes follow so they stay opposed to the
+                # outer ring.
+                roof_face = [[get_roof_vertex(v) for v in reversed(outer_ring)]]
 
                 for hole in hole_rings:
                     roof_face.append(
-                        [get_roof_vertex(v) for v in hole]  # keep same as ground hole (opposite of outer)
+                        [get_roof_vertex(v) for v in reversed(hole)]
                     )
 
                 shell.append(roof_face)
-                sem_values.append(roof_idx)
+                sem_values.append(LOD1_ROOF)
 
                 # walls from outer boundary
                 def add_walls(ring):
@@ -163,15 +229,17 @@ def convert_to_lod1(_cj):
                         t0 = get_roof_vertex(b0)
                         t1 = get_roof_vertex(b1)
 
+                        # Rise before running along the ring: b0->b1->t1->t0
+                        # would wind the quad the other way and face inward.
                         wall = [[
                             b0,
-                            b1,
+                            t0,
                             t1,
-                            t0
+                            b1
                         ]]
 
                         shell.append(wall)
-                        sem_values.append(wall_idx)
+                        sem_values.append(LOD1_WALL)
 
                 add_walls(outer_ring)
                 for hole in hole_rings:
@@ -182,7 +250,7 @@ def convert_to_lod1(_cj):
                 "lod": "1",
                 "boundaries": [shell],
                 "semantics": {
-                    "surfaces": surfaces,
+                    "surfaces": [dict(s) for s in LOD1_SURFACES],
                     "values": [sem_values]
                 }
             }

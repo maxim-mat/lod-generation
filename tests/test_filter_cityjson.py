@@ -74,6 +74,32 @@ def test_drops_parent_keeps_part_and_strips_dangling_refs():
     assert len(kept["pand-0"]["geometry"]) == 1
 
 
+def test_part_inherits_attributes_from_the_dropped_parent():
+    """3DBAG puts every BAG attribute on the parent; the part we keep has none."""
+    verts, boundaries, sem = box(0, 0, 4, 5, 3)
+    cj = cityjson({
+        "pand": {"type": "Building", "children": ["pand-0"],
+                 "attributes": {"b3_dak_type": "slanted", "bouwjaar": 1900},
+                 "geometry": [{"type": "MultiSurface", "lod": "0", "boundaries": [[[0, 1, 2, 3]]]}]},
+        "pand-0": {"type": "BuildingPart", "parents": ["pand"], "attributes": None,
+                   "geometry": [{"type": "Solid", "lod": "2.2", "boundaries": boundaries, "semantics": sem}]},
+    }, verts)
+    kept, _ = filter_city_objects(cj, lod=2)
+    assert kept["pand-0"]["attributes"] == {"b3_dak_type": "slanted", "bouwjaar": 1900}
+
+
+def test_part_keeps_its_own_attributes_over_the_parents():
+    verts, boundaries, sem = box(0, 0, 4, 5, 3)
+    cj = cityjson({
+        "pand": {"type": "Building", "children": ["pand-0"], "attributes": {"src": "parent"},
+                 "geometry": [{"type": "MultiSurface", "lod": "0", "boundaries": [[[0, 1, 2, 3]]]}]},
+        "pand-0": {"type": "BuildingPart", "parents": ["pand"], "attributes": {"src": "child"},
+                   "geometry": [{"type": "Solid", "lod": "2.2", "boundaries": boundaries, "semantics": sem}]},
+    }, verts)
+    kept, _ = filter_city_objects(cj, lod=2)
+    assert kept["pand-0"]["attributes"] == {"src": "child"}
+
+
 def test_compacts_vertices_and_preserves_world_coordinates():
     verts_a, bounds_a, sem = box(0, 0, 4, 5, 3)
     verts_b, bounds_b, _ = box(50, 50, 4, 5, 3)
@@ -149,29 +175,76 @@ def test_filtered_fixture_still_parses_to_a_levi_graph(tmp_path):
     assert after["edge_index"].shape == before["edge_index"].shape
 
 
-def test_lod1_is_regenerated_from_the_filtered_lod2(tmp_path):
-    """The LOD1 folder is derived, so ids must align 1:1 with the LOD2 output."""
+def _raw_tree(tmp_path):
+    """A raw folder with one source subfolder, a tile and a non-JSON asset."""
+    fixture = Path(__file__).parent / "fixtures" / "synthetic_lod2_building.city.json"
+    raw = tmp_path / "raw" / "Source A"
+    raw.mkdir(parents=True)
+    (raw / "tile.city.json").write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
+    (raw / "description.txt").write_text("notes", encoding="utf-8")
+    return tmp_path / "raw", tmp_path / "out"
+
+
+def test_synthetic_lod1_is_opt_in(tmp_path):
+    from src.filter_cityjson import process_dataset
+
+    raw, out = _raw_tree(tmp_path)
+    totals = process_dataset(raw, out, max_slenderness=None, min_extent=0.0)
+
+    assert not (out / "LOD1_synth").exists()
+    assert totals["LOD1_synth"]["files"] == 0
+    assert (out / "LOD2" / "Source A" / "tile.city.json").exists()
+    # the fixture is pure lod2, so there is no real lod-1 geometry to extract
+    assert not (out / "LOD1" / "Source A" / "tile.city.json").exists()
+
+
+def test_convert_on_the_fly_pairs_synth_lod1_with_lod2(tmp_path):
+    """The synthetic pair must keep the LOD2 filename and object ids."""
     from src.dataset.dataset import parse_cityjson_file_to_graphs
     from src.filter_cityjson import process_dataset
 
-    fixture = Path(__file__).parent / "fixtures" / "synthetic_lod2_building.city.json"
-    src = tmp_path / "ds" / "LOD2" / "Source A"
-    src.mkdir(parents=True)
-    (src / "tile.city.json").write_text(fixture.read_text(encoding="utf-8"), encoding="utf-8")
-    (src / "description.txt").write_text("notes", encoding="utf-8")
+    raw, out = _raw_tree(tmp_path)
+    totals = process_dataset(raw, out, max_slenderness=None, min_extent=0.0,
+                             convert_on_the_fly=True)
 
-    out = tmp_path / "out"
-    totals = process_dataset(tmp_path / "ds", out, max_slenderness=None, min_extent=0.0)
-
-    assert totals["lod2"]["files"] == 1
-    assert totals["lod1_generated"]["files"] == 1
-    assert (out / "LOD1" / "Source A" / "description.txt").exists()
+    assert totals["LOD2"]["files"] == 1
+    assert totals["LOD1_synth"]["files"] == 1
+    assert (out / "LOD1_synth" / "Source A" / "description.txt").exists()
 
     lod2 = parse_cityjson_file_to_graphs(out / "LOD2" / "Source A" / "tile.city.json")
-    lod1 = parse_cityjson_file_to_graphs(out / "LOD1" / "Source A" / "tile.city.json")
-    assert set(lod1) == set(lod2)
-    g1, g2 = next(iter(lod1.values())), next(iter(lod2.values()))
+    synth = parse_cityjson_file_to_graphs(out / "LOD1_synth" / "Source A" / "tile.city.json")
+    assert set(synth) == set(lod2)
+    g1, g2 = next(iter(synth.values())), next(iter(lod2.values()))
     assert g1["x"].shape[0] < g2["x"].shape[0]        # LOD1 is the coarser of the pair
+
+
+def test_real_lod1_and_lod2_are_split_into_their_own_folders(tmp_path):
+    """A 3DBAG-shaped part carrying 1.2 and 2.2 lands in both LOD folders."""
+    import json as _json
+    from src.filter_cityjson import process_dataset
+
+    verts, boundaries, sem = box(0, 0, 8, 12, 6)
+    raw = tmp_path / "raw" / "Source B"
+    raw.mkdir(parents=True)
+    cj = cityjson({
+        "pand": {"type": "Building", "children": ["pand-0"], "attributes": {"year": 1900},
+                 "geometry": [{"type": "MultiSurface", "lod": "0", "boundaries": [[[0, 1, 2, 3]]]}]},
+        "pand-0": {"type": "BuildingPart", "parents": ["pand"],
+                   "geometry": [{"type": "Solid", "lod": "1.2", "boundaries": boundaries, "semantics": sem},
+                                {"type": "Solid", "lod": "2.2", "boundaries": boundaries, "semantics": sem}]},
+    }, verts)
+    (raw / "tile.city.json").write_text(_json.dumps(cj), encoding="utf-8")
+
+    out = tmp_path / "out"
+    totals = process_dataset(tmp_path / "raw", out, max_slenderness=None, min_extent=0.0)
+
+    for lod in ("LOD1", "LOD2"):
+        written = _json.loads((out / lod / "Source B" / "tile.city.json").read_text(encoding="utf-8"))
+        assert set(written["CityObjects"]) == {"pand-0"}, f"{lod} kept the wrong objects"
+        assert len(written["CityObjects"]["pand-0"]["geometry"]) == 1
+        assert totals[lod]["kept"] == 1
+    assert _json.loads((out / "LOD1" / "Source B" / "tile.city.json")
+                       .read_text(encoding="utf-8"))["CityObjects"]["pand-0"]["geometry"][0]["lod"] == "1.2"
 
 
 def test_returns_none_when_nothing_survives():

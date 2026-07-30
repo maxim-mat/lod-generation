@@ -1,32 +1,40 @@
 #!/usr/bin/env python3
-"""Filter a CityJSON dataset to exactly one Solid per building, per LOD folder.
+"""Split a raw CityJSON dataset into folders of exactly one LOD each.
 
-The raw The Hague dataset mixes several representations inside each LOD folder,
-which the graph parser silently unions together:
+A raw folder holds whatever the supplier shipped, with sources in subfolders.
+Its files mix several representations inside one object, which the graph parser
+silently unions together:
 
-  * 3DBAG (Source B) parent ``Building`` objects carry only a lod-0 footprint
-    MultiSurface; the volumes live on their ``BuildingPart`` children. Parsed
-    as-is, every parent becomes a spurious 5-node graph (footprint ring + one
-    face node).
+  * 3DBAG parent ``Building`` objects carry only a lod-0 footprint MultiSurface;
+    the volumes live on their ``BuildingPart`` children. Parsed as-is, every
+    parent becomes a spurious 5-node graph (footprint ring + one face node).
   * Those ``BuildingPart`` objects hold three alternative Solids (LOD 1.2, 1.3
     and 2.2). They are *views* of one building, not parts of it, so unioning
     them yields three interpenetrating copies.
   * A few parts are degenerate slivers (e.g. a 0.6 x 0.6 m footprint extruded
     12.5 m) left over from party-wall strips.
 
-Only the LOD2 folder is read. The dataset's LOD1 folder is derived data --
-``convert_to_lod1`` applied to the LOD2 folder, once per geometry, which is why
-its files carry all three variants with every ``lod`` tag rewritten to "1".
-Filtering it independently would pair each LOD2 sample with an LOD1 solid
-derived from a *different* source variant, so the LOD1 output is regenerated
-here from the already-filtered LOD2 instead.
+Each output folder is one pure LOD extracted from those mixed geometries:
 
-Output mirrors the input tree, so ``CityJsonLodDataset`` reads it unchanged.
-Buildings split across several ``BuildingPart``s stay separate objects; 3DBAG
-already suffixes their ids (``<Pand>-0``, ``-1``), so they remain unique.
+  ``LOD1/``        real lod-1 Solids, where the supplier shipped any
+  ``LOD2/``        real lod-2 Solids
+  ``LOD1_synth/``  lod-1 *derived* from the LOD2 output by ``convert_to_lod1``,
+                   written only with ``--convert-on-the-fly``
+
+LOD1 and LOD2 are independent extractions -- a source with no lod-1 geometry
+simply contributes nothing to ``LOD1/``. ``LOD1_synth/`` exists because real
+lod-1 data usually has no matching lod-2 description of the same building,
+whereas a converted solid is paired with its LOD2 original by construction:
+same filename, same object ids. The height it extrudes to is a heuristic, so
+prefer real ``LOD1/`` geometry when a source provides it.
+
+Every folder mirrors the raw subfolder layout, so ``CityJsonLodDataset`` reads
+them unchanged. Buildings split across several ``BuildingPart``s stay separate
+objects; 3DBAG already suffixes their ids (``<Pand>-0``, ``-1``), so they
+remain unique.
 
 Usage:
-    python -m src.filter_cityjson "data/The Hague" --out "data/The Hague filtered"
+    python -m src.filter_cityjson "data/The Hague/raw" --out "data/The Hague"
 """
 import argparse
 import json
@@ -40,7 +48,7 @@ from pathlib import Path
 
 import numpy as np
 
-from src.geometry.geometry import convert_to_lod1
+from src.geometry.geometry import DEFAULT_ROOF_PERCENTILE, convert_to_lod1
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +75,10 @@ def select_solid(obj, lod):
     """The single Solid representing this object at ``lod``, or None.
 
     Candidates are Solids whose ``lod`` tag truncates to ``lod``, so 2.2 counts
-    as LOD2 while 1.2 and 1.3 do not. If several survive -- possible when an
-    exporter has flattened the tags -- the finest wins, i.e. the most faces.
+    as LOD2 while 1.2 and 1.3 do not. Several routinely survive at lod 1, where
+    3DBAG ships both 1.2 and 1.3; the finest wins, i.e. the most faces, which
+    picks 1.3 wherever it actually refines 1.2 and 1.2 where the two are the
+    same shape. The result is always the most detailed solid at that LOD.
     """
     candidates = []
     for geom in obj.get("geometry", []):
@@ -121,12 +131,14 @@ def filter_city_objects(cj, lod, max_slenderness=DEFAULT_MAX_SLENDERNESS,
     """Keep one Solid per object at ``lod``; drop footprint parents and slivers.
 
     Returns ``(city_objects, stats)``. ``parents``/``children`` are stripped
-    because the objects they reference are gone.
+    because the objects they reference are gone; a part that carries no
+    attributes of its own inherits the dropped parent's instead.
     """
     vertices = world_vertices(cj)
+    objects = cj.get("CityObjects", {})
     kept, stats = {}, {"kept": 0, "no_lod_solid": 0, "slivers": 0, "sliver_ids": []}
 
-    for oid, obj in cj.get("CityObjects", {}).items():
+    for oid, obj in objects.items():
         solid = select_solid(obj, lod)
         if solid is None:
             stats["no_lod_solid"] += 1
@@ -135,8 +147,14 @@ def filter_city_objects(cj, lod, max_slenderness=DEFAULT_MAX_SLENDERNESS,
             stats["slivers"] += 1
             stats["sliver_ids"].append(oid)
             continue
-        kept[oid] = {**{k: v for k, v in obj.items() if k not in ("geometry", "parents", "children")},
-                     "geometry": [solid]}
+        entry = {k: v for k, v in obj.items() if k not in ("geometry", "parents", "children")}
+        # 3DBAG hangs every BAG attribute on the parent Building and leaves the
+        # BuildingPart's null, so dropping the parent would discard them all.
+        if not entry.get("attributes"):
+            entry["attributes"] = next(
+                (a for pid in obj.get("parents", [])
+                 if (a := objects.get(pid, {}).get("attributes"))), entry.get("attributes"))
+        kept[oid] = {**entry, "geometry": [solid]}
         stats["kept"] += 1
 
     return kept, stats
@@ -184,32 +202,38 @@ def _git_commit():
         return None
 
 
-def _find_lod_dir(dataset_dir, lod):
-    for d in sorted(dataset_dir.iterdir()):
-        if d.is_dir() and d.name.lower() == f"lod{lod}":
-            return d
-    return None
-
-
 def _write(path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh)
 
 
-def process_dataset(dataset_dir, out_dir, max_slenderness, min_extent, lod=2):
-    """Filter the LODn folder into ``out_dir``, regenerating LOD1 beside it."""
-    src_dir = _find_lod_dir(dataset_dir, lod)
-    if src_dir is None:
-        raise FileNotFoundError(f"No LOD{lod} folder under {dataset_dir}")
-    out_lod2 = out_dir / src_dir.name
-    out_lod1 = out_dir / ((_find_lod_dir(dataset_dir, 1) or Path("LOD1")).name)
+SYNTH_DIR = "LOD1_synth"
 
-    totals = {f"lod{lod}": {"files": 0, "kept": 0, "no_lod_solid": 0, "slivers": 0, "sliver_ids": []},
-              "lod1_generated": {"files": 0}, "errors": []}
 
-    for src in sorted(p for p in src_dir.rglob("*") if p.is_file()):
-        rel = src.relative_to(src_dir)
+def process_dataset(raw_dir, out_dir, max_slenderness, min_extent,
+                    convert_on_the_fly=False, lods=(1, 2),
+                    roof_percentile=DEFAULT_ROOF_PERCENTILE):
+    """Split ``raw_dir`` into one folder per LOD under ``out_dir``.
+
+    ``raw_dir`` is the supplier's tree, source subfolders and all; every output
+    folder mirrors its layout. With ``convert_on_the_fly`` the LOD2 output is
+    additionally converted down into ``LOD1_synth/``, keeping the filenames and
+    object ids of its LOD2 original so the two form matched pairs.
+    """
+    if not raw_dir.is_dir():
+        raise FileNotFoundError(f"Raw folder not found: {raw_dir}")
+
+    names = {lod: f"LOD{lod}" for lod in lods}
+    totals = {names[lod]: {"files": 0, "kept": 0, "no_lod_solid": 0, "slivers": 0, "sliver_ids": []}
+              for lod in lods}
+    totals[SYNTH_DIR] = {"files": 0}
+    totals["errors"] = []
+
+    roots = [out_dir / n for n in names.values()] + ([out_dir / SYNTH_DIR] if convert_on_the_fly else [])
+
+    for src in sorted(p for p in raw_dir.rglob("*") if p.is_file()):
+        rel = src.relative_to(raw_dir)
 
         try:
             with open(src, "r", encoding="utf-8") as fh:
@@ -218,36 +242,38 @@ def process_dataset(dataset_dir, out_dir, max_slenderness, min_extent, lod=2):
             cj = None                        # description.txt and other non-JSON assets
 
         if cj is None or cj.get("type") != "CityJSON":
-            for dst in (out_lod2 / rel, out_lod1 / rel):
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
+            for root in roots:
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, root / rel)
             continue
 
-        kept, stats = filter_city_objects(cj, lod, max_slenderness, min_extent)
-        if not kept:
-            logger.warning("no LOD%d objects survived in %s", lod, src.name)
-            continue
-        filtered = compact_vertices({**cj, "CityObjects": kept})
+        for lod in lods:
+            kept, stats = filter_city_objects(cj, lod, max_slenderness, min_extent)
+            if not kept:
+                logger.info("no lod-%d geometry in %s", lod, src.name)
+                continue
+            filtered = compact_vertices({**cj, "CityObjects": kept})
 
-        try:
-            _write(out_lod2 / rel, filtered)
-            # convert_to_lod1 mutates its argument, so hand it a copy; the
-            # LOD1 pair must come from the same solid the LOD2 file keeps.
-            lod1 = compact_vertices(convert_to_lod1(deepcopy(filtered)))
-            _write(out_lod1 / rel, lod1)
-        except (OSError, KeyError, ValueError) as exc:
-            logger.error("failed on %s: %s", src.name, exc)
-            totals["errors"].append(f"{rel}: {exc}")
-            continue
+            try:
+                _write(out_dir / names[lod] / rel, filtered)
+                if convert_on_the_fly and lod == 2:
+                    # convert_to_lod1 mutates its argument, so hand it a copy;
+                    # the synthetic pair must come from the solid LOD2 kept.
+                    _write(out_dir / SYNTH_DIR / rel,
+                           compact_vertices(convert_to_lod1(deepcopy(filtered), roof_percentile)))
+                    totals[SYNTH_DIR]["files"] += 1
+            except (OSError, KeyError, IndexError, ValueError) as exc:
+                logger.error("failed on %s at lod %d: %s", src.name, lod, exc)
+                totals["errors"].append(f"{rel} (lod{lod}): {exc}")
+                continue
 
-        bucket = totals[f"lod{lod}"]
-        bucket["files"] += 1
-        for key in ("kept", "no_lod_solid", "slivers"):
-            bucket[key] += stats[key]
-        bucket["sliver_ids"] += [f"{src.name}:{i}" for i in stats["sliver_ids"]]
-        totals["lod1_generated"]["files"] += 1
-        logger.info("%s -> kept %d, dropped %d (%d slivers)",
-                    src.name, stats["kept"], stats["no_lod_solid"], stats["slivers"])
+            bucket = totals[names[lod]]
+            bucket["files"] += 1
+            for key in ("kept", "no_lod_solid", "slivers"):
+                bucket[key] += stats[key]
+            bucket["sliver_ids"] += [f"{src.name}:{i}" for i in stats["sliver_ids"]]
+            logger.info("%s lod%d -> kept %d, dropped %d (%d slivers)",
+                        src.name, lod, stats["kept"], stats["no_lod_solid"], stats["slivers"])
 
     return totals
 
@@ -255,9 +281,16 @@ def process_dataset(dataset_dir, out_dir, max_slenderness, min_extent, lod=2):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("dataset_dir", help="Dataset root containing the LOD2 folder.")
-    ap.add_argument("--out", required=True, help="Output folder (must not already exist).")
-    ap.add_argument("--lod", type=int, default=2, help="Source LOD folder to filter (default: 2).")
+    ap.add_argument("raw_dir", help="Raw dataset folder, source subfolders and all.")
+    ap.add_argument("--out", required=True,
+                    help="Dataset root to write LOD1/, LOD2/ and LOD1_synth/ into.")
+    ap.add_argument("--lods", type=int, nargs="+", default=[1, 2],
+                    help="LODs to extract into their own folders (default: 1 2).")
+    ap.add_argument("--convert-on-the-fly", action="store_true",
+                    help="Also derive LOD1_synth/ from the LOD2 output, paired by file and object id.")
+    ap.add_argument("--roof-percentile", type=float, default=DEFAULT_ROOF_PERCENTILE,
+                    help="Area-weighted roof-height quantile the synthetic LOD1 cap sits at "
+                         f"(default: {DEFAULT_ROOF_PERCENTILE}, matching 3DBAG lod1.2:lod2.2 volume).")
     ap.add_argument("--max-slenderness", type=float, default=DEFAULT_MAX_SLENDERNESS,
                     help="Drop solids taller than this multiple of their narrowest span.")
     ap.add_argument("--min-extent", type=float, default=DEFAULT_MIN_EXTENT,
@@ -267,38 +300,42 @@ def main():
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    dataset_dir = Path(args.dataset_dir).resolve()
-    if not dataset_dir.is_dir():
-        sys.exit(f"Dataset folder not found: {dataset_dir}")
+    raw_dir = Path(args.raw_dir).resolve()
+    if not raw_dir.is_dir():
+        sys.exit(f"Raw folder not found: {raw_dir}")
     out_dir = Path(args.out).resolve()
-    if out_dir.exists() and any(out_dir.iterdir()):
-        sys.exit(f"Output folder already exists and is not empty: {out_dir}")
-    if out_dir == dataset_dir:
-        sys.exit("Output folder must differ from the dataset folder.")
+    written = [out_dir / f"LOD{l}" for l in args.lods] + [out_dir / SYNTH_DIR]
+    for d in written:
+        if d.exists() and any(d.iterdir()):
+            sys.exit(f"Output folder already exists and is not empty: {d}")
+    if raw_dir in written or raw_dir == out_dir:
+        sys.exit("Raw folder must sit outside the folders being written.")
     out_dir.mkdir(parents=True, exist_ok=True)
 
     max_slenderness = None if args.keep_slivers else args.max_slenderness
     try:
-        totals = process_dataset(dataset_dir, out_dir, max_slenderness, args.min_extent, args.lod)
+        totals = process_dataset(raw_dir, out_dir, max_slenderness, args.min_extent,
+                                 args.convert_on_the_fly, tuple(args.lods), args.roof_percentile)
     except FileNotFoundError as exc:
         sys.exit(str(exc))
 
     manifest = {
         "created": datetime.now(timezone.utc).isoformat(),
         "git_commit": _git_commit(),
-        "source": str(dataset_dir),
+        "source": str(raw_dir),
         "args": vars(args),
         "totals": totals,
     }
     (out_dir / "filter_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     if totals["errors"]:
-        logger.warning("%d files failed: %s", len(totals["errors"]), totals["errors"][:5])
-    bucket = totals[f"lod{args.lod}"]
-    logger.info("lod%d: %d files, %d objects kept, %d dropped, %d slivers",
-                args.lod, bucket["files"], bucket["kept"], bucket["no_lod_solid"], bucket["slivers"])
-    logger.info("lod1: %d files regenerated from the filtered output",
-                totals["lod1_generated"]["files"])
+        logger.warning("%d failures: %s", len(totals["errors"]), totals["errors"][:5])
+    for lod in args.lods:
+        b = totals[f"LOD{lod}"]
+        logger.info("LOD%d: %d files, %d objects kept, %d without a lod-%d solid, %d slivers",
+                    lod, b["files"], b["kept"], b["no_lod_solid"], lod, b["slivers"])
+    if args.convert_on_the_fly:
+        logger.info("%s: %d files derived from the LOD2 output", SYNTH_DIR, totals[SYNTH_DIR]["files"])
     logger.info("manifest written to %s", out_dir / "filter_manifest.json")
 
 
