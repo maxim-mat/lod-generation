@@ -62,6 +62,16 @@ class ModelConfig:
     # spans every slot, so unheld Off positions rigidly translate the building.
     off_anchor_weight: float = 0.1
 
+    # Cross-entropy class balancing, the categorical counterpart of the above.
+    # Off is 73.7% of node slots and 99.0% of node pairs; GroundSurface is 0.67%
+    # of node slots. class_balance is the exponent on inverse frequency: 0 leaves
+    # the loss proper, 1 equalises every class's contribution. off_ce_weight
+    # scales the Off class on top, since how often the model emits Off sets the
+    # generated graph's size. Any non-default value biases the network's x0
+    # posterior, which `_debias` divides back out before sampling.
+    class_balance: float = 0.5
+    off_ce_weight: float = 1.0
+
 @dataclass
 class EarlyStoppingConfig:
     """Configuration for early stopping callback."""

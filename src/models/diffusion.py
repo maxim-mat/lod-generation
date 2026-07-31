@@ -36,6 +36,7 @@ class CityJSONDiffusionModule(L.LightningModule):
                  x_marginals=None, e_marginals=None,
                  nu_pos=2.5, nu_x=1.0, nu_e=1.5,
                  lambda_pos=3.0, lambda_x=0.4, lambda_e=2.0, off_anchor_weight=0.1,
+                 class_balance=0.5, off_ce_weight=1.0,
                  coord_scale=1.0, equivariance="so2", z_shift=0.0,
                  time_embed="scalar", dist_embed="raw", dist_embed_dim=16,
                  dist_r_max=None):
@@ -112,6 +113,24 @@ class CityJSONDiffusionModule(L.LightningModule):
         x_marginals = torch.as_tensor(x_marginals, dtype=torch.float32)
         e_marginals = torch.as_tensor(e_marginals, dtype=torch.float32)
 
+        # Class weights for the two cross entropies. Off is 73.7% of node slots
+        # and 99.0% of node pairs, so an unweighted mean spends nearly all of the
+        # gradient on padding -- the same imbalance the coordinate MSE already
+        # corrects by normalising over real slots. GroundSurface, which defines
+        # the base plane, is 0.67% of node slots.
+        #
+        # Derived from the *supplied* marginals, not `self.noise.X_marginals`:
+        # under discrete_noise_type='uniform' the noise model overwrites those
+        # with a uniform prior, which says nothing about class frequency.
+        self.class_balance = float(class_balance)
+        self.off_ce_weight = float(off_ce_weight)
+        self.register_buffer(                        # OFF is the last node class
+            "x_ce_weight",
+            self._ce_weights(x_marginals, class_balance, off_ce_weight, -1))
+        self.register_buffer(                        # EDGE_OFF is the first edge class
+            "e_ce_weight",
+            self._ce_weights(e_marginals, class_balance, off_ce_weight, 0))
+
         # ponytail: one knob drives both X and E transitions. GraphNoiseModel keeps
         # them separate so they can be ablated independently -- add two config
         # fields when that ablation is actually run.
@@ -141,6 +160,54 @@ class CityJSONDiffusionModule(L.LightningModule):
     # ------------------------------------------------------------------
     # Data preparation
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ce_weights(marginals, beta, off_weight, off_index):
+        """Per-class cross-entropy weights ``(1 / pi_c) ** beta``, Off scaled.
+
+        ``beta=0`` leaves the loss proper (all weights 1); ``beta=1`` equalises
+        every class's total contribution. ``off_weight`` scales the Off class on
+        top, since how often the model emits Off is what sets the generated
+        graph's size and is worth tuning separately from the semantic classes.
+        A class absent from the training split gets weight 1, not infinity.
+
+        ``off_index`` is explicit because the two conventions disagree: Off is
+        the *last* node class (VERTEX, GROUND, ROOF, WALL, OFF) but the *first*
+        edge class (EDGE_OFF, EDGE_VV, EDGE_VF).
+        """
+        pi = torch.as_tensor(marginals, dtype=torch.float32).clone()
+        w = torch.where(pi > 0, pi.clamp(min=1e-12) ** -float(beta),
+                        torch.ones_like(pi))
+        w[off_index] = w[off_index] * float(off_weight)
+        return w
+
+    @staticmethod
+    def _debias(logits, weight):
+        """Undo the class weighting on a prediction, in logit space.
+
+        A weighted cross entropy is minimised by ``p_hat(c) ∝ w_c * p(c)``, but
+        the reverse chain consumes ``softmax(pred)`` as ``p(x0 | xt)``. Without
+        this every sample would be tilted toward whichever classes the loss
+        up-weighted. Subtracting ``log(w)`` divides the weights back out.
+        """
+        return logits - torch.log(weight.clamp(min=1e-12)).to(logits.dtype)
+
+    def _node_ce(self, X_pred, X0):
+        return F.cross_entropy(
+            X_pred.reshape(-1, self.num_node_classes),
+            X0.argmax(dim=-1).reshape(-1),
+            weight=self.x_ce_weight.to(X_pred.dtype),
+        )
+
+    def _edge_ce(self, E_pred, E0):
+        # Self-loops are not modelled, so they must not enter the edge loss.
+        n = E0.shape[1]
+        off_diag = ~torch.eye(n, dtype=torch.bool, device=E0.device)
+        return F.cross_entropy(
+            E_pred[:, off_diag].reshape(-1, self.num_edge_classes),
+            E0[:, off_diag].argmax(dim=-1).reshape(-1),
+            weight=self.e_ce_weight.to(E_pred.dtype),
+        )
 
     @staticmethod
     def _centre_positions(R0, node_categories, xy_only=False, z_shift=0.0):
@@ -218,17 +285,8 @@ class CityJSONDiffusionModule(L.LightningModule):
         coord_loss = (sq_err * real).sum() / (real.sum() * 3).clamp(min=1.0)
         off_anchor = (sq_err * (1 - real)).sum() / ((1 - real).sum() * 3).clamp(min=1.0)
 
-        node_loss = F.cross_entropy(
-            X_pred.reshape(-1, self.num_node_classes), X0.argmax(dim=-1).reshape(-1)
-        )
-
-        # Self-loops are not modelled, so they must not enter the edge loss.
-        n = E0.shape[1]
-        off_diag = ~torch.eye(n, dtype=torch.bool, device=E0.device)
-        edge_loss = F.cross_entropy(
-            E_pred[:, off_diag].reshape(-1, self.num_edge_classes),
-            E0[:, off_diag].argmax(dim=-1).reshape(-1),
-        )
+        node_loss = self._node_ce(X_pred, X0)
+        edge_loss = self._edge_ce(E_pred, E0)
 
         # `coord_loss` is returned (and logged) as the real-node MSE alone, so the
         # dashboard series is directly comparable to `val_coord_mse` from
@@ -379,9 +437,15 @@ class CityJSONDiffusionModule(L.LightningModule):
             s_arr = torch.full((batch_size, 1), s_int, dtype=torch.long, device=self.device)
 
             R_pred, E_pred, X_pred = self(X_t, pos, E_t, t_int, node_mask=node_mask)
+            # The chain treats softmax(pred) as p(x0 | xt). A class-weighted
+            # loss is minimised by w_c * p(c), so the weights are divided back
+            # out here -- otherwise balancing would tilt every sample toward the
+            # rare classes it was meant only to learn better.
             pos, X_t, E_t = self.noise.sample_zs_from_zt_and_pred(
                 pos_t=pos, X_t=X_t, E_t=E_t,
-                pred_pos=R_pred, pred_X=X_pred, pred_E=E_pred,
+                pred_pos=R_pred,
+                pred_X=self._debias(X_pred, self.x_ce_weight),
+                pred_E=self._debias(E_pred, self.e_ce_weight),
                 t_int=t_int, s_int=s_arr, node_mask=node_mask,
             )
 
