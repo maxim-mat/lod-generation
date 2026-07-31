@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
+from collections import Counter
 from math import sqrt
 from statistics import median
+
+import numpy as np
 
 # Calibrated so a converted LOD1 stands in the same relation to its LOD2 as
 # real 3DBAG lod1.2 does to lod2.2 -- a volume ratio of 1.0725, measured over
@@ -14,6 +17,44 @@ DEFAULT_ROOF_PERCENTILE = 0.64
 # azimuth and slope describe LOD2 geometry that no longer exists here.
 LOD1_GROUND, LOD1_ROOF, LOD1_WALL = 0, 1, 2
 LOD1_SURFACES = ({"type": "GroundSurface"}, {"type": "RoofSurface"}, {"type": "WallSurface"})
+
+
+def newell_vector(points):
+    """Twice the area vector of a ring: ``2 * A * n``, translation-invariant."""
+    p = np.asarray(points, dtype=float)
+    return np.cross(p, np.roll(p, -1, axis=0)).sum(axis=0)
+
+
+def face_normal(points):
+    """Unit normal of a ring, or None when it encloses no area.
+
+    None means the ring is degenerate -- collinear or collapsed -- which is a
+    defect in its own right, not a case to paper over with a default normal.
+    """
+    n = newell_vector(points)
+    mag = float(np.linalg.norm(n))
+    return None if mag < 1e-12 else n / mag
+
+
+def shell_edge_defects(faces):
+    """``(unpaired, reused)`` directed edges of a shell.
+
+    ``unpaired`` -- no oppositely-wound twin, so the surface is open there.
+    ``reused``   -- traversed twice in the same direction, so two faces disagree
+    about which side faces out.
+
+    ``faces`` is a list of faces, each a list of rings of vertex indices. Kept
+    separate from the copy in ``analysis.cityobject_analysis``, which stays
+    independent of the pipeline on purpose so it can detect regressions in it.
+    """
+    used = Counter()
+    for face in faces:
+        for ring in face:
+            for i in range(len(ring)):
+                used[(ring[i], ring[(i + 1) % len(ring)])] += 1
+    unpaired = [e for e in used if (e[1], e[0]) not in used]
+    reused = [e for e, n in used.items() if n > 1]
+    return unpaired, reused
 
 
 def signed_area_2d(ring, _vertices):
