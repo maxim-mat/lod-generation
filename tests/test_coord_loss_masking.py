@@ -95,3 +95,40 @@ def test_off_anchor_is_applied_and_weighted():
                          + m0.lambda_e * edge0)).item()
     assert abs(anchor0) < 1e-6, anchor0
     assert abs(coord0.item() - coord_loss.item()) < 1e-5
+
+
+def test_val_coord_mse_measures_the_same_nodes_as_the_training_loss():
+    """`val_coord_mse` selects checkpoints, so it must not measure a different
+    tensor from the loss being optimised.
+
+    node_mask marks vertex nodes only; the coordinate loss is taken over real
+    nodes (vertex + face). Face nodes are ring centroids sitting closer to the
+    centre, so the two sets give systematically different numbers.
+    """
+    import pytest
+    import torch
+
+    from src.models.diffusion import CityJSONDiffusionModule
+
+    B, N = 1, 5
+    R0 = torch.zeros(B, N, 3)
+    R_pred = torch.zeros(B, N, 3)
+    # node 0 vertex, node 1 face, nodes 2-4 Off
+    cats = torch.zeros(B, N, 5)
+    cats[0, 0, 0] = 1.0          # vertex
+    cats[0, 1, 3] = 1.0          # a face class
+    cats[0, 2:, 4] = 1.0         # Off
+    R_pred[0, 0] = torch.tensor([3.0, 0.0, 0.0])   # vertex error,  sq 9
+    R_pred[0, 1] = torch.tensor([0.0, 6.0, 0.0])   # face error,     sq 36
+
+    real_mask = 1.0 - cats[..., -1]
+    vertex_mask = (cats.argmax(-1) == 0).float()
+
+    over_real = CityJSONDiffusionModule._active_coord_mse(
+        None, R_pred, R0, real_mask)
+    over_vertices = CityJSONDiffusionModule._active_coord_mse(
+        None, R_pred, R0, vertex_mask)
+
+    assert float(over_real) == pytest.approx((9.0 + 36.0) / (2 * 3))
+    assert float(over_vertices) == pytest.approx(9.0 / (1 * 3))
+    assert float(over_real) != pytest.approx(float(over_vertices))

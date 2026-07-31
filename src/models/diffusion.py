@@ -236,9 +236,16 @@ class CityJSONDiffusionModule(L.LightningModule):
                  + self.lambda_x * node_loss + self.lambda_e * edge_loss)
         return total, coord_loss, node_loss, edge_loss, X_pred, R_pred, R0
 
-    def _active_coord_mse(self, R_pred, R0, node_mask):
-        """Coordinate MSE over real nodes only, for a comparable monitored metric."""
-        mask = node_mask.unsqueeze(-1)
+    def _active_coord_mse(self, R_pred, R0, real_mask):
+        """Coordinate MSE over real nodes, for a comparable monitored metric.
+
+        ``real_mask`` must be 1 - P(Off), the same set `_shared_step` optimises.
+        Passing `node_mask` marks vertex nodes only and silently measures a
+        different tensor from `train_coord_mse`: face nodes are ring centroids
+        and sit at 0.69x the mean squared radius of vertices, so the two series
+        drift apart by a systematic factor.
+        """
+        mask = real_mask.unsqueeze(-1)
         sq_err = ((R_pred - R0) ** 2 * mask).sum()
         return sq_err / (mask.sum() * 3.0 + 1e-6)
 
@@ -292,8 +299,8 @@ class CityJSONDiffusionModule(L.LightningModule):
 
         total, coord_loss, node_loss, edge_loss, X_pred, R_pred, R0 = self._shared_step(batch, t_int=t_int)
 
-        node_mask = batch["node_mask"]
-        coord_mse = self._active_coord_mse(R_pred, R0, node_mask)
+        real_mask = 1.0 - batch["node_categories"][..., -1]
+        coord_mse = self._active_coord_mse(R_pred, R0, real_mask)
         # Plain accuracy is inflated by the Off-padding majority; report
         # precision/recall of the minority vertex class (class 0) instead.
         # Metric names kept for dashboard continuity: "real" == vertex.
