@@ -8,10 +8,17 @@ largest graph in the split, and a handful of 4,000-node outliers set ``n_max``
 for everything. Down-weighting them shrinks ``n_max`` far faster than it shrinks
 the object count.
 
-The subset is therefore *not* distribution-faithful, by design. Use it for
-pipeline shakedowns, hyper-parameter sweeps and overfitting checks -- never for
-a number you intend to report, and never to fit ``coord_scale`` or the class
-marginals for a full run, since both would inherit the size bias.
+The subset is therefore *not* distribution-faithful, by design. That needs no
+special handling during training: ``train`` recomputes every train-split
+statistic -- class marginals, ``coord_scale``, ``dist_r_max`` -- from whichever
+datamodule it builds, so a run on this set is internally consistent.
+
+What does not carry over is comparison *between* runs. At 2% the scale is
+3.56 m against the full corpus's 8.00 m, and Off is 0.832 of node slots against
+0.737, so scaled-unit metrics like ``val_coord_mse`` and the class-balance
+weights sit on a different footing. Use it for pipeline shakedowns, sweeps and
+overfitting checks; do not read its numbers as an estimate of full-corpus
+performance.
 
 Objects are chosen once, on a reference folder (LOD2 by default), and the same
 ids are then carried into every other LOD folder present. That keeps
@@ -172,8 +179,10 @@ def sample_dataset(root, out_dir, fraction, seed, alpha=1.0,
         "args": {"fraction": fraction, "seed": seed, "alpha": alpha,
                  "reference": reference, "folders": list(present)},
         "stats": stats,
-        "warning": "Size-biased subset: not distribution-faithful. Do not fit "
-                   "coord_scale or class marginals for a full run from it.",
+        "warning": "Size-biased subset: not distribution-faithful. Train-split "
+                   "statistics are recomputed per datamodule, so a run on this "
+                   "set is self-consistent; its scaled-unit metrics are simply "
+                   "not comparable with a full-corpus run's.",
     }
     (out_dir / "sample_manifest.json").parent.mkdir(parents=True, exist_ok=True)
     (out_dir / "sample_manifest.json").write_text(json.dumps(manifest, indent=2),
