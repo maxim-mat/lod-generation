@@ -45,11 +45,13 @@ import logging
 import shutil
 import sys
 from collections import Counter
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 
 from src.filter_cityjson import SYNTH_DIR, _git_commit, _write, compact_vertices, world_vertices
-from src.geometry.geometry import face_normal, shell_edge_defects
+from src.geometry.geometry import (DEFAULT_ROOF_PERCENTILE, convert_to_lod1, face_normal,
+                                   shell_edge_defects)
 
 logger = logging.getLogger(__name__)
 
@@ -329,6 +331,54 @@ def _transform_folder(src_root, out_root, drop_map=None, record_drops=False):
     return stats, drops
 
 
+def regenerate_synth(lod2_dir, out_dir, roof_percentile=DEFAULT_ROOF_PERCENTILE):
+    """Derive ``LOD1_synth`` from an already-cleaned ``LOD2`` folder.
+
+    Ordering matters. ``convert_to_lod1`` returns an object untouched when it
+    finds no ``RoofSurface``, so running it before the repair left 103 objects
+    in ``LOD1_synth`` still tagged lod 2 and byte-identical to their LOD2
+    original -- a "pair" that was the identity function. Converting from the
+    cleaned LOD2, where those roofs are labelled, converts them properly.
+
+    The conversion is cleaned in the same pass, because ``convert_to_lod1``
+    emits a degenerate ``[a, b, b, a]`` wall wherever a footprint edge
+    collapses; without this the synthetic folder reintroduces defects the LOD2
+    folder no longer has.
+    """
+    stats = Counter()
+    for src in sorted(p for p in lod2_dir.rglob("*") if p.is_file()):
+        rel = src.relative_to(lod2_dir)
+        try:
+            with open(src, "r", encoding="utf-8") as fh:
+                cj = json.load(fh)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            cj = None
+        if cj is None or cj.get("type") != "CityJSON":
+            (out_dir / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, out_dir / rel)
+            continue
+
+        try:
+            synth = convert_to_lod1(deepcopy(cj), roof_percentile)
+            cleaned, file_stats, dropped = transform_cityjson(synth)
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            logger.error("synth conversion failed on %s: %s", rel, exc)
+            stats["errors"] += 1
+            continue
+        stats.update(file_stats)
+        if dropped:
+            # Would desynchronise the pair, so it is surfaced rather than logged
+            # at debug and forgotten.
+            logger.warning("%s: %d synthetic objects dropped, pairing broken: %s",
+                           rel, len(dropped), sorted(dropped)[:5])
+        if cleaned is None:
+            stats["files_emptied"] += 1
+            continue
+        _write(out_dir / rel, cleaned)
+        stats["files"] += 1
+    return stats
+
+
 def process_dataset(root, out_dir, folders=DEFAULT_FOLDERS):
     """Clean each LOD folder under ``root`` into ``out_dir``.
 
@@ -359,15 +409,24 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("root", help="Dataset root holding LOD1/, LOD2/ and LOD1_synth/.")
     ap.add_argument("--out", required=True, help="Where to write the cleaned copy.")
-    ap.add_argument("--folders", nargs="+", default=list(DEFAULT_FOLDERS),
-                    help=f"LOD folders to clean (default: {' '.join(DEFAULT_FOLDERS)}).")
+    ap.add_argument("--folders", nargs="*", default=list(DEFAULT_FOLDERS),
+                    help=f"LOD folders to clean (default: {' '.join(DEFAULT_FOLDERS)}). "
+                         "Pass with no values to only regenerate the synthetic pair.")
+    ap.add_argument("--regenerate-synth", action="store_true",
+                    help=f"Derive {SYNTH_DIR}/ from the cleaned LOD2 instead of cleaning the "
+                         "input's copy, and overwrite whatever is there. Required for the "
+                         "roofless objects convert_to_lod1 would otherwise pass through.")
+    ap.add_argument("--roof-percentile", type=float, default=DEFAULT_ROOF_PERCENTILE,
+                    help=f"Cap quantile for the derived LOD1 (default: {DEFAULT_ROOF_PERCENTILE}).")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     root, out_dir = Path(args.root).resolve(), Path(args.out).resolve()
     if not root.is_dir():
         sys.exit(f"Dataset root not found: {root}")
-    for name in args.folders:
+
+    folders = [f for f in args.folders if not (args.regenerate_synth and f == SYNTH_DIR)]
+    for name in folders:
         d = out_dir / name
         if d.exists() and any(d.iterdir()):
             sys.exit(f"Output folder already exists and is not empty: {d}")
@@ -376,20 +435,39 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        totals = process_dataset(root, out_dir, tuple(args.folders))
+        totals = process_dataset(root, out_dir, tuple(folders)) if folders else {}
     except FileNotFoundError as exc:
         sys.exit(str(exc))
 
+    if args.regenerate_synth:
+        lod2 = out_dir / "LOD2"
+        if not lod2.is_dir():
+            sys.exit(f"Cannot derive {SYNTH_DIR}/ without a cleaned LOD2 at {lod2}")
+        logger.info("deriving %s/ from the cleaned LOD2 (overwriting)", SYNTH_DIR)
+        stats = regenerate_synth(lod2, out_dir / SYNTH_DIR, args.roof_percentile)
+        totals[SYNTH_DIR] = dict(stats)
+        logger.info("%s: %d files, %d objects, %d dropped",
+                    SYNTH_DIR, stats["files"], stats["kept_objects"],
+                    stats["dropped_objects"])
+
+    # An incremental run (e.g. --folders with no values) must not erase the
+    # provenance of the folders it left alone.
+    path = out_dir / "transform_manifest.json"
+    previous = {}
+    if path.exists():
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8")).get("totals", {})
+        except (OSError, json.JSONDecodeError):
+            logger.warning("could not read the existing manifest; it will be replaced")
     manifest = {
         "created": datetime.now(timezone.utc).isoformat(),
         "git_commit": _git_commit(),
         "source": str(root),
         "args": vars(args),
-        "totals": totals,
+        "totals": {**previous, **totals},
     }
-    (out_dir / "transform_manifest.json").write_text(json.dumps(manifest, indent=2),
-                                                     encoding="utf-8")
-    logger.info("manifest written to %s", out_dir / "transform_manifest.json")
+    path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    logger.info("manifest written to %s", path)
 
 
 if __name__ == "__main__":

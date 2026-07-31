@@ -231,6 +231,25 @@ def test_transform_cityjson_honours_an_external_drop_set():
     assert set(out["CityObjects"]) == {"a"}
 
 
+def test_regenerate_synth_pairs_with_the_cleaned_lod2(tmp_path):
+    """Derived LOD1 must carry the LOD2 ids and be tagged lod 1, not lod 2."""
+    import json
+
+    from src.transform_cityjson import regenerate_synth
+
+    lod2, synth = tmp_path / "LOD2", tmp_path / "LOD1_synth"
+    (lod2 / "Source A").mkdir(parents=True)
+    cj = make_cj({"a": make_object(), "b": make_object()})
+    (lod2 / "Source A" / "t.json").write_text(json.dumps(cj), encoding="utf-8")
+
+    stats = regenerate_synth(lod2, synth)
+    out = json.loads((synth / "Source A" / "t.json").read_text(encoding="utf-8"))
+    assert set(out["CityObjects"]) == {"a", "b"}
+    assert stats["dropped_objects"] == 0
+    for obj in out["CityObjects"].values():
+        assert str(obj["geometry"][0]["lod"]).startswith("1")
+
+
 def test_transform_cityjson_returns_none_when_nothing_survives():
     cj = make_cj({"bad": make_object(sem=["GroundSurface"] * 6)})
     out, _, dropped = transform_cityjson(cj)
