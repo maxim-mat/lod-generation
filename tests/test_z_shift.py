@@ -87,8 +87,12 @@ def test_generate_cityjson_restores_z_shift(monkeypatch):
     monkeypatch.setattr(pp, "graph_to_cityjson", fake)
     model.generate_cityjson(batch_size=1)
 
+    # Export centres the footprint horizontally in every mode, so xy collapses
+    # to the origin here (all four vertices share one xy).
     assert torch.allclose(torch.as_tensor(seen["coords"][:, :2]),
-                          torch.full((4, 2), 2.0, dtype=torch.float64), atol=1e-6)
+                          torch.zeros((4, 2), dtype=torch.float64), atol=1e-6)
+    # z is the point of this test: se2 carries real elevation, so z_shift is
+    # restored and must survive un-levelled.
     assert torch.allclose(torch.as_tensor(seen["coords"][:, 2]),
                           torch.full((4,), 9.0, dtype=torch.float64), atol=1e-6)   # 1 * 2 + 7
 

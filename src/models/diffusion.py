@@ -17,6 +17,7 @@ Adaptations for this dataset:
 import logging
 
 import lightning as L
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -400,6 +401,34 @@ class CityJSONDiffusionModule(L.LightningModule):
         coords[:, 2] += self.z_shift
         return coords
 
+    @staticmethod
+    def _ground_centre(coords, node_labels, edge_labels):
+        """Centre of the sample's ground, or None when it has no vertices.
+
+        Mirrors `dataset.get_base_center`: the vertices of GroundSurface faces,
+        found here through the generated EDGE_VF membership edges, falling back
+        to the vertices within 10 cm of the lowest one when no ground face was
+        generated at all.
+        """
+        from src.dataset.dataset import EDGE_VF, GROUND, VERTEX
+
+        coords = np.asarray(coords, dtype=float)
+        node_labels = np.asarray(node_labels)
+        vertices = np.flatnonzero(node_labels == VERTEX)
+        if vertices.size == 0:
+            return None
+
+        edge_labels = np.asarray(edge_labels)
+        ground_faces = np.flatnonzero(node_labels == GROUND)
+        on_ground = [v for v in vertices
+                     if (edge_labels[ground_faces, v] == EDGE_VF).any()] \
+            if ground_faces.size else []
+
+        if not on_ground:
+            z = coords[vertices, 2]
+            on_ground = vertices[np.abs(z - z.min()) < 0.1]
+        return coords[np.asarray(sorted(on_ground))].mean(axis=0)
+
     @torch.no_grad()
     def generate_cityjson(self, batch_size=1):
         """
@@ -420,6 +449,21 @@ class CityJSONDiffusionModule(L.LightningModule):
             # The chain runs in scaled units; CityJSON is metres. se2 keeps
             # absolute heights: restore the z offset the targets subtracted.
             coords = self._denormalize_coords(pos[i])
+
+            # Put the building back on the ground. The network is trained on
+            # zero-CoM coordinates, so a sample's footprint lands at an
+            # arbitrary negative z and every geometric check downstream -- ground
+            # level, validity, the LOD1/LOD2 comparison -- would see it floating.
+            # Restores `dataset.get_base_center`'s convention. se2 is exempt: its
+            # z_shift deliberately carries real elevation, which levelling
+            # would discard.
+            centre = self._ground_centre(coords, node_labels[i].cpu().numpy(),
+                                         edge_labels[i].cpu().numpy())
+            if centre is not None:
+                coords[:, :2] -= centre[:2]
+                if self.equivariance != "se2":
+                    coords[:, 2] -= centre[2]
+
             cj = graph_to_cityjson(
                 coords,
                 node_labels[i].cpu().numpy(),
