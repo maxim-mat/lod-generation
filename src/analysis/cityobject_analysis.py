@@ -177,16 +177,31 @@ def connected_components(rings):
     return components
 
 
-def is_watertight(faces):
-    """Every directed edge used once and its reverse present -- a closed shell."""
+def shell_edge_defects(faces):
+    """``(unpaired, reused)`` directed edges of a shell.
+
+    ``unpaired`` -- no oppositely-wound twin, so the surface is open there.
+    ``reused``   -- traversed twice in the *same* direction, so two faces
+    disagree about which side faces out; the shell is closed but not orientable.
+
+    A wireframe view shows neither: both defects leave every *undirected* edge
+    drawn exactly as it would be on a clean solid, which is why visually
+    perfect buildings still fail closure.
+    """
     used = Counter()
     for face in faces:
         for ring in face:
             for i in range(len(ring)):
                 used[(ring[i], ring[(i + 1) % len(ring)])] += 1
-    if any(n != 1 for n in used.values()):
-        return False
-    return all((b, a) in used for a, b in used)
+    unpaired = [e for e in used if (e[1], e[0]) not in used]
+    reused = [e for e, n in used.items() if n > 1]
+    return unpaired, reused
+
+
+def is_watertight(faces):
+    """Closed *and* consistently oriented: no holes, no repeated direction."""
+    unpaired, reused = shell_edge_defects(faces)
+    return not unpaired and not reused
 
 
 def signed_volume(faces, verts):
@@ -318,8 +333,13 @@ def object_defects(obj, verts):
     solid = next((g for g in (obj.get("geometry") or []) if g.get("type") == "Solid"), None)
     if solid:
         sfaces = solid_faces(solid)
-        if not is_watertight(sfaces):
-            found.add("not_watertight")
+        # Split, because the two failures need different repairs: a hole needs a
+        # face added, a same-direction edge needs a face rewound.
+        unpaired, reused = shell_edge_defects(sfaces)
+        if unpaired:
+            found.add("open_shell")
+        if reused:
+            found.add("non_manifold_edge")
         if signed_volume(sfaces, verts) <= 0:
             found.add("non_positive_volume")
     return sorted(found)

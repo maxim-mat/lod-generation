@@ -25,6 +25,10 @@ SEMANTIC_COLORS = {
 }
 DEFAULT_COLOR = "#d62728"
 
+# Closure defects are invisible in a wireframe -- every undirected edge is still
+# drawn -- so they get their own loud overlay.
+DEFECT_COLORS = {"open boundary": "#ff2d55", "inconsistent winding": "#b14aed"}
+
 
 def load_cityjson(path):
     """``(cityjson_dict, world_vertices)`` for a file on disk."""
@@ -67,11 +71,13 @@ def _normal(points):
 
 
 def cityjson_figure(city_objects, vertices, title="", show_normals=False,
-                    shade=False):
+                    shade=False, highlight_edges=None):
     """Wireframe (optionally shaded) view of CityObjects, coloured by semantics.
 
     ``city_objects`` is an iterable of CityObject dicts; ``vertices`` must
     already be in world coordinates (see :func:`load_cityjson`).
+    ``highlight_edges`` maps a label to ``(a, b)`` vertex-index pairs drawn as a
+    thick overlay -- used to show where a solid fails to close.
     """
     # Batched by semantic type, with NaN breaks between rings: one trace per
     # face would mean 5000+ traces on the larger outliers and a browser that
@@ -128,6 +134,16 @@ def cityjson_figure(city_objects, vertices, title="", show_normals=False,
             line=dict(color=SEMANTIC_COLORS.get(label, DEFAULT_COLOR), width=5),
             name=f"{label} normals", legendgroup=label, showlegend=False,
             hoverinfo="skip"))
+
+    for label, pairs in (highlight_edges or {}).items():
+        if not pairs:
+            continue
+        gap = np.full((1, 3), np.nan)
+        seg = np.vstack([np.vstack([vertices[a], vertices[b], gap]) for a, b in pairs])
+        fig.add_trace(go.Scatter3d(
+            x=seg[:, 0], y=seg[:, 1], z=seg[:, 2], mode="lines",
+            line=dict(color=DEFECT_COLORS.get(label, DEFAULT_COLOR), width=9),
+            name=f"{label} ({len(pairs)})", hovertext=label, hoverinfo="text"))
 
     fig.update_layout(title=title, scene=dict(aspectmode="data"),
                       margin=dict(l=0, r=0, b=0, t=40), height=680,

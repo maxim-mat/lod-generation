@@ -9,7 +9,8 @@ import pytest
 from src.analysis.cityobject_analysis import (
     connected_components, count_coincident, face_area, face_normal,
     iter_faces, is_watertight, newell_vector, object_defects, object_metrics,
-    planarity_ratio, signed_volume, vertex_degrees, wireframe_edges,
+    planarity_ratio, shell_edge_defects, signed_volume, vertex_degrees,
+    wireframe_edges,
 )
 
 
@@ -152,6 +153,26 @@ def test_cube_missing_a_face_is_not_watertight():
     assert not is_watertight(faces[:-1])
 
 
+def test_closed_cube_has_no_edge_defects():
+    _, faces = unit_cube()
+    assert shell_edge_defects(faces) == ([], [])
+
+
+def test_a_hole_shows_up_as_unpaired_edges_only():
+    _, faces = unit_cube()
+    unpaired, reused = shell_edge_defects(faces[:-1])
+    assert len(unpaired) == 4 and reused == []
+
+
+def test_a_rewound_face_shows_up_as_reused_edges():
+    """Closed surface, inconsistent winding -- invisible in a wireframe."""
+    _, faces = unit_cube()
+    faces[1] = [faces[1][0][::-1]]
+    _, reused = shell_edge_defects(faces)
+    assert reused
+    assert not is_watertight(faces)
+
+
 def test_inward_orientation_gives_negative_volume():
     verts, faces = unit_cube()
     flipped = [[r[::-1] for r in f] for f in faces]
@@ -243,6 +264,15 @@ def test_repeated_vertex_in_a_ring_is_flagged():
     obj = cube_object()
     obj["geometry"][0]["boundaries"][0][1] = [[4, 5, 5, 7]]
     assert "repeated_ring_vertex" in object_defects(obj, verts)
+
+
+def test_open_shell_is_reported_separately_from_winding():
+    verts, _ = unit_cube()
+    obj = cube_object()
+    del obj["geometry"][0]["boundaries"][0][1]          # drop the roof
+    defects = object_defects(obj, verts)
+    assert "open_shell" in defects
+    assert "non_manifold_edge" not in defects
 
 
 def test_disconnected_wireframe_is_flagged():
