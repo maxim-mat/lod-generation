@@ -55,7 +55,12 @@ def test_compute_coord_scale_is_pooled_std_of_centred_active_coords():
         x[:n] = coords
         mask = torch.zeros(N)
         mask[:n] = 1.0
-        items.append({"x": x, "node_mask": mask})
+        # Real nodes are 1 - P(last class); with no face nodes here this
+        # coincides with node_mask, so the expected value is unchanged.
+        cats = torch.zeros(N, 2)
+        cats[:n, 0] = 1.0
+        cats[n:, 1] = 1.0
+        items.append({"x": x, "node_mask": mask, "node_categories": cats})
 
     dm = CityJSONDataModule(dataset_dir="unused", lods=1)
     dm.train_dataset = items
@@ -73,12 +78,43 @@ def test_compute_coord_scale_ignores_virtual_padding():
     x[:2] = coords
     mask = torch.zeros(N)
     mask[:2] = 1.0
+    cats = torch.zeros(N, 2)
+    cats[:2, 0] = 1.0
+    cats[2:, 1] = 1.0
 
     dm = CityJSONDataModule(dataset_dir="unused", lods=1)
-    dm.train_dataset = [{"x": x, "node_mask": mask}]
+    dm.train_dataset = [{"x": x, "node_mask": mask, "node_categories": cats}]
 
     expected = float((coords - coords.mean(0, keepdim=True)).flatten().std(unbiased=False))
     assert abs(dm.compute_coord_scale() - expected) < 1e-5
+
+
+def test_compute_coord_scale_counts_face_nodes_not_just_vertices():
+    """`_prepare` divides vertex *and* face coordinates, so both set the scale.
+
+    node_mask marks vertex nodes only; measuring through it described a
+    different tensor from the one the model scales.
+    """
+    verts = torch.tensor([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]])
+    face = torch.tensor([[0.0, 9.0, 0.0]])
+    x = torch.zeros(N, 3)
+    x[:2] = verts
+    x[2] = face
+    mask = torch.zeros(N)
+    mask[:2] = 1.0                       # vertex nodes only
+    cats = torch.zeros(N, 2)
+    cats[:3, 0] = 1.0                    # vertices + the face node are real
+    cats[3:, 1] = 1.0
+
+    dm = CityJSONDataModule(dataset_dir="unused", lods=1)
+    dm.train_dataset = [{"x": x, "node_mask": mask, "node_categories": cats}]
+
+    real = torch.cat([verts, face])
+    expected = float((real - real.mean(0, keepdim=True)).flatten().std(unbiased=False))
+    vertex_only = float((verts - verts.mean(0, keepdim=True)).flatten().std(unbiased=False))
+
+    assert abs(dm.compute_coord_scale() - expected) < 1e-5
+    assert abs(expected - vertex_only) > 1e-3      # the two genuinely differ
 
 
 def test_prepare_divides_targets_by_coord_scale():

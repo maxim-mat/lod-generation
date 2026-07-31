@@ -192,7 +192,12 @@ class CityJSONDataModule(L.LightningDataModule):
             if isinstance(item, tuple):
                 item = item[0]
 
-            active = item["x"][item["node_mask"].bool()]
+            # Real nodes = vertices *and* face nodes, matching
+            # `_centre_positions`, which centres over 1 - P(Off). node_mask
+            # marks vertex nodes only; using it measured a different tensor
+            # from the one the model divides (7% high on The Hague LOD2).
+            real = item["node_categories"][..., -1] == 0
+            active = item["x"][real]
             if active.numel() == 0:
                 continue
 

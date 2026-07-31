@@ -17,7 +17,20 @@ logger = logging.getLogger(__name__)
 VERTEX, GROUND, ROOF, WALL, OFF = 0, 1, 2, 3, 4
 NUM_NODE_CLASSES = 5
 NODE_CLASS_NAMES = ("Vertex", "GroundSurface", "RoofSurface", "WallSurface", "Off")
-SURFACE_TO_CLASS = {"GroundSurface": GROUND, "RoofSurface": ROOF, "WallSurface": WALL}
+# Every CityGML boundary class the corpus uses maps explicitly. Left implicit,
+# OuterFloorSurface and OuterCeilingSurface fell through to the normal-based
+# fallback, which sent ~5.5k overhang undersides to GROUND -- ground nodes
+# floating at height, breaking the "ground is the base at z~0" invariant that
+# normalize_coords and the ground-level statistics both rely on. Balcony tops
+# join ROOF (where the normal already put them); undersides become WALL, i.e.
+# envelope that is not the footprint.
+SURFACE_TO_CLASS = {
+    "GroundSurface": GROUND,
+    "RoofSurface": ROOF,
+    "WallSurface": WALL,
+    "OuterFloorSurface": ROOF,
+    "OuterCeilingSurface": WALL,
+}
 # Edges: ring adjacency between vertices, membership between a face and its vertices.
 EDGE_OFF, EDGE_VV, EDGE_VF = 0, 1, 2
 NUM_EDGE_CLASSES = 3
@@ -68,10 +81,13 @@ def get_base_center(geom_list, v_raw, active_vertex_indices):
                         continue
                     sem_idx = sem_shell[face_i]
                     if sem_idx in ground_surface_indices:
-                        for ring in face:
-                            for vid in ring:
-                                ground_vertex_indices.add(vid)
-                                
+                        # Outer ring only: the graph never contains hole
+                        # vertices, so averaging them centres the building on
+                        # a point the model cannot see. An off-centre
+                        # courtyard shifted the footprint by up to 4.8 m.
+                        for vid in face[0]:
+                            ground_vertex_indices.add(vid)
+
         elif geom_type in ["MultiSurface", "CompositeSurface"]:
             # boundaries structure: [face][ring][vertex]
             # values structure: [face]
@@ -80,10 +96,9 @@ def get_base_center(geom_list, v_raw, active_vertex_indices):
                     continue
                 sem_idx = values[face_i]
                 if sem_idx in ground_surface_indices:
-                    for ring in face:
-                        for vid in ring:
-                            ground_vertex_indices.add(vid)
-                            
+                    for vid in face[0]:              # outer ring only, as above
+                        ground_vertex_indices.add(vid)
+
     # 2. Geometric fallback: Vertices close to the minimum Z elevation
     if not ground_vertex_indices and active_vertex_indices:
         all_vids = list(active_vertex_indices)
@@ -138,6 +153,10 @@ def _iter_faces(geom):
     elif gtype in ("MultiSurface", "CompositeSurface"):
         faces, vals = boundaries, values
     else:
+        # Silently yielding nothing here once hid 265k lod-0 footprints; a
+        # geometry the parser cannot read must say so.
+        logger.warning("unsupported geometry type %r (lod %s): %d boundaries ignored",
+                       gtype, geom.get("lod"), len(boundaries))
         return
     for i, face in enumerate(faces):
         if not face or len(face[0]) < 3:
@@ -168,17 +187,29 @@ def parse_cityjson_file_to_graphs(filepath, normalize_coords=False):
         v_raw = v_raw * scale + translate
 
     graphs = {}
+    inner_rings = 0        # holes the Levi graph cannot represent
+    by_normal = 0          # faces with no usable semantic label
 
     for obj_id, city_obj in cj.get("CityObjects", {}).items():
         geom_list = city_obj.get("geometry", [])
         if not geom_list:
             continue
 
+        for geom in geom_list:
+            bounds = geom.get("boundaries") or []
+            if geom.get("type") == "Solid":
+                bounds = [f for shell in bounds for f in shell]
+            elif geom.get("type") not in ("MultiSurface", "CompositeSurface"):
+                bounds = []
+            inner_rings += sum(max(len(face) - 1, 0)
+                               for face in bounds if isinstance(face, list))
+
         faces = []  # (original-index ring, node class)
         for geom in geom_list:
             for ring, stype in _iter_faces(geom):
                 cls = SURFACE_TO_CLASS.get(stype)
                 if cls is None:
+                    by_normal += 1
                     cls = surface_class_from_normal(v_raw[ring])
                 faces.append((ring, cls))
         if not faces:
@@ -221,6 +252,12 @@ def parse_cityjson_file_to_graphs(filepath, normalize_coords=False):
             "type": city_obj.get("type", "Unknown"),
         }
 
+    if inner_rings or by_normal:
+        # A Levi face node carries one ring, so a courtyard's inner ring cannot
+        # be represented and its adjacency is lost. Reported, not silent.
+        logger.info("%s: %d graphs, %d inner ring(s) discarded, "
+                    "%d face(s) classified by normal (no semantic label)",
+                    Path(filepath).name, len(graphs), inner_rings, by_normal)
     return graphs
 
 # ==============================================================================
