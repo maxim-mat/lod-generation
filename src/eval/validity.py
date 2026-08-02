@@ -40,9 +40,9 @@ _SEQ_HEADER = {
 
 
 def _to_cityjsonseq(cjs):
-    """CityJSONSeq for val3dity stdin streaming: a CityJSON header line, then one
-    CityJSONFeature per line. Streaming whole CityJSON documents instead makes
-    val3dity reject every line after the first.
+    """CityJSONSeq for val3dity: a CityJSON header line, then one CityJSONFeature
+    per line. Writing whole CityJSON documents per line instead makes val3dity
+    reject every line after the first.
     """
     lines = [json.dumps(_SEQ_HEADER)]
     for cj in cjs:
@@ -64,9 +64,15 @@ def check_validity(cjs, val3dity_path=None):
         logger.warning("val3dity not found; skipping the validity arm.")
         return None
     with tempfile.TemporaryDirectory() as tmp:
+        # A .jsonl *file*, not "stdin": val3dity's stdin branch returns before it
+        # ever reaches the --report block, so a piped run exits 0, writes no
+        # report, and only prints '"<id>" [codes]' lines to stdout. File input
+        # goes through the same CityJSONSeq reader but writes the JSON report.
+        src = Path(tmp) / "input.jsonl"
+        src.write_text(_to_cityjsonseq(cjs), encoding="utf-8")
         report = Path(tmp) / "report.json"
         proc = subprocess.run(
-            [exe, "stdin", "--report", str(report)], input=_to_cityjsonseq(cjs),
+            [exe, str(src), "--report", str(report)],
             capture_output=True, text=True,
         )
         if proc.returncode != 0 or not report.exists():

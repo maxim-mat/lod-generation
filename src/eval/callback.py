@@ -1,3 +1,4 @@
+import io
 import logging
 import time
 from contextlib import contextmanager
@@ -168,7 +169,8 @@ def _save_and_log(records, metrics, loggers, save_dir, cfg):
     cols = ["sample_id", "num_vertices", "num_faces", "mesh"]
     table = wandb.Table(columns=cols)
     for i, rec in enumerate(records[:cfg.log_n_samples]):
-        obj = wandb.Object3D(_io_from_obj(cityjson_to_obj(rec["cityjson"])))
+        obj = wandb.Object3D(io.StringIO(cityjson_to_obj(rec["cityjson"])),
+                             file_type="obj")
         n_v = int((rec["node_labels"] == VERTEX).sum())
         city_objects = rec["cityjson"]["CityObjects"]
         n_f = len(next(iter(city_objects.values()))["geometry"][0]["boundaries"][0]) if city_objects else 0
@@ -178,13 +180,6 @@ def _save_and_log(records, metrics, loggers, save_dir, cfg):
     art = wandb.Artifact(f"generative_eval_{exp.id}", type="generated_buildings")
     art.add_dir(str(save_dir))
     exp.log_artifact(art)
-
-
-def _io_from_obj(obj_str):
-    import io
-    buf = io.StringIO(obj_str)
-    buf.name = "sample.obj"  # wandb.Object3D infers format from the name
-    return buf
 
 
 class GenerativeEvalCallback(L.Callback):
