@@ -18,7 +18,19 @@ def train(cfg: Config):
     """
     Main training pipeline.
     Sets up Datamodule, Model, Logger, Callbacks and runs the Lightning Trainer.
+
+    `cfg.config_set` selects which set of config objects is built: "diffusion"
+    (default) and "mini" both run the Levi-graph diffusion below -- "mini" is
+    the same objects pointed at the mini dataset -- while "mesh" hands off to
+    the LOD1-conditioned mesh transformer.
     """
+    if cfg.config_set == "mesh":
+        from src.train_mesh import train_mesh
+        return train_mesh(cfg)
+    if cfg.config_set not in ("diffusion", "mini"):
+        raise ValueError(f"Unknown config_set: {cfg.config_set!r}. "
+                         "Expected 'diffusion', 'mini' or 'mesh'.")
+
     # Seed everything for reproducibility
     L.seed_everything(cfg.seed, workers=True)
     start_time = datetime.now().strftime("%Y%m%d_%H%M%S")

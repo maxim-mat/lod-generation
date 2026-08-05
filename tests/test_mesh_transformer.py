@@ -1,11 +1,12 @@
 """Smoke checks for the LOD1-conditioned mesh transformer. CPU + random data only."""
 import torch
 
-from src.dataset.mesh_dataset import BOS, EOS, PAD, vocab_size
+from src.dataset.mesh_dataset import specials, vocab_size
 from src.models.mesh_transformer import MeshTransformer, MeshTransformerModule
 
 NUM_BINS = 32           # tiny vocabulary; the tokenizer's bin count is a config knob
 V = vocab_size(NUM_BINS)
+BOS, EOS, PAD = specials(NUM_BINS)
 B, LC, LT = 2, 18, 20   # 2 cond faces, 2 target faces + BOS + EOS
 
 
@@ -73,6 +74,26 @@ def test_padded_targets_are_excluded_from_the_loss():
     scrambled["tgt"][1, -2:] = 0     # rewrite padded slots to a real token id
     torch.manual_seed(0)
     assert torch.isclose(model._shared_step(scrambled)[0], ref)
+
+
+def test_mesh_config_set_resolves():
+    """configs/mesh-train.yaml must survive the structured-schema merge.
+
+    Guards the trap that MeshDataConfig introduces: OmegaConf resolves the
+    *whole* Config, so a new MISSING field or an unfilled diffusion field breaks
+    every config file, not just the new one.
+    """
+    from pathlib import Path
+
+    from src.utils.initialization import load_config
+
+    cfg = load_config(Path("configs/mesh-train.yaml"), [])
+    assert cfg.config_set == "mesh"
+    assert cfg.mesh_data.dataset_dir and cfg.mesh_data.num_bins == 128
+
+    # ...and the diffusion configs keep resolving with the new blocks defaulted.
+    levi = load_config(Path("configs/levi1-train.yaml"), [])
+    assert levi.config_set == "diffusion" and levi.mesh_data.dataset_dir is None
 
 
 def test_validation_step_logs_accuracy():

@@ -1,0 +1,81 @@
+# LOD1-conditioned autoregressive mesh transformer (MeshAnything, arXiv:2406.10163)
+# Usage: python main.py --train --config configs/mesh-train.yaml
+#
+# Starts on the mini dataset; point mesh_data.dataset_dir at
+# "data/The Hague/clean" for the full run.
+
+mode: train
+config_set: mesh
+seed: 42
+
+# The diffusion `data:` block is not read under config_set: mesh, but
+# DataConfig.dataset_dir is MISSING and OmegaConf resolves the whole schema, so
+# it still needs a value. Left deliberately non-real so nothing quietly uses it.
+data:
+  dataset_dir: unused-under-config_set-mesh
+
+# Mesh dataset settings (MeshDataConfig)
+mesh_data:
+  dataset_dir: data/The Hague/mini
+  lod_in: LOD1_synth
+  lod_out: LOD2
+  num_bins: 128
+  max_faces: 200
+  max_files: null
+  num_workers: 4
+  persistent_workers: false
+
+# Transformer settings (MeshModelConfig)
+mesh_model:
+  d_model: 256
+  n_head: 8
+  num_layers: 6
+  dropout: 0.1
+  max_seq_len: null      # null = size it from the dataset's longest pair
+
+training:
+  batch_size: 8          # sequences are long; attention is quadratic in length
+  train_val_test_split:
+    - 0.8
+    - 0.1
+    - 0.1
+  lr: 1e-4
+  max_epochs: 100
+  gradient_clip_val: 1.0
+  lr_scheduler: "cosine"
+  lr_decay_steps: 50
+  lr_decay_rate: 0.5
+  early_stopping:
+    enabled: true
+    monitor: val_loss
+    patience: 10
+    mode: min
+  checkpoint:
+    enabled: true
+    monitor: val_loss
+    mode: min
+    save_top_k: 3
+    filename: "{epoch:02d}-{val_loss:.4f}"
+
+trainer:
+  accelerator: auto
+  devices: 1
+  precision: "32"
+  log_every_n_steps: 50
+
+logging:
+  loggers:
+    - tensorboard
+  project_name: lod-generation
+  experiment_name: mesh-transformer
+  run_name: mesh-1
+  save_dir: outputs
+  wandb_entity: maxim-lod
+  wandb_offline: false
+  log_model: false
+
+# The generative eval is written against the Levi-graph sampler, not this model.
+generative_eval:
+  enabled: false
+
+resume_from: null

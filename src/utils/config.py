@@ -73,6 +73,44 @@ class ModelConfig:
     off_ce_weight: float = 1.0
 
 @dataclass
+class MeshDataConfig:
+    """Dataset/datamodule for the LOD1-conditioned mesh transformer.
+
+    Separate from `DataConfig`: the mesh pipeline shares none of its fields
+    (no n_max, no coord_scale, no marginals) and reads two LOD directories by
+    name rather than by LOD number.
+    """
+    # Not MISSING: every existing diffusion config would then fail to resolve
+    # just for leaving this whole block out. Checked in `train_mesh` instead.
+    dataset_dir: Optional[str] = None
+    # Directory names under dataset_dir, not LOD numbers. LOD1_synth is the
+    # default input because the real LOD1 folder only covers Source B, while
+    # every LOD2 building has a synthesized LOD1 counterpart.
+    lod_in: str = "LOD1_synth"
+    lod_out: str = "LOD2"
+    # Coordinate discretization. 128 is the MeshAnything/MeshGPT default; it
+    # bounds how exactly the tokenizer can reproduce a mesh.
+    num_bins: int = 128
+    # Buildings above this triangle count are dropped. 9 tokens per triangle
+    # and quadratic attention, so this is the real sequence-length knob.
+    max_faces: Optional[int] = 200
+    # Read only the first N files per LOD. Smoke tests and sample dumps only.
+    max_files: Optional[int] = None
+    num_workers: int = 4
+    persistent_workers: bool = False
+
+@dataclass
+class MeshModelConfig:
+    """Architecture of the autoregressive mesh transformer (arXiv:2406.10163)."""
+    d_model: int = 256        # must be divisible by n_head
+    n_head: int = 8
+    num_layers: int = 6
+    dropout: float = 0.1
+    # Positional-embedding capacity, covering len(cond) + len(tgt) - 1. None =
+    # size it from the loaded dataset's longest pair, logged at startup.
+    max_seq_len: Optional[int] = None
+
+@dataclass
 class EarlyStoppingConfig:
     """Configuration for early stopping callback."""
     enabled: bool = True
@@ -169,9 +207,19 @@ class GenerativeEvalConfig:
 class Config:
     """Root configuration class."""
     mode: str = "train"  # "train" or "inference"
+    # Which set of config objects is built and run:
+    #   "diffusion" — data + model, the Levi-graph discrete diffusion (default)
+    #   "mini"      — the same objects pointed at data/The Hague/mini; it needs
+    #                 no fields of its own, so it gets no dataclass of its own
+    #   "mesh"      — mesh_data + mesh_model, the LOD1-conditioned transformer
+    # Resolved in `src.train.train`. Deliberately a plain string switch rather
+    # than a registry; there are three of these and they are all in one repo.
+    config_set: str = "diffusion"
     seed: int = 42
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    mesh_data: MeshDataConfig = field(default_factory=MeshDataConfig)
+    mesh_model: MeshModelConfig = field(default_factory=MeshModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)

@@ -52,6 +52,13 @@ def parse_args():
         help="Path to YAML configuration file",
     )
     parser.add_argument(
+        "--config-set",
+        choices=["diffusion", "mini", "mesh"],
+        default=None,
+        help="Which set of config objects to build and run. Overrides the "
+             "config file's `config_set:`; defaults to whatever it says.",
+    )
+    parser.add_argument(
         "overrides",
         nargs="*",
         help="Config overrides in dotlist format (e.g., training.max_epochs=50)",
