@@ -34,6 +34,9 @@ def train_mesh(cfg: Config):
         lod_in=cfg.mesh_data.lod_in,
         lod_out=cfg.mesh_data.lod_out,
         num_bins=cfg.mesh_data.num_bins,
+        # OmegaConf ListConfig -> plain list, so numpy can broadcast it
+        margin_lo=list(cfg.mesh_data.margin_lo),
+        margin_hi=list(cfg.mesh_data.margin_hi),
         max_faces=cfg.mesh_data.max_faces,
         max_files=cfg.mesh_data.max_files,
         batch_size=cfg.training.batch_size,
@@ -50,7 +53,8 @@ def train_mesh(cfg: Config):
     # Sized from the data unless pinned, so a longer building cannot silently
     # index past the positional embedding mid-run.
     max_seq_len = cfg.mesh_model.max_seq_len or datamodule.max_seq_len
-    logger.info("max_seq_len = %d (dataset longest: %d)", max_seq_len, datamodule.max_seq_len)
+    logger.info("max_seq_len = %d (dataset longest segment: %d)",
+                max_seq_len, datamodule.max_seq_len)
 
     model = MeshTransformerModule(
         num_bins=cfg.mesh_data.num_bins,
@@ -67,6 +71,13 @@ def train_mesh(cfg: Config):
 
     exp_loggers = create_loggers(cfg, save_dir)
     callbacks = create_callbacks(cfg, save_dir)
+
+    # Mesh-only, so it is built here rather than inside the shared helper.
+    if cfg.mesh_eval.enabled:
+        from src.eval.mesh_eval import MeshEvalCallback
+        callbacks.append(MeshEvalCallback(cfg.mesh_eval, save_dir,
+                                          max_faces=cfg.mesh_data.max_faces or 200,
+                                          seed=cfg.seed))
 
     trainer = L.Trainer(
         max_epochs=cfg.training.max_epochs,

@@ -53,7 +53,7 @@ def specials(num_bins=NUM_BINS):
 # Normalization and quantization
 # ----------------------------------------------------------------------
 
-def normalize_to_unit_box(verts, ref=None):
+def normalize_to_unit_box(verts, ref=None, margin_lo=0.0, margin_hi=0.0):
     """Map ``verts`` into [-0.5, 0.5] and return ``(verts_n, center, scale)``.
 
     The longest axis of the bounding box spans the full unit interval; the
@@ -65,17 +65,36 @@ def normalize_to_unit_box(verts, ref=None):
             LOD1/LOD2 pair must share one frame -- rescaling each mesh by its own
             box would erase exactly the height difference the model has to learn,
             and at sampling time only the LOD1 box is known.
+        margin_lo, margin_hi: scalar or [3] headroom added below / above the
+            reference box on each axis, as a fraction of its scale. LOD2 is not
+            contained in the LOD1 box -- the ridge rises above the LOD1 height,
+            which is only the *median* roof height -- and without headroom
+            `quantize` clips it flat onto the box face. Split by side because
+            the overflow is one-directional: measured on mini, +z needs ~0.09
+            while the other five sides need nothing at p99. A symmetric margin
+            would buy the same ridge clearance for twice the range, coarsening
+            every z bin to reserve space under the ground plane that no vertex
+            ever reaches. Both depend only on the LOD1 box, so sampling
+            reproduces the frame exactly.
 
     Returns:
-        tuple: (verts_n [V, 3], center [3], scale float). Inverse is
-        ``verts_n * scale + center``.
+        tuple: (verts_n [V, 3], center [3], scale [3]). ``center`` is the box
+        centre shifted by the margin imbalance and ``scale`` already includes
+        the margins, so the inverse stays ``verts_n * scale + center``. Scale is
+        per axis, so uneven margins scale the axes differently -- by the same
+        ratio for every building, which keeps the frame consistent across the
+        corpus and exactly invertible.
     """
     box = np.asarray(verts if ref is None else ref, dtype=float)
     lo, hi = box.min(axis=0), box.max(axis=0)
-    center = (lo + hi) / 2.0
-    scale = float((hi - lo).max())
-    if not np.isfinite(scale) or scale <= 0:
-        scale = 1.0  # a degenerate (single-point) building must not divide by 0
+    base = float((hi - lo).max())
+    if not np.isfinite(base) or base <= 0:
+        base = 1.0  # a degenerate (single-point) building must not divide by 0
+
+    m_lo = np.broadcast_to(np.asarray(margin_lo, dtype=float), (3,))
+    m_hi = np.broadcast_to(np.asarray(margin_hi, dtype=float), (3,))
+    center = (lo + hi) / 2.0 + base * (m_hi - m_lo) / 2.0
+    scale = base * (1.0 + m_lo + m_hi)
     return (np.asarray(verts, dtype=float) - center) / scale, center, scale
 
 
@@ -269,6 +288,11 @@ class MeshDataset(Dataset):
             while the synthesized LOD1 exists for every LOD2 building.
         lod_out (str): sub-directory holding the target meshes.
         num_bins (int): coordinate discretization, 128 in the paper.
+        margin_lo, margin_hi (float | sequence): per-axis (x, y, z) headroom
+            below / above the LOD1 box, as a fraction of its scale. See
+            :func:`normalize_to_unit_box`; the measured requirement for all six
+            sides is logged at construction so these can be calibrated rather
+            than guessed. Only +z is non-zero by default.
         max_faces (int, optional): drop buildings whose LOD2 exceeds this;
             sequence length is 9 tokens per face and attention is quadratic.
         max_files (int, optional): stop after this many files per LOD. For
@@ -276,9 +300,12 @@ class MeshDataset(Dataset):
     """
 
     def __init__(self, dataset_dir, lod_in="LOD1_synth", lod_out="LOD2",
-                 num_bins=NUM_BINS, max_faces=None, max_files=None):
+                 num_bins=NUM_BINS, margin_lo=(0.0, 0.0, 0.0),
+                 margin_hi=(0.0, 0.0, 0.1), max_faces=None, max_files=None):
         self.dataset_dir = Path(dataset_dir)
         self.num_bins = num_bins
+        self.margin_lo = np.broadcast_to(np.asarray(margin_lo, dtype=float), (3,))
+        self.margin_hi = np.broadcast_to(np.asarray(margin_hi, dtype=float), (3,))
         self.bos, self.eos, self.pad = specials(num_bins)
 
         meshes_in = _scan_lod_dir(self.dataset_dir, lod_in, max_files)
@@ -298,11 +325,62 @@ class MeshDataset(Dataset):
             logger.warning("No buildings shared between %s and %s under %s",
                            lod_in, lod_out, self.dataset_dir)
 
-        # Longest sequence the model must position-embed: cond + BOS + tgt + EOS.
-        self.max_seq_len = max((9 * (len(a[1]) + len(b[1])) + 2
-                                for a, b in self.pairs), default=2)
-        logger.info("MeshDataset: %d buildings, max sequence length %d",
+        # Longest *segment* the model must position-embed. Positions restart in
+        # the target segment (see `MeshTransformer.forward`), so this is a max
+        # over the two halves, not their sum -- and unlike a sum it cannot be
+        # exceeded by a batch that pairs the longest condition with the longest
+        # target. The condition contributes 9 tokens per face, the target those
+        # plus BOS (the trailing EOS is never fed back in).
+        self.max_seq_len = max((max(9 * len(a[1]), 9 * len(b[1]) + 1)
+                                for a, b in self.pairs), default=1)
+        logger.info("MeshDataset: %d buildings, longest segment %d tokens",
                     len(self.ids), self.max_seq_len)
+        self._log_overflow()
+
+    def _log_overflow(self):
+        """Report the margin LOD2 actually needs on each of the six box sides.
+
+        The margins must cover this or `quantize` clips those vertices flat onto
+        a box face. Reported as percentiles, not a max: on the mini corpus five
+        of the six sides need nothing at all and the extreme tail is source
+        defects (one LOD2 sits 9 m outside a 4 m LOD1 box), so a max-based
+        target would trade everyone's coordinate resolution for a handful of
+        broken pairs. Measured at load so the config stays calibrated to
+        whatever corpus is in use -- mini is explicitly not
+        distribution-faithful and under-represents the tallest roofs.
+        """
+        if not self.pairs:
+            return
+
+        # With no margin the normalized box is exactly [-0.5, 0.5] on its
+        # longest axis, so `n.max - 0.5` and `-n.min - 0.5` are precisely what
+        # margin_hi and margin_lo have to match, side by side.
+        need_hi, need_lo = [], []
+        for (v_in, _), (v_out, _) in self.pairs:
+            n = normalize_to_unit_box(v_out, ref=v_in)[0]
+            need_hi.append(n.max(axis=0) - 0.5)
+            need_lo.append(-n.min(axis=0) - 0.5)
+        need_hi, need_lo = np.array(need_hi), np.array(need_lo)
+
+        # Half a bin of slack: `quantize` rounds to nearest, so an excess under
+        # that lands on the outermost bin regardless -- which is where it
+        # belongs. Without it this counts the ~1e-16 float noise from LOD1_synth
+        # sharing the LOD2 footprint exactly, and reports half the corpus.
+        tol = 0.5 / (self.num_bins - 1)
+        clipped = ((need_hi > self.margin_hi + tol) |
+                   (need_lo > self.margin_lo + tol)).any(axis=1).mean()
+
+        log = logger.warning if clipped > 0.02 else logger.info
+        for need, margin, sign in ((need_hi, self.margin_hi, "+"),
+                                   (need_lo, self.margin_lo, "-")):
+            for k, axis in enumerate("xyz"):
+                log("margin needed on %s%s: p50 %+.3f p95 %+.3f p99 %+.3f "
+                    "max %+.3f (configured %.3f)", sign, axis,
+                    *np.percentile(need[:, k], [50, 95, 99]), need[:, k].max(),
+                    margin[k])
+        log("margins lo=%s hi=%s clip %.1f%% of buildings",
+            np.round(self.margin_lo, 3).tolist(),
+            np.round(self.margin_hi, 3).tolist(), 100 * clipped)
 
     def __len__(self):
         return len(self.ids)
@@ -313,8 +391,10 @@ class MeshDataset(Dataset):
 
     def __getitem__(self, index):
         (v_in, f_in), (v_out, f_out) = self.pairs[index]
-        v_in_n, center, scale = normalize_to_unit_box(v_in)
-        v_out_n, _, _ = normalize_to_unit_box(v_out, ref=v_in)
+        v_in_n, center, scale = normalize_to_unit_box(
+            v_in, margin_lo=self.margin_lo, margin_hi=self.margin_hi)
+        v_out_n, _, _ = normalize_to_unit_box(
+            v_out, ref=v_in, margin_lo=self.margin_lo, margin_hi=self.margin_hi)
 
         cond = tokenize(v_in_n, f_in, self.num_bins)
         body = tokenize(v_out_n, f_out, self.num_bins)
@@ -378,7 +458,7 @@ if __name__ == "__main__":
         item = ds[k]
         v_rt, f_rt = detokenize(item["tgt"].numpy(), ds.num_bins)
         write_obj(out_dir / f"{name}_lod2_roundtrip.obj",
-                  v_rt * float(item["scale"]) + item["center"].numpy(), f_rt)
+                  v_rt * item["scale"].numpy() + item["center"].numpy(), f_rt)
         print(f"{ds.ids[k]}: lod1 {len(f1)} tris, lod2 {len(f2)} tris, "
               f"seq {len(item['cond'])}+{len(item['tgt'])}")
     print(f"wrote {out_dir}")

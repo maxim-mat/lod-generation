@@ -158,9 +158,13 @@ def create_callbacks(cfg: Config, save_dir: Path) -> list:
     except Exception:
         pass
 
-    # Generative Eval
+    # Generative Eval. Not for the mesh transformer: it samples unconditionally
+    # via model.sample(), which that module does not have, and unconditional
+    # distribution metrics are meaningless when every input has one right
+    # answer. Gated on config_set rather than trusting the yaml so a stale file
+    # cannot resurrect a callback that would crash on the first test batch.
     ge_cfg = cfg.generative_eval
-    if ge_cfg.enabled:
+    if ge_cfg.enabled and cfg.config_set != "mesh":
         from src.eval.callback import GenerativeEvalCallback
         callbacks.append(GenerativeEvalCallback(ge_cfg, save_dir, cfg.seed))
 

@@ -19,6 +19,7 @@ from src.dataset.mesh_dataset import (
     mesh_collate_fn,
     normalize_to_unit_box,
     parse_cityjson_file_to_meshes,
+    quantize,
     tokenize,
     vocab_size,
     write_obj,
@@ -126,8 +127,71 @@ def test_normalize_accepts_a_shared_reference_frame():
     other = np.array([[0.0, 0.0, 0.0], [5.0, 5.0, 5.0]])
     _, c_ref, s_ref = normalize_to_unit_box(ref)
     v_n, c, s = normalize_to_unit_box(other, ref=ref)
-    assert np.allclose(c, c_ref) and np.isclose(s, s_ref)
+    assert np.allclose(c, c_ref) and np.allclose(s, s_ref)
     assert np.allclose(v_n * s + c, other)
+
+
+def test_margin_keeps_a_taller_roof_inside_the_box():
+    """A ridge above the LOD1 height must survive quantization, not flatten.
+
+    Without headroom the ridge normalizes past 0.5, `quantize` clips it to the
+    top bin, and every roof in the corpus decodes flat.
+    """
+    # Scale is the *longest* axis of the LOD1 box (10 m of footprint here), so
+    # the ridge has to clear 8 m before it leaves the normalized box at all.
+    lod1 = np.array([[0.0, 0.0, 0.0], [10.0, 10.0, 6.0]])   # LOD1 top at 6 m
+    ridge = np.array([[0.0, 0.0, 0.0], [10.0, 10.0, 9.5]])  # ridge 3.5 m higher
+
+    clipped, _, _ = normalize_to_unit_box(ridge, ref=lod1)
+    assert clipped.max() > 0.5                              # would be clipped
+
+    v_n, center, scale = normalize_to_unit_box(ridge, ref=lod1, margin_hi=0.2)
+    assert v_n.min() >= -0.5 and v_n.max() <= 0.5
+    # The margin rides inside `scale` and `center`, so the inverse is unchanged.
+    assert np.allclose(v_n * scale + center, ridge)
+    # ...and quantize/dequantize no longer saturates at the top bin.
+    q = quantize(v_n)
+    assert q.max() < 127
+
+
+def test_margin_is_per_axis():
+    """z headroom must not cost x/y resolution -- the overflow is +z only."""
+    lod1 = np.array([[0.0, 0.0, 0.0], [10.0, 10.0, 6.0]])
+    ridge = np.array([[0.0, 0.0, 0.0], [10.0, 10.0, 9.5]])
+
+    v_n, center, scale = normalize_to_unit_box(ridge, ref=lod1,
+                                               margin_hi=[0.0, 0.0, 0.2])
+    assert scale.shape == (3,)
+    assert np.allclose(scale[:2], 10.0)          # x/y untouched by the z margin
+    assert np.isclose(scale[2], 10.0 * 1.2)
+    assert v_n.max() <= 0.5 and v_n.min() >= -0.5
+    assert np.allclose(v_n * scale + center, ridge)
+
+    # x/y still span the full range, so they keep every bin an isotropic margin
+    # would have spent on vertical headroom.
+    iso = normalize_to_unit_box(ridge, ref=lod1, margin_lo=0.2, margin_hi=0.2)[0]
+    assert quantize(v_n)[:, 0].ptp() > quantize(iso)[:, 0].ptp()
+
+
+def test_one_sided_margin_buys_the_same_ceiling_for_half_the_range():
+    """Why margin_lo defaults to 0: nothing ever goes below the LOD1 box.
+
+    A symmetric margin reserves as much room under the ground plane as above
+    the ridge, coarsening every z bin to hold space no vertex reaches.
+    """
+    lod1 = np.array([[0.0, 0.0, 0.0], [10.0, 10.0, 6.0]])
+
+    def ceiling(**margins):
+        """Highest z, in metres, that still lands inside the normalized box."""
+        _, center, scale = normalize_to_unit_box(lod1, **margins)
+        return center[2] + 0.5 * scale[2], scale[2]
+
+    top_1, scale_1 = ceiling(margin_hi=[0.0, 0.0, 0.2])
+    top_2, scale_2 = ceiling(margin_lo=[0.0, 0.0, 0.2], margin_hi=[0.0, 0.0, 0.2])
+
+    assert np.isclose(top_1, top_2)              # identical ridge clearance
+    assert scale_1 < scale_2                     # for a smaller z span
+    assert np.isclose(scale_2 / scale_1, 14 / 12)
 
 
 # ----------------------------------------------------------------------

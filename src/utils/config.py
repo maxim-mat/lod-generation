@@ -91,6 +91,21 @@ class MeshDataConfig:
     # Coordinate discretization. 128 is the MeshAnything/MeshGPT default; it
     # bounds how exactly the tokenizer can reproduce a mesh.
     num_bins: int = 128
+    # Per-axis (x, y, z) headroom below / above the LOD1 normalization box, as a
+    # fraction of its scale, so LOD2 geometry outside that box is not quantized
+    # flat onto a box face. Split by side, and settable on all six, because the
+    # overflow is one-directional. p99 over the 8016 mini (LOD1_synth, LOD2)
+    # pairs under max_faces=200: every side is 0.000 except +z, which needs
+    # 0.087 for LOD1_synth and 0.102 for real LOD1 -- ridges above the median
+    # roof height, which is all convert_to_lod1 keeps. Rounded to 0.1 to cover
+    # both inputs. x and y are 0 because LOD1_synth is extruded from the LOD2
+    # footprint, so they coincide by construction; -z is 0 because the two share
+    # a ground plane. The tail past p99 (+z p99.9 = 0.58, max 2.11) is source
+    # defects: covering it would cost every building most of its z resolution.
+    # MeshDataset logs the measured requirement for all six sides at load;
+    # re-read it on `clean`, which mini under-represents at the large end.
+    margin_lo: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    margin_hi: List[float] = field(default_factory=lambda: [0.0, 0.0, 0.1])
     # Buildings above this triangle count are dropped. 9 tokens per triangle
     # and quadratic attention, so this is the real sequence-length knob.
     max_faces: Optional[int] = 200
@@ -100,14 +115,35 @@ class MeshDataConfig:
     persistent_workers: bool = False
 
 @dataclass
+class MeshEvalConfig:
+    """Free-running generation scored against the paired ground-truth LOD2.
+
+    Replaces `GenerativeEvalConfig` on the mesh path: that one measures an
+    unconditional model against a distribution, which is meaningless here since
+    every LOD1 condition has exactly one correct answer.
+    """
+    enabled: bool = True
+    # generate() has no KV cache, so a 200-face building is ~1800 sequential
+    # forward passes. This is the knob that decides how much a run costs.
+    every_n_epochs: int = 10
+    n_val: int = 8
+    n_test: int = 32
+    batch_size: int = 8
+    n_points: int = 4096          # surface samples per mesh for chamfer/F-score
+    taus: List[float] = field(default_factory=lambda: [0.25, 0.5])  # F-score, metres
+    voxel_m: float = 0.25         # IoU grid resolution, metres
+    save_samples: int = 8         # .obj + .city.json written per test run
+
+@dataclass
 class MeshModelConfig:
     """Architecture of the autoregressive mesh transformer (arXiv:2406.10163)."""
     d_model: int = 256        # must be divisible by n_head
     n_head: int = 8
     num_layers: int = 6
     dropout: float = 0.1
-    # Positional-embedding capacity, covering len(cond) + len(tgt) - 1. None =
-    # size it from the loaded dataset's longest pair, logged at startup.
+    # Positional-embedding capacity. Positions restart per segment, so this
+    # covers max(len(cond), len(tgt) - 1). None = size it from the loaded
+    # dataset's longest segment, logged at startup.
     max_seq_len: Optional[int] = None
 
 @dataclass
@@ -220,6 +256,7 @@ class Config:
     model: ModelConfig = field(default_factory=ModelConfig)
     mesh_data: MeshDataConfig = field(default_factory=MeshDataConfig)
     mesh_model: MeshModelConfig = field(default_factory=MeshModelConfig)
+    mesh_eval: MeshEvalConfig = field(default_factory=MeshEvalConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)

@@ -20,13 +20,18 @@ class MeshDataModule(L.LightningDataModule):
         dataset_dir (str | Path): e.g. ``data/The Hague/mini``.
         lod_in, lod_out (str): sub-directory names of the two LODs.
         num_bins (int): coordinate discretization; must match the model's.
+        margin_lo, margin_hi (float | sequence): per-axis (x, y, z) headroom
+            below / above the LOD1 normalization box, so LOD2 geometry that
+            leaves that box is not clipped. Overflow is one-directional --
+            only +z is non-zero by default -- hence the split by side.
         max_faces (int, optional): drop buildings above this triangle count.
         max_files (int, optional): read only the first N files per LOD.
         seed (int): seeds the train/val/test split, for reproducibility.
     """
 
     def __init__(self, dataset_dir, lod_in="LOD1_synth", lod_out="LOD2",
-                 num_bins=NUM_BINS, max_faces=None, max_files=None,
+                 num_bins=NUM_BINS, margin_lo=(0.0, 0.0, 0.0),
+                 margin_hi=(0.0, 0.0, 0.1), max_faces=None, max_files=None,
                  batch_size=8, train_val_test_split=(0.8, 0.1, 0.1),
                  num_workers=0, persistent_workers=False, seed=42):
         super().__init__()
@@ -34,6 +39,8 @@ class MeshDataModule(L.LightningDataModule):
         self.lod_in = lod_in
         self.lod_out = lod_out
         self.num_bins = num_bins
+        self.margin_lo = margin_lo
+        self.margin_hi = margin_hi
         self.max_faces = max_faces
         self.max_files = max_files
         self.batch_size = batch_size
@@ -54,7 +61,9 @@ class MeshDataModule(L.LightningDataModule):
 
         self.full_dataset = MeshDataset(
             dataset_dir=self.dataset_dir, lod_in=self.lod_in, lod_out=self.lod_out,
-            num_bins=self.num_bins, max_faces=self.max_faces, max_files=self.max_files,
+            num_bins=self.num_bins, margin_lo=self.margin_lo,
+            margin_hi=self.margin_hi,
+            max_faces=self.max_faces, max_files=self.max_files,
         )
         total = len(self.full_dataset)
         if total == 0:
@@ -72,7 +81,7 @@ class MeshDataModule(L.LightningDataModule):
 
     @property
     def max_seq_len(self):
-        """Longest ``cond + tgt`` in the corpus; sizes the positional embedding."""
+        """Longest single segment in the corpus; sizes the positional embedding."""
         if self.full_dataset is None:
             raise RuntimeError("max_seq_len requires setup() to have run first.")
         return self.full_dataset.max_seq_len

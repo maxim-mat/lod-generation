@@ -1,0 +1,82 @@
+# Training Configuration for CityJSON LOD Generation
+# Usage: python main.py --config configs/train.yaml
+
+mode: train
+seed: 42
+
+# Data settings
+data:
+  dataset_dir: data/The Hague/mini
+  lods:
+    - 2
+  normalize_coords: true
+  num_workers: 10
+  n_max: 50
+  upper_limit_nodes: 50
+
+# Model settings
+model:
+  num_node_classes: 5
+  num_edge_classes: 3
+  equivariance: so2
+  dist_embed: sinusoidal
+  hidden_dim: 64
+  edge_dim: 32
+  global_dim: 32
+  n_head: 8
+  num_layers: 4
+  dropout: 0.1
+  T: 500
+  discrete_noise_type: marginal
+  nu_pos: 2.5
+  nu_x: 1.0
+  nu_e: 1.5
+  lambda_pos: 3.0
+  lambda_x: 0.4
+  lambda_e: 2.0
+
+# Training settings
+training:
+  batch_size: 256
+  train_val_test_split:
+    - 0.8
+    - 0.1
+    - 0.1
+  lr: 1e-3
+  max_epochs: 250
+  gradient_clip_val: null
+  lr_scheduler: "cosine"
+  lr_decay_steps: 50
+  lr_decay_rate: 0.5
+  early_stopping:
+    enabled: true
+    monitor: val_coord_mse
+    patience: 10
+    mode: min
+  checkpoint:
+    enabled: true
+    monitor: val_coord_mse
+    mode: min
+    save_top_k: 3
+    filename: "{epoch:02d}-{val_coord_mse:.4f}"
+
+# Lightning Trainer settings
+trainer:
+  accelerator: auto
+  devices: 1
+  precision: "32"
+  log_every_n_steps: 50
+
+# Experiment logging
+logging:
+  loggers:
+    - wandb
+  project_name: lod-generation
+  experiment_name: initial-runs
+  run_name: mini-2
+  save_dir: outputs
+  wandb_entity: maxim-lod
+  wandb_offline: false
+  log_model: false
+
+resume_from: null

@@ -20,6 +20,11 @@ mesh_data:
   lod_in: LOD1_synth
   lod_out: LOD2
   num_bins: 128
+  # Headroom below / above the LOD1 box, per axis (x, y, z), as a fraction of
+  # its scale. p99 on mini is 0 on every side but +z, which buys room for the
+  # ridge above the median roof height. All six are settable; see the load log.
+  margin_lo: [0.0, 0.0, 0.0]
+  margin_hi: [0.0, 0.0, 0.1]
   max_faces: 200
   max_files: null
   num_workers: 4
@@ -74,8 +79,22 @@ logging:
   wandb_offline: false
   log_model: false
 
-# The generative eval is written against the Levi-graph sampler, not this model.
-generative_eval:
-  enabled: false
+# Free-running generation scored against the paired ground-truth LOD2. The
+# unconditional generative_eval does not apply here and is gated off by
+# config_set in create_callbacks, so it needs no block.
+#
+# Ceilings measured on mini (raw LOD2 vs its own 128-bin round trip), which is
+# the best any model can score: chamfer 0.155 m, footprint IoU 0.992,
+# volumetric IoU 0.991 (defined for 75% -- the rest are not watertight at source).
+mesh_eval:
+  enabled: true
+  every_n_epochs: 10     # generate() is ~1800 sequential forwards, no KV cache
+  n_val: 8
+  n_test: 32
+  batch_size: 8
+  n_points: 4096
+  taus: [0.25, 0.5]
+  voxel_m: 0.25
+  save_samples: 8
 
 resume_from: null
