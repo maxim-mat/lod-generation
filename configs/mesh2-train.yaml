@@ -1,8 +1,16 @@
 # LOD1-conditioned autoregressive mesh transformer (MeshAnything, arXiv:2406.10163)
-# Usage: python main.py --train --config configs/mesh-train.yaml
+# Usage: python main.py --train --config configs/mesh2-train.yaml
 #
-# Starts on the mini dataset; point mesh_data.dataset_dir at
-# "data/The Hague/clean" for the full run.
+# Capacity probe against mesh-1. mesh-1 converged (val_loss 0.397 -> 0.389 over
+# epochs 26-42, early stopping at 46) with the copyable half of the task solved
+# -- footprint IoU 0.979, decode/eos/cityjson rates all 1.0 -- while the geometry
+# LOD2 actually adds lagged: bin MAE z 1.33 vs y 0.52 despite z being the primary
+# sort key, roof_mean_z_err 0.305 m at coord_mae 0.292 m, merged_face_ratio 0.83.
+# Free-running chamfer (0.179 m) beat teacher-forced (0.260 m), so it is not
+# exposure bias and not optimization. This run tests whether it is capacity,
+# before the far more expensive VQ-VAE rewrite.
+#
+# Everything below is mesh-train.yaml except mesh_model.d_model and run_name.
 
 mode: train
 config_set: mesh
@@ -31,8 +39,14 @@ mesh_data:
   persistent_workers: false
 
 # Transformer settings (MeshModelConfig)
+#
+# 256 -> 512 only. Block parameters go as num_layers * d_model^2, so doubling
+# the width is exactly 4x on them: ~5.3M -> ~20M total. Width rather than depth
+# because mesh-1's failure is which coordinate it predicts, not how many
+# sequential steps of reasoning it takes to get there. n_head stays 8, giving
+# the standard 64-wide head instead of a wider-but-fewer split.
 mesh_model:
-  d_model: 256
+  d_model: 512
   n_head: 8
   num_layers: 6
   dropout: 0.1
@@ -73,7 +87,7 @@ logging:
     - wandb
   project_name: lod-generation
   experiment_name: initial-runs
-  run_name: mesh-1
+  run_name: mesh-2
   save_dir: outputs
   wandb_entity: maxim-lod
   wandb_offline: false
