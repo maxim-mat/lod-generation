@@ -1,7 +1,12 @@
 # VQ-VAE mesh tokenizer for the LOD1-conditioned mesh transformer
 
 Date: 2026-08-08
-Status: approved, stage 1 of 2
+Status: implemented, both stages
+
+Stage 1 (the tokenizer and its training) and stage 2 (the transformer driven by
+codes) both landed on 2026-08-08. The section headed "Scope" below described the
+original two-increment plan; stage 2 was brought forward on request and its
+delivered shape is recorded under "Stage 2 as built" at the end.
 
 ## Why
 
@@ -183,6 +188,45 @@ leave quality to the training gate above.
 - commitment loss is finite and strictly positive on non-degenerate input
 - usage metric counts distinct codes correctly on a known assignment
 - `tokenize` is deterministic in eval mode
+
+## Stage 2 as built
+
+Selected by `mesh_model.tokenizer: vqvae` plus `mesh_model.vqvae_ckpt`;
+`configs/mesh3-train.yaml` is the run config. `coord` remains the default, so
+`mesh-train.yaml` and `mesh2-train.yaml` are unaffected.
+
+**`MeshDataset` still emits coordinate tokens.** Conversion happens in
+`MeshTransformerModule._prepare`, on device, under `no_grad`: the condition is
+reshaped to `[B, F, 9]` and encoded; the target is reshaped, quantized, offset
+per residual stage into its own id block, flattened face-major and wrapped in
+BOS/EOS. Doing it in the dataset would have meant running the tokenizer in
+dataloader workers on CPU, and caching codes that the frozen tokenizer can
+regenerate.
+
+**Per-stage id blocks.** Code 5 at stage 0 is not code 5 at stage 1, so the
+vocabulary is `codebook_size * depth + 3`. Sharing one block would make a code
+ambiguous in a way `decode_tokens` could not undo.
+
+**Frozen tokenizer.** `requires_grad_(False)` plus a `requires_grad` filter in
+`configure_optimizers`, so AdamW does not carry optimizer state for every
+codebook entry. A drifting codebook would make the target distribution
+non-stationary underneath the model learning to predict it.
+
+**Metrics change on this path.** `bin_mae`, `bin_mae_x/y/z`, `coord_mae_m` and
+`acc_1bin` are suppressed: a code id is a nominal label, so `|code_a - code_b|`
+is noise dressed as a metric. `code_acc_0..depth-1` replace them, one per
+residual stage — later stages are strictly harder and that split is what shows
+it. `token_acc`, `eos_acc`, `eos_fp_rate` and `tf_chamfer_m` carry over.
+
+**`run_mesh_eval` is tokenizer-agnostic**, via `model._prepare` and
+`model.decode_tokens`. The reference mesh is the ground truth through the *same*
+tokenizer, so the comparison isolates model error from tokenizer loss — the same
+contract the coordinate path already had.
+
+**Not built: the `cond_path` switch.** The spec above floated exposing raw
+coordinate tokens for the condition as a config option to keep the question
+empirical. Option (b) was chosen outright, so the switch would be dead
+flexibility; add it if the comparison is ever wanted.
 
 ## Out of scope
 

@@ -53,9 +53,13 @@ class MeshTransformer(nn.Module):
     """
 
     def __init__(self, vocab_size, d_model=256, n_head=8, num_layers=6,
-                 dropout=0.1, max_seq_len=4096):
+                 dropout=0.1, max_seq_len=4096, cond_dim=None):
         super().__init__()
         self.max_seq_len = max_seq_len
+        # Under the VQ-VAE tokenizer the condition arrives as continuous
+        # per-face features rather than token ids, so it needs a projection
+        # instead of a lookup. None keeps the coordinate path exactly as it was.
+        self.cond_proj = nn.Linear(cond_dim, d_model) if cond_dim else None
         self.token_embed = nn.Embedding(vocab_size, d_model)
         self.pos_embed = nn.Embedding(max_seq_len, d_model)
         # Which half of the prefix a position belongs to. Without it the model
@@ -75,7 +79,8 @@ class MeshTransformer(nn.Module):
         """Next-token logits for the target sequence.
 
         Args:
-            cond: [B, Lc] LOD1 tokens.
+            cond: [B, Lc] LOD1 token ids, or [B, Fc, cond_dim] continuous
+                per-face features from a VQ-VAE encoder.
             tgt: [B, Lt] target tokens, BOS-led and EOS-terminated.
             cond_pad_mask, tgt_pad_mask: [B, L] bool, True at padding.
 
@@ -83,8 +88,7 @@ class MeshTransformer(nn.Module):
             Tensor: [B, Lt - 1, vocab] where position ``i`` predicts ``tgt[:, i+1]``.
         """
         n_cond, n_tgt = cond.shape[1], tgt.shape[1]
-        x = torch.cat([cond, tgt[:, :-1]], dim=1)
-        length = x.shape[1]
+        length = n_cond + n_tgt - 1
         if max(n_cond, n_tgt - 1) > self.max_seq_len:
             raise ValueError(
                 f"Segment of {max(n_cond, n_tgt - 1)} exceeds "
@@ -98,14 +102,21 @@ class MeshTransformer(nn.Module):
         # embeddings from batch to batch, and on yet another set at sampling
         # time, where the condition is unpadded. The segment embedding is what
         # tells the two halves apart, so the indices need not.
-        pos = torch.cat([torch.arange(n_cond, device=x.device),
-                         torch.arange(n_tgt - 1, device=x.device)])
-        segment = (torch.arange(length, device=x.device) >= n_cond).long()
-        h = self.drop(self.token_embed(x) + self.pos_embed(pos) + self.segment_embed(segment))
+        device = cond.device
+        pos = torch.cat([torch.arange(n_cond, device=device),
+                         torch.arange(n_tgt - 1, device=device)])
+        segment = (torch.arange(length, device=device) >= n_cond).long()
+
+        # The two halves are embedded separately because under the VQ-VAE
+        # tokenizer they no longer share a vocabulary: the condition is a
+        # projected face feature, the target a code id.
+        cond_h = self.cond_proj(cond) if cond.is_floating_point() else self.token_embed(cond)
+        x = torch.cat([cond_h, self.token_embed(tgt[:, :-1])], dim=1)
+        h = self.drop(x + self.pos_embed(pos) + self.segment_embed(segment))
 
         # Bool, not the float mask from generate_square_subsequent_mask: torch
         # deprecates mixing mask dtypes with a bool src_key_padding_mask.
-        causal = torch.ones(length, length, dtype=torch.bool, device=x.device).triu(1)
+        causal = torch.ones(length, length, dtype=torch.bool, device=device).triu(1)
         pad_mask = None
         if cond_pad_mask is not None and tgt_pad_mask is not None:
             pad_mask = torch.cat([cond_pad_mask, tgt_pad_mask[:, :-1]], dim=1)
@@ -119,7 +130,8 @@ class MeshTransformerModule(L.LightningModule):
 
     def __init__(self, num_bins=NUM_BINS, d_model=256, n_head=8, num_layers=6,
                  dropout=0.1, max_seq_len=4096, lr=1e-4,
-                 lr_scheduler="none", lr_decay_steps=50, lr_decay_rate=0.5):
+                 lr_scheduler="none", lr_decay_steps=50, lr_decay_rate=0.5,
+                 vqvae=None):
         """
         Args:
             num_bins (int): coordinate discretization used by the tokenizer.
@@ -127,29 +139,141 @@ class MeshTransformerModule(L.LightningModule):
                 saved as a hyperparameter so inference restores it.
             lr_scheduler (str): 'none' | 'cosine' | 'step', as in
                 `CityJSONDiffusionModule`.
+            vqvae (MeshVQVAE, optional): a trained stage-1 tokenizer. Given one,
+                the model predicts *codes* rather than coordinates and the LOD1
+                condition is encoded (never quantized -- see the design spec).
+                None keeps the coordinate tokenizer, which stays the default.
         """
         super().__init__()
-        self.save_hyperparameters()
+        # The tokenizer is a module, not a hyperparameter: pickling it into the
+        # checkpoint would store a second copy of stage 1 in every stage-2 file.
+        self.save_hyperparameters(ignore=["vqvae"])
 
         self.num_bins = num_bins
         self.lr = lr
         self.lr_scheduler = lr_scheduler
         self.lr_decay_steps = lr_decay_steps
         self.lr_decay_rate = lr_decay_rate
-        _, _, self.pad = specials(num_bins)
+
+        self.vqvae = vqvae
+        if vqvae is None:
+            self.bos, self.eos, self.pad = specials(num_bins)
+            vocab, cond_dim = vocab_size(num_bins), None
+        else:
+            # Frozen: stage 2 must not move the vocabulary underneath the codes
+            # it is learning to predict, and a drifting codebook would make the
+            # target distribution non-stationary.
+            vqvae.eval()
+            for p in vqvae.parameters():
+                p.requires_grad_(False)
+            # Each residual stage gets its own id block. Sharing one block would
+            # make "code 5" ambiguous between stages, which decode cannot undo.
+            base = vqvae.codebook_size * vqvae.depth
+            self.bos, self.eos, self.pad = base, base + 1, base + 2
+            vocab, cond_dim = base + 3, vqvae.head.in_features
 
         self.network = MeshTransformer(
-            vocab_size=vocab_size(num_bins), d_model=d_model, n_head=n_head,
+            vocab_size=vocab, d_model=d_model, n_head=n_head,
             num_layers=num_layers, dropout=dropout, max_seq_len=max_seq_len,
+            cond_dim=cond_dim,
         )
+
+    # ------------------------------------------------------------------
+    # Batch -> this model's vocabulary
+    # ------------------------------------------------------------------
+
+    def _prepare(self, batch):
+        """``(cond, tgt, cond_pad_mask, tgt_pad_mask)`` in the active vocabulary.
+
+        `MeshDataset` always emits coordinate tokens -- stage 2 changed nothing
+        about it -- so under the VQ-VAE the conversion happens here, on device,
+        under no_grad. Returns the batch untouched on the coordinate path.
+        """
+        if self.vqvae is None:
+            return (batch["cond"], batch["tgt"],
+                    batch.get("cond_pad_mask"), batch.get("tgt_pad_mask"))
+
+        with torch.no_grad():
+            cond_coords, cond_faces = self._faces(batch["cond"], batch.get("cond_pad_mask"))
+            cond = self.vqvae.encode(cond_coords, cond_faces)
+
+            # Drop BOS; EOS and PAD both sit above the bin range, so one test
+            # separates real coordinates from everything else.
+            body = batch["tgt"][:, 1:]
+            body_pad = batch.get("tgt_pad_mask")
+            body_pad = body_pad[:, 1:] if body_pad is not None else torch.zeros_like(body, dtype=torch.bool)
+            coords, faces_pad = self._faces(body, body_pad | (body >= self.num_bins))
+            codes = self.vqvae.tokenize(coords, faces_pad)
+
+            # Offset each stage into its own id block, then flatten face-major.
+            offset = torch.arange(self.vqvae.depth, device=codes.device) * self.vqvae.codebook_size
+            flat = (codes + offset).flatten(start_dim=1)
+            valid = (~faces_pad).repeat_interleave(self.vqvae.depth, dim=1)
+
+            # Padding is always a suffix, so the valid codes are a prefix and
+            # EOS goes at index 1 + count.
+            b, width = flat.shape
+            tgt = flat.new_full((b, width + 2), self.pad)
+            tgt[:, 0] = self.bos
+            tgt[:, 1:width + 1] = torch.where(valid, flat, self.pad)
+            n = valid.sum(dim=1)
+            tgt[torch.arange(b, device=flat.device), n + 1] = self.eos
+
+            positions = torch.arange(width + 2, device=flat.device)[None]
+            tgt_pad = positions > (n + 1)[:, None]
+
+        return cond, tgt, cond_faces, tgt_pad
+
+    def _faces(self, tokens, pad_mask):
+        """[B, L] coordinate tokens to ``([B, F, 9] coords, [B, F] pad)``.
+
+        Trimmed to the last real coordinate, rounded up to a whole face. The
+        target sequence carries EOS and padding past that point, and reshaping
+        over them would append a face slot made entirely of padding to every
+        batch -- masked out, so harmless to the loss, but it would let the
+        sequence width be set by where EOS landed rather than by the face count.
+        """
+        real = int((~pad_mask).sum(dim=1).max()) if pad_mask.numel() else 0
+        width = 9 * ((real + 8) // 9)
+        if width < tokens.shape[1]:
+            tokens, pad_mask = tokens[:, :width], pad_mask[:, :width]
+        elif width > tokens.shape[1]:
+            short = width - tokens.shape[1]
+            tokens = F.pad(tokens, (0, short), value=0)
+            pad_mask = F.pad(pad_mask, (0, short), value=True)
+        # Clamp because PAD/EOS are out of range for the coordinate embedding;
+        # those slots are masked out anyway.
+        coords = tokens.clamp(0, self.num_bins - 1).reshape(tokens.shape[0], -1, 9)
+        # A face survives only if all nine of its coordinates are real.
+        return coords, pad_mask.reshape(tokens.shape[0], -1, 9).any(dim=-1)
+
+    def decode_tokens(self, tokens):
+        """A generated sequence to ``(verts, faces)`` in the unit box.
+
+        The one place that knows which tokenizer produced the sequence, so
+        `run_mesh_eval` does not have to.
+        """
+        tokens = torch.as_tensor(tokens).reshape(-1)
+        if self.vqvae is None:
+            return detokenize(tokens.cpu().numpy(), self.num_bins)
+
+        depth, size = self.vqvae.depth, self.vqvae.codebook_size
+        codes = tokens[tokens < depth * size]
+        codes = codes[: len(codes) - len(codes) % depth].reshape(-1, depth)
+        if len(codes) == 0:
+            return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
+        # Undo the per-stage offset; a stage-2 sample can land in the wrong
+        # block, so clamp rather than trust it.
+        offset = torch.arange(depth, device=codes.device) * size
+        return self.vqvae.detokenize((codes - offset).clamp(0, size - 1))
 
     def _shared_step(self, batch):
         """Returns (loss, logits, targets); targets are PAD where masked out."""
-        logits = self.network(batch["cond"], batch["tgt"],
-                              batch.get("cond_pad_mask"), batch.get("tgt_pad_mask"))
+        cond, tgt, cond_pad_mask, tgt_pad_mask = self._prepare(batch)
+        logits = self.network(cond, tgt, cond_pad_mask, tgt_pad_mask)
 
-        targets = batch["tgt"][:, 1:]
-        pad_mask = batch.get("tgt_pad_mask")
+        targets = tgt[:, 1:]
+        pad_mask = tgt_pad_mask
         if pad_mask is not None:
             # Mask by position, not by token value: a padded slot must not train
             # the model to emit anything, whatever id happens to sit there.
@@ -179,39 +303,50 @@ class MeshTransformerModule(L.LightningModule):
         Returns:
             dict: str -> scalar tensor, unprefixed.
         """
-        _, eos, _ = specials(self.num_bins)
+        eos = self.eos
         pred = logits.argmax(dim=-1)
         keep = targets != self.pad
-        is_coord = keep & (targets < self.num_bins)
         err = (pred - targets).abs().float()
 
         n_tok = keep.sum().clamp(min=1)
-        n_coord = is_coord.sum().clamp(min=1)
-        out = {
-            "token_acc": ((pred == targets) & keep).sum() / n_tok,
-            "bin_mae": (err * is_coord).sum() / n_coord,
-            "acc_1bin": ((err <= 1) & is_coord).sum() / n_coord,
-        }
+        out = {"token_acc": ((pred == targets) & keep).sum() / n_tok}
 
-        # The tokenizer emits x, y, z per vertex, so position mod 3 is the axis.
-        # Split that way rather than by depth: z is where LOD2 actually differs
-        # from its LOD1 condition, while x and y are largely copyable.
-        axis = torch.arange(targets.shape[1], device=targets.device) % 3
-        for k, name in enumerate("xyz"):
-            sel = is_coord & (axis == k)
-            out[f"bin_mae_{name}"] = (err * sel).sum() / sel.sum().clamp(min=1)
+        if self.vqvae is not None:
+            # A code id is a nominal label: |code_a - code_b| means nothing, so
+            # every magnitude statistic below would be noise dressed as a metric.
+            # Per-stage accuracy is the honest equivalent -- later residual
+            # stages are strictly harder, and that split is what shows it.
+            stage = torch.arange(targets.shape[1], device=targets.device) % self.vqvae.depth
+            for k in range(self.vqvae.depth):
+                sel = keep & (stage == k) & (targets < self.vqvae.codebook_size * self.vqvae.depth)
+                out[f"code_acc_{k}"] = (((pred == targets) & sel).sum()
+                                        / sel.sum().clamp(min=1))
+        else:
+            is_coord = keep & (targets < self.num_bins)
+            n_coord = is_coord.sum().clamp(min=1)
+            out["bin_mae"] = (err * is_coord).sum() / n_coord
+            out["acc_1bin"] = ((err <= 1) & is_coord).sum() / n_coord
 
-        if scale is not None:
-            # Per-axis bin width in metres; `scale` already carries the margins.
-            width = (scale / (self.num_bins - 1))[:, axis]
-            out["coord_mae_m"] = (err * width * is_coord).sum() / n_coord
+            # The tokenizer emits x, y, z per vertex, so position mod 3 is the
+            # axis. Split that way rather than by depth: z is where LOD2 actually
+            # differs from its LOD1 condition, while x and y are largely copyable.
+            axis = torch.arange(targets.shape[1], device=targets.device) % 3
+            for k, name in enumerate("xyz"):
+                sel = is_coord & (axis == k)
+                out[f"bin_mae_{name}"] = (err * sel).sum() / sel.sum().clamp(min=1)
+
+            if scale is not None:
+                # Per-axis bin width in metres; `scale` already carries the margins.
+                width = (scale / (self.num_bins - 1))[:, axis]
+                out["coord_mae_m"] = (err * width * is_coord).sum() / n_coord
 
         # One EOS in ~1800 tokens is ~0.06% of the gradient and invisible in
         # any aggregate. If the model never learns it, every generation runs to
         # max_new_tokens instead of closing, and only these two show it.
         at_eos = targets == eos
+        not_eos = keep & (targets != eos)
         out["eos_acc"] = ((pred == eos) & at_eos).sum() / at_eos.sum().clamp(min=1)
-        out["eos_fp_rate"] = ((pred == eos) & is_coord).sum() / n_coord
+        out["eos_fp_rate"] = ((pred == eos) & not_eos).sum() / not_eos.sum().clamp(min=1)
         return out
 
     def _log_token_metrics(self, loss, logits, targets, batch, prefix, on_step):
@@ -247,8 +382,8 @@ class MeshTransformerModule(L.LightningModule):
 
         center = batch["center"][i].detach().cpu().numpy()
         scale = batch["scale"][i].detach().cpu().numpy()
-        gen = detokenize(pred[real].detach().cpu().numpy(), self.num_bins)
-        ref = detokenize(targets[i][real].detach().cpu().numpy(), self.num_bins)
+        gen = self.decode_tokens(pred[real].detach())
+        ref = self.decode_tokens(targets[i][real].detach())
         if len(gen[1]) == 0 or len(ref[1]) == 0:
             return
 
@@ -284,7 +419,10 @@ class MeshTransformerModule(L.LightningModule):
         return self._eval_step(batch, "test", batch_idx)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr)
+        # requires_grad filter, not self.parameters(): a frozen VQ-VAE handed to
+        # AdamW would still accumulate optimizer state for every codebook entry.
+        optimizer = torch.optim.AdamW(
+            [p for p in self.parameters() if p.requires_grad], lr=self.lr)
 
         if self.lr_scheduler == "cosine":
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -323,7 +461,7 @@ class MeshTransformerModule(L.LightningModule):
             model chose to stop. Decode with
             `src.dataset.mesh_dataset.detokenize`.
         """
-        bos, eos, _ = specials(self.num_bins)
+        bos, eos = self.bos, self.eos
         if max_new_tokens is None:
             max_new_tokens = self.network.max_seq_len - 1
         tgt = torch.full((cond.shape[0], 1), bos, dtype=torch.long, device=cond.device)

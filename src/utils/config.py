@@ -145,6 +145,14 @@ class MeshModelConfig:
     # covers max(len(cond), len(tgt) - 1). None = size it from the loaded
     # dataset's longest segment, logged at startup.
     max_seq_len: Optional[int] = None
+    # "coord" -- 9 discretized coordinates per face, an exact inverse, the
+    # measurement baseline and the default. "vqvae" -- codes from a trained
+    # stage-1 checkpoint, `depth` per face, and the LOD1 condition goes through
+    # the same encoder unquantized (see the design spec for why not quantized).
+    tokenizer: str = "coord"
+    # Stage-1 checkpoint. Required when tokenizer == "vqvae"; the codebook is
+    # loaded frozen, so nothing here can move the vocabulary mid-run.
+    vqvae_ckpt: Optional[str] = None
 
 @dataclass
 class MeshVQVAEConfig:

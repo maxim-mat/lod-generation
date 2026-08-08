@@ -61,6 +61,11 @@ class _Dataset:
 
 
 def _model():
+    # Seeded: an untrained model's weights decide whether a generation decodes
+    # to anything at all, so without this the assertions below depend on
+    # whatever consumed the global RNG earlier in the session -- the test
+    # passed alone and failed in a full run.
+    torch.manual_seed(1)
     return MeshTransformerModule(num_bins=NUM_BINS, d_model=16, n_head=2,
                                  num_layers=1, dropout=0.0, max_seq_len=128)
 

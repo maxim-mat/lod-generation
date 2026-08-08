@@ -22,7 +22,7 @@ import lightning as L
 import numpy as np
 import torch
 
-from src.dataset.mesh_dataset import detokenize, mesh_collate_fn, specials, write_obj
+from src.dataset.mesh_dataset import mesh_collate_fn, specials, write_obj
 from src.eval.mesh_metrics import mesh_metrics, surface_distances, chamfer_distance
 from src.post_process.post_process import mesh_to_cityjson, save_to_file
 
@@ -54,8 +54,9 @@ def _n_polygons(cj):
     return len(next(iter(cj["CityObjects"].values()))["geometry"][0]["boundaries"][0])
 
 
-def _to_metres(tokens, num_bins, center, scale):
-    verts, faces = detokenize(tokens, num_bins)
+def _to_metres(model, tokens, center, scale):
+    """Decode through whichever tokenizer the model was built with."""
+    verts, faces = model.decode_tokens(tokens)
     return verts * scale + center, faces
 
 
@@ -91,7 +92,7 @@ def run_mesh_eval(model, dataset, indices, cfg, max_new_tokens, seed=1234,
                     max_new_tokens, budget)
         max_new_tokens = budget
 
-    _, eos, _ = specials(model.num_bins)
+    eos = model.eos
     was_training = model.training
     model.eval()
 
@@ -99,23 +100,31 @@ def run_mesh_eval(model, dataset, indices, cfg, max_new_tokens, seed=1234,
     for start in range(0, len(indices), cfg.batch_size):
         chunk = indices[start:start + cfg.batch_size]
         items = [dataset[int(i)] for i in chunk]
-        batch = mesh_collate_fn(items, pad=model.pad)
+        # The dataset speaks coordinates whatever the model speaks, so pad with
+        # the coordinate PAD; `_prepare` converts and re-pads if it has to.
+        batch = mesh_collate_fn(items, pad=specials(model.num_bins)[2])
 
         device = next(model.parameters()).device
         with torch.no_grad():
+            batch = {k: v.to(device) if torch.is_tensor(v) else v
+                     for k, v in batch.items()}
+            # Whatever vocabulary the model was built with: coordinate tokens
+            # pass through, VQ-VAE codes are encoded/quantized here.
+            cond, tgt, cond_pad, _ = model._prepare(batch)
             # temperature 0 -> argmax. A sampled generation would make the
             # metric a random variable and the epoch-to-epoch curve unreadable.
-            out = model.generate(batch["cond"].to(device),
-                                 batch["cond_pad_mask"].to(device),
+            out = model.generate(cond, cond_pad,
                                  max_new_tokens=max_new_tokens, temperature=0.0)
 
         for k, i in enumerate(chunk):
-            centre = batch["center"][k].numpy()
-            scale = batch["scale"][k].numpy()
-            tokens = out[k].cpu().numpy()
+            centre = batch["center"][k].cpu().numpy()
+            scale = batch["scale"][k].cpu().numpy()
+            tokens = out[k].cpu()
 
-            gen = _to_metres(tokens, model.num_bins, centre, scale)
-            ref = _to_metres(batch["tgt"][k].numpy(), model.num_bins, centre, scale)
+            gen = _to_metres(model, tokens, centre, scale)
+            # The reference is the ground truth through the *same* tokenizer, so
+            # the comparison isolates model error from tokenizer loss.
+            ref = _to_metres(model, tgt[k].cpu(), centre, scale)
 
             row = mesh_metrics(gen, ref, taus=tuple(cfg.taus),
                                n_points=cfg.n_points, voxel_m=cfg.voxel_m)
