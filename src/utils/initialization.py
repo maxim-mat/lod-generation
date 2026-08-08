@@ -53,7 +53,7 @@ def parse_args():
     )
     parser.add_argument(
         "--config-set",
-        choices=["diffusion", "mini", "mesh"],
+        choices=["diffusion", "mini", "mesh", "mesh_vqvae"],
         default=None,
         help="Which set of config objects to build and run. Overrides the "
              "config file's `config_set:`; defaults to whatever it says.",

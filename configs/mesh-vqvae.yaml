@@ -1,0 +1,103 @@
+# Stage-1 learned mesh vocabulary (MeshAnything, arXiv:2406.10163 §4.2)
+# Usage: python main.py --train --config configs/mesh-vqvae.yaml
+#
+# Trains a VQ-VAE to reconstruct LOD1 and LOD2 faces through a codebook. The
+# resulting checkpoint is what stage 2 loads frozen in place of the coordinate
+# tokenizer. Design and gate: docs/superpowers/specs/2026-08-08-mesh-vqvae-design.md
+#
+# Success is NOT "beat the coordinate tokenizer" -- the decoder predicts logits
+# over the same 128 bins, so its reconstruction ceiling is that tokenizer's
+# measured 0.107 m chamfer plus whatever the codebook loses. What is being
+# bought is 9 -> 3 tokens per face and a decoder that tolerates imperfect codes.
+# Gate: val reconstruction within ~0.15 m, and a codebook actually in use --
+# watch val_codes_used and val_codebook_ppl, not just the loss.
+
+mode: train
+config_set: mesh_vqvae
+seed: 42
+
+# Not read under config_set: mesh_vqvae, but DataConfig.dataset_dir resolves
+# with the rest of the schema, so it still needs a value.
+data:
+  dataset_dir: data/The Hague/mini
+
+# Same block the transformer uses, so the two stages cannot disagree about
+# bins, margins, max_faces or the seeded train/val/test split. A building in
+# the transformer's test split must never be in the VQ-VAE's training set.
+mesh_data:
+  dataset_dir: data/The Hague/mini
+  lod_in: LOD1_synth
+  lod_out: LOD2
+  num_bins: 128
+  margin_lo: [0.0, 0.0, 0.0]
+  margin_hi: [0.0, 0.0, 0.1]
+  max_faces: 200
+  max_files: null
+  num_workers: 10
+  persistent_workers: false
+
+# Codebook (MeshVQVAEConfig)
+mesh_vqvae:
+  # 1024, not the paper's 8192: walls, ground planes and roof slopes are far
+  # less varied than Objaverse art assets, and a codebook past the diversity of
+  # the data leaves most entries dead and the survivors undertrained. Calibrate
+  # from val_codes_used -- raise it if usage saturates, lower it if most entries
+  # never fire.
+  codebook_size: 1024
+  depth: 3               # codes per face; the paper's setting, 3x compression
+  d_model: 256
+  n_head: 8
+  num_layers: 4          # encoder and decoder each
+  dropout: 0.1
+  max_faces: null        # null = size it from the corpus's longest mesh
+  commitment: 0.25       # van den Oord et al. (2017) standard value
+
+training:
+  # Items are single meshes here, not (LOD1, LOD2) pairs of 1800-token
+  # sequences, so this can be far larger than the transformer's 8.
+  batch_size: 64
+  train_val_test_split:
+    - 0.8
+    - 0.1
+    - 0.1
+  lr: 1e-4
+  max_epochs: 100
+  gradient_clip_val: 1.0
+  lr_scheduler: "cosine"
+  lr_decay_steps: 50
+  lr_decay_rate: 0.5
+  early_stopping:
+    enabled: true
+    monitor: val_loss
+    patience: 10
+    mode: min
+  checkpoint:
+    enabled: true
+    monitor: val_loss
+    mode: min
+    save_top_k: 3
+    filename: "{epoch:02d}-{val_loss:.4f}"
+
+trainer:
+  accelerator: auto
+  devices: 1
+  precision: "32"
+  log_every_n_steps: 50
+
+logging:
+  loggers:
+    - wandb
+  project_name: lod-generation
+  experiment_name: initial-runs
+  run_name: mesh-vqvae-1
+  save_dir: outputs
+  wandb_entity: maxim-lod
+  wandb_offline: false
+  log_model: false
+
+# Unconditional distribution metrics do not apply to a reconstruction model;
+# create_callbacks gates this off by config_set regardless of what is here.
+generative_eval:
+  enabled: false
+
+resume_from: null

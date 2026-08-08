@@ -147,6 +147,29 @@ class MeshModelConfig:
     max_seq_len: Optional[int] = None
 
 @dataclass
+class MeshVQVAEConfig:
+    """Stage-1 learned mesh vocabulary (arXiv:2406.10163 §4.2).
+
+    Read only under `config_set: mesh_vqvae`. The mesh data itself still comes
+    from `mesh_data`, so the two stages cannot disagree about bins, margins or
+    the train/val/test split.
+    """
+    codebook_size: int = 1024
+    # Residual stages, i.e. codes per face. 3 is the paper's setting and gives
+    # the 9 -> 3 token compression that is the whole point of the codebook.
+    depth: int = 3
+    d_model: int = 256        # must be divisible by n_head
+    n_head: int = 8
+    num_layers: int = 4
+    dropout: float = 0.1
+    # Capacity of the per-face positional embedding. None = size it from the
+    # loaded corpus's longest mesh, logged at startup.
+    max_faces: Optional[int] = None
+    # Weight on the term pulling the encoder toward the codebook
+    # (van den Oord et al., 2017). 0.25 is the standard value.
+    commitment: float = 0.25
+
+@dataclass
 class EarlyStoppingConfig:
     """Configuration for early stopping callback."""
     enabled: bool = True
@@ -248,8 +271,9 @@ class Config:
     #   "mini"      — the same objects pointed at data/The Hague/mini; it needs
     #                 no fields of its own, so it gets no dataclass of its own
     #   "mesh"      — mesh_data + mesh_model, the LOD1-conditioned transformer
+    #   "mesh_vqvae"— mesh_data + mesh_vqvae, stage-1 learned mesh vocabulary
     # Resolved in `src.train.train`. Deliberately a plain string switch rather
-    # than a registry; there are three of these and they are all in one repo.
+    # than a registry; there are four of these and they are all in one repo.
     config_set: str = "diffusion"
     seed: int = 42
     data: DataConfig = field(default_factory=DataConfig)
@@ -257,6 +281,7 @@ class Config:
     mesh_data: MeshDataConfig = field(default_factory=MeshDataConfig)
     mesh_model: MeshModelConfig = field(default_factory=MeshModelConfig)
     mesh_eval: MeshEvalConfig = field(default_factory=MeshEvalConfig)
+    mesh_vqvae: MeshVQVAEConfig = field(default_factory=MeshVQVAEConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
