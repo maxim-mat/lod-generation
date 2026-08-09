@@ -174,20 +174,23 @@ class MeshVQVAEConfig:
     # loaded corpus's longest mesh, logged at startup.
     max_faces: Optional[int] = None
     # Weight on the term pulling the encoder toward the codebook
-    # (van den Oord et al., 2017). 0.25 is the standard value.
-    commitment: float = 0.25
-    # Weight on the whole quantizer loss where it meets the reconstruction
-    # cross-entropy. The two are in different units (nats vs. squared distance
-    # in d_model space, summed over `depth` stages), so an unweighted sum lets
-    # the codebook term dominate both the gradient and any metric monitoring
-    # it. Sweep this before touching the quantizer itself.
-    vq_weight: float = 0.1
-    # Training steps between restarts of unused codebook entries. nn.Embedding's
-    # backward only reaches selected rows, so an entry that stops being chosen is
-    # frozen permanently; resampling it from live encoder residuals is the only
-    # way back. 0 disables the restart (the entries are still seeded from data
-    # on the first batch).
-    restart_every: int = 100
+    # (van den Oord et al., 2017). 0.1 is MeshGPT's `commit_loss_weight`. With
+    # EMA codebook updates this is the *only* quantizer term in the objective,
+    # so it is also the whole knob for balancing against the reconstruction
+    # cross-entropy.
+    commitment: float = 0.1
+    # EMA decay for the codebook, matching vector-quantize-pytorch's default.
+    decay: float = 0.8
+    # Replace the straight-through estimator with the rotation trick (Fifty et
+    # al., ICLR 2025, arXiv:2410.06424): the gradient at the code is rotated
+    # onto the encoder output rather than copy-pasted, so points in one Voronoi
+    # cell get different updates by angle. Reported to cut quantization error by
+    # an order of magnitude and raise codebook usage. Off by default: it
+    # postdates MeshAnything, so turning it on is a departure from the method,
+    # not a reproduction of it. A/B it against a settled baseline -- and note
+    # its stated failure mode (paper §6) is codewords near zero norm, which is
+    # what `kmeans_init` exists to prevent.
+    rotation_trick: bool = False
 
 @dataclass
 class EarlyStoppingConfig:

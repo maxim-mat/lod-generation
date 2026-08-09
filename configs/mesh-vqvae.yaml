@@ -50,19 +50,22 @@ mesh_vqvae:
   num_layers: 4          # encoder and decoder each
   dropout: 0.1
   max_faces: null        # null = size it from the corpus's longest mesh
-  commitment: 0.25       # van den Oord et al. (2017) standard value
-  # Scales the quantizer loss against the reconstruction cross-entropy. At 1.0
-  # (run mesh-vqvae-1) the codebook term was ~6x recon_ce, so the encoder was
-  # optimized toward being quantizable rather than reconstructable and the
-  # codebook collapsed 511 -> 52 live entries by epoch 10. Sweep 0.03/0.1/0.3.
-  vq_weight: 0.1
-  # Steps between restarts of codebook entries that went unused. Entries are
-  # also seeded from real encoder residuals on the first batch -- without that,
-  # they start ~1700x closer to the origin than the encoder output ever gets,
-  # argmin picks on rounding noise, and the few rows that win step 0 are the
-  # only ones that can ever receive gradient (mesh-vqvae-2: 28 live of 1024).
-  # Watch codes_used_s0/s1/s2, not just the pooled codes_used.
-  restart_every: 100
+  # MeshGPT's `commit_loss_weight`. Quantization runs through ResidualVQ from
+  # vector-quantize-pytorch with MeshGPT's settings (kmeans_init, EMA codebook,
+  # dead-code revival at EMA usage < 2) -- the library MeshAnything itself uses.
+  # The codebook is EMA-updated rather than trained, so this is the only
+  # quantizer term in the loss. Watch codes_used_s0/s1/s2, not the pooled
+  # codes_used: a hand-rolled quantizer collapsed to 28 live entries of 1024 by
+  # epoch 1 (mesh-vqvae-2), and the pooled number read "fine" throughout.
+  commitment: 0.1
+  decay: 0.8             # codebook EMA decay
+  # Rotation trick (arXiv:2410.06424) in place of the straight-through
+  # estimator. Off = what MeshAnything actually did; the paper postdates it.
+  # Worth an A/B once there is a settled baseline to compare against: its
+  # reported win is an order of magnitude on quantization error, which is the
+  # side that matters here (recon_ce / bin_mae), since codebook usage is
+  # already healthy with kmeans_init + EMA + dead-code revival.
+  rotation_trick: false
 
 training:
   # Items are single meshes here, not (LOD1, LOD2) pairs of 1800-token

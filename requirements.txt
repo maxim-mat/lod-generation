@@ -3,6 +3,11 @@ torch>=2.0.0
 lightning>=2.0.0
 omegaconf>=2.3.0
 
+# Mesh VQ-VAE quantizer. The same library MeshAnything/MeshGPT use, so the
+# codebook gets kmeans init, EMA updates and dead-code revival rather than a
+# hand-rolled quantizer that collapses (see src/models/mesh_vqvae.py).
+vector-quantize-pytorch>=1.31.0
+
 # Data handling & geometry
 numpy>=1.24.0
 pandas>=2.0.0

@@ -102,57 +102,69 @@ def test_usage_counts_distinct_codes():
     assert 1.0 < stats["perplexity"] < 3.0 + 1e-6
 
 
-def test_codebooks_are_seeded_from_encoder_outputs():
-    """Entries initialized near the origin are unreachable from a transformer
-    output: every candidate distance equals ||z|| to within rounding, argmin
-    picks on noise, and only the rows that win the first step ever get gradient
-    again (run mesh-vqvae-2 froze at 28 live entries of 1024 this way)."""
+def test_codebook_is_seeded_from_data_not_the_origin():
+    """Guards `kmeans_init`. Entries sitting near the origin are unreachable
+    from a transformer output: every candidate distance equals ||z|| to within
+    rounding, argmin picks on noise, and the rows that win the first step are
+    the only ones ever updated (a hand-rolled quantizer froze at 28 live entries
+    of 1024 this way, run mesh-vqvae-2)."""
     def nearest(model, z):
-        """Mean distance from each encoder output to its closest entry."""
-        d = torch.cdist(z.flatten(0, -2), model.codebooks[0].weight)
+        """Mean distance from each encoder output to its closest stage-0 entry."""
+        d = torch.cdist(z.flatten(0, -2), model.quantizer.codebooks[0])
         return float(d.min(dim=-1).values.mean())
 
-    model = _vqvae().eval()          # eval: quantize must not seed
+    model = _vqvae().train()
     z = model.encode(_coords())
     before = nearest(model, z)
     model.quantize(z)
-    assert not bool(model._initialized) and nearest(model, z) == before
-
-    model.train()
-    model.quantize(z)
-    assert bool(model._initialized)
-    # Entries are now drawn from z itself, so the nearest one sits on top of it.
+    # Entries are drawn from z itself, so the nearest one sits on top of it.
     assert nearest(model, z) < 0.1 * before
 
 
-def test_unused_entries_are_resampled_not_left_frozen():
-    """`nn.Embedding` backward only touches selected rows, so an entry that
-    stops being selected is frozen for good unless something resamples it."""
-    model = _vqvae(restart_every=1).train()
-    z = model.encode(_coords())
-    model.quantize(z)                       # seeds, then records usage
-    dead = model._usage[0] == 0
-    assert bool(dead.any()), "no unused entries; test cannot check the restart"
+def test_rotation_trick_changes_the_gradient_but_not_the_forward_pass():
+    """`rotation_trick` has to reach ResidualVQ to mean anything. It rotates the
+    gradient from the code to the encoder output instead of copy-pasting it
+    (Fifty et al., ICLR 2025, arXiv:2410.06424), so the forward value is
+    identical by construction and only the backward pass moves."""
+    def run(rotation_trick):
+        torch.manual_seed(0)
+        model = _vqvae(rotation_trick=rotation_trick).train()
+        z = model.encode(_coords()).detach().requires_grad_(True)
+        z_q, _, _ = model.quantize(z)
+        z_q.square().sum().backward()
+        return z_q.detach(), z.grad
 
-    frozen = model.codebooks[0].weight[dead].clone()
-    model.quantize(z)                       # restart pass
-    assert not torch.allclose(model.codebooks[0].weight[dead], frozen)
+    (q_ste, g_ste), (q_rot, g_rot) = run(False), run(True)
+    assert torch.allclose(q_ste, q_rot, atol=1e-6), "the forward pass must not move"
+    assert not torch.allclose(g_ste, g_rot, atol=1e-6), "rotation_trick never reached the quantizer"
 
 
-def test_a_frozen_codebook_is_never_resampled():
+def test_a_frozen_codebook_never_moves():
     """Stage 2 holds the tokenizer as a submodule, so Lightning's per-epoch
     `model.train()` recurses in and undoes the `eval()` it was constructed with.
-    Resampling there would rewrite the vocabulary the transformer is being
-    trained to predict, mid-run."""
-    model = _vqvae(restart_every=1).train()
+    An EMA codebook updates on `training` alone, so without the freeze it would
+    rewrite the vocabulary the transformer is being trained to predict, mid-run.
+    """
+    model = _vqvae().train()
     z = model.encode(_coords())
     model.quantize(z)                       # seeds while still trainable
     for p in model.parameters():
         p.requires_grad_(False)
 
-    before = model.codebooks[0].weight.clone()
+    before = model.quantizer.codebooks.clone()
     model.quantize(z.detach())
-    assert torch.equal(model.codebooks[0].weight, before)
+    assert torch.equal(model.quantizer.codebooks, before)
+
+
+def test_padded_faces_come_back_as_negative_one():
+    """The quantizer marks padding rather than assigning it a code. Anything
+    counting occupancy or writing meshes has to skip those, not clamp them."""
+    model = _vqvae().eval()
+    pad = torch.zeros(B, F, dtype=torch.bool)
+    pad[1, -2:] = True
+    _, _, codes = model.quantize(model.encode(_coords(), pad), pad)
+    assert (codes[1, -2:] == -1).all()
+    assert (codes[0] >= 0).all()
 
 
 def test_codebook_stats_reports_each_stage_separately():
@@ -180,17 +192,16 @@ def test_module_training_step_returns_a_finite_loss():
     assert torch.isfinite(loss) and float(loss) > 0
 
 
-def test_vq_weight_scales_the_quantizer_term_only():
-    """`recon_ce` is cross-entropy in nats; `vq_loss` is a raw MSE in d_model
-    space summed over `depth` stages. Summing them unweighted let the codebook
-    term carry ~85% of the objective (run mesh-vqvae-1), so it needs a knob."""
+def test_loss_is_reconstruction_plus_the_commitment_term_only():
+    """The codebook is EMA-updated, not trained, so nothing else reaches the
+    objective. Run mesh-vqvae-1 also summed in a raw codebook MSE, which carried
+    ~85% of `val_loss` and made its best checkpoint the untrained epoch 0."""
     module = MeshVQVAEModule(num_bins=NUM_BINS, codebook_size=CODEBOOK, depth=DEPTH,
-                             d_model=16, n_head=2, num_layers=1, dropout=0.0,
-                             vq_weight=0.1).eval()
+                             d_model=16, n_head=2, num_layers=1, dropout=0.0).eval()
     batch = {"coords": _coords(), "pad_mask": torch.zeros(B, F, dtype=torch.bool)}
     with torch.no_grad():
         loss, metrics = module._shared_step(batch)
-    assert torch.allclose(loss, metrics["recon_ce"] + 0.1 * metrics["vq_loss"], atol=1e-6)
+    assert torch.allclose(loss, metrics["recon_ce"] + metrics["vq_loss"], atol=1e-6)
 
 
 def test_padded_faces_do_not_contribute_to_the_loss():

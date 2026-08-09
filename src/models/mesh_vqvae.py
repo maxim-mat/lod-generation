@@ -37,6 +37,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from vector_quantize_pytorch import ResidualVQ
+
 from src.dataset.mesh_dataset import NUM_BINS, canonicalize, dequantize
 
 logger = logging.getLogger(__name__)
@@ -69,17 +71,19 @@ class MeshVQVAE(nn.Module):
         max_faces (int): capacity of the per-face positional embedding. Faces are
             canonically ordered, so their position carries information.
         commitment (float): weight on the term pulling the encoder toward the
-            codebook (van den Oord et al., 2017).
+            codebook (van den Oord et al., 2017). MeshGPT uses 0.1.
+        decay (float): EMA decay for the codebook.
+        rotation_trick (bool): rotate the gradient from code to encoder output
+            instead of the straight-through copy. See `MeshVQVAEConfig`.
     """
 
     def __init__(self, num_bins=NUM_BINS, codebook_size=1024, depth=3,
                  d_model=256, n_head=8, num_layers=4, dropout=0.1,
-                 max_faces=512, commitment=0.25, restart_every=100):
+                 max_faces=512, commitment=0.1, decay=0.8, rotation_trick=False):
         super().__init__()
         self.num_bins = num_bins
         self.codebook_size = codebook_size
         self.depth = depth
-        self.commitment = commitment
         self.max_faces = max_faces
 
         # A face is 9 coordinates; embed each and project the concatenation, so
@@ -93,22 +97,33 @@ class MeshVQVAE(nn.Module):
         self.decoder = _stack(d_model, n_head, num_layers, dropout)
         # One codebook per residual stage: stage i quantizes what stages
         # 0..i-1 left behind, so they must not share entries.
-        self.codebooks = nn.ModuleList(
-            nn.Embedding(codebook_size, d_model) for _ in range(depth))
-        # Deliberately NOT the usual uniform(-1/K, 1/K): that puts all K entries
-        # inside a ball of radius ~0.01 around the origin, while `encode` is a
-        # pre-LN transformer with no output norm whose ||z|| is order 10 and
-        # grows during training. Every candidate distance is then ||z|| to
-        # within a rounding error, argmin picks on noise, and since
-        # nn.Embedding's backward only reaches selected rows, the handful that
-        # win the first steps are the only ones ever updated -- run
-        # mesh-vqvae-2 froze at 28 live entries of 1024 by epoch 1. Entries are
-        # seeded from real encoder residuals on the first training batch
-        # instead; see `_reseed`.
-        self.restart_every = restart_every
-        self.register_buffer("_initialized", torch.zeros((), dtype=torch.bool))
-        self.register_buffer("_steps", torch.zeros((), dtype=torch.long))
-        self.register_buffer("_usage", torch.zeros(depth, codebook_size, dtype=torch.long))
+        #
+        # Settings are MeshGPT's `rvq_kwargs` verbatim, which is what
+        # MeshAnything inherits (its §5.2 cites the RVQ of SoundStream,
+        # Zeghidour et al. arXiv:2107.03312, and its README credits
+        # lucidrains/vector-quantize-pytorch). Hand-rolling this is what produced
+        # the collapse in run mesh-vqvae-2 -- 28 live entries of 1024 by epoch 1
+        # -- because the paper text describes only the 2017 objective and leaves
+        # the machinery that makes it trainable to the library:
+        #   * `kmeans_init` seeds entries from real encoder outputs. Without it
+        #     an entry far from the data is never selected, never updated, and
+        #     therefore dead permanently.
+        #   * `threshold_ema_dead_code` revives entries whose EMA usage decays
+        #     below 2 (random restarts, Jukebox arXiv:2005.00341 §3.1).
+        #   * EMA codebook updates (van den Oord 2017 appendix; VQ-VAE-2,
+        #     arXiv:1906.00446) make the codebook a buffer rather than a
+        #     parameter, so the codebook MSE leaves the objective entirely and
+        #     only the commitment term is left to weigh against `recon_ce`.
+        self.quantizer = ResidualVQ(
+            dim=d_model,
+            num_quantizers=depth,
+            codebook_size=codebook_size,
+            kmeans_init=True,
+            threshold_ema_dead_code=2,
+            decay=decay,
+            commitment_weight=commitment,
+            rotation_trick=rotation_trick,
+        )
 
         self.head = nn.Linear(d_model, COORDS_PER_FACE * num_bins)
 
@@ -141,100 +156,36 @@ class MeshVQVAE(nn.Module):
         x = x + self.pos_embed(pos)[None]
         return self.encoder(x, src_key_padding_mask=pad_mask)
 
-    @staticmethod
-    def _reseed(codebook, residual, valid, dead):
-        """Overwrite ``dead`` codebook rows with sampled encoder residuals.
-
-        Both the first-batch initialization and the periodic restart of unused
-        entries. Sampling the residuals the stage must actually quantize is what
-        keeps every row reachable: an entry far from the data is never selected,
-        never receives gradient, and is therefore dead permanently.
-
-        The standard remedy for codebook collapse. Random restarts from current
-        encoder outputs are Jukebox (Dhariwal et al., arXiv:2005.00341 §3.1);
-        pairing them with a data-dependent (k-means) initialization is the
-        residual-VQ recipe of SoundStream (Zeghidour et al., arXiv:2107.03312),
-        restated in EnCodec (Défossez et al., arXiv:2210.13438 §3.2). Sampling
-        the pool rather than running k-means is that init at one iteration.
-        Those papers also drop the codebook MSE in favour of an EMA update,
-        which would remove the loss-scale mismatch `vq_weight` currently patches.
-        """
-        n = int(dead.sum())
-        pool = residual[valid].detach()
-        if n == 0 or pool.shape[0] == 0:
-            return
-        pick = pool[torch.randint(pool.shape[0], (n,), device=pool.device)]
-        # Noise so that duplicates drawn from a pool smaller than `n` separate.
-        codebook.weight.data[dead] = pick + 0.01 * pool.std() * torch.randn_like(pick)
-
     def quantize(self, z, pad_mask=None):
         """Residual vector quantization with a straight-through estimator.
 
-        On the first training batch every codebook is seeded from the residuals
-        it has to quantize, and every ``restart_every`` steps entries unused
-        since the last check are resampled the same way. Both are no-ops in eval,
-        so `tokenize` stays deterministic.
-
         Returns:
-            tuple: (z_q [B, F, d], vq_loss scalar, codes [B, F, depth]).
-            ``z_q`` carries ``z``'s gradient: argmin is not differentiable, so
-            without the straight-through pass the encoder never trains.
+            tuple: (z_q [B, F, d], commit_loss scalar, codes [B, F, depth]).
+            Padded faces come back as ``-1`` codes and zeroed features, and are
+            excluded from the commitment loss. ``z_q`` carries ``z``'s gradient:
+            argmin is not differentiable, so without the straight-through pass
+            the encoder never trains.
         """
-        valid = self._valid(z, pad_mask)
-        vb = valid.bool()
-        residual, quantized, codes, loss = z, torch.zeros_like(z), [], z.new_zeros(())
-
-        # `requires_grad`, not `self.training` alone: stage 2 holds this network
-        # as a frozen submodule, and Lightning's per-epoch `model.train()`
-        # recurses into it, undoing the `eval()` it was handed. Resampling there
-        # would rewrite the vocabulary the transformer is learning to predict.
-        trainable = self.training and self.codebooks[0].weight.requires_grad
-        seeding = trainable and not bool(self._initialized)
-        restarting = (trainable and self.restart_every > 0
-                      and int(self._steps) % self.restart_every == 0)
-
-        for k, codebook in enumerate(self.codebooks):
-            if seeding or restarting:
-                dead = (torch.ones(self.codebook_size, dtype=torch.bool, device=z.device)
-                        if seeding else self._usage[k] == 0)
-                self._reseed(codebook, residual, vb, dead)
-                self._usage[k].zero_()
-            # cdist over the flattened face axis; codebooks are small enough
-            # that the full distance matrix is cheaper than any index.
-            idx = torch.cdist(residual.flatten(0, -2), codebook.weight).argmin(dim=-1)
-            idx = idx.view(residual.shape[:-1])
-            q = codebook(idx)
-            if trainable:
-                self._usage[k] += torch.bincount(idx[vb].reshape(-1),
-                                                 minlength=self.codebook_size)
-
-            # Codebook term pulls entries to the residual, commitment term pulls
-            # the encoder to the entries; each stops the other's gradient.
-            loss = loss + (_masked_mse(q, residual.detach(), valid)
-                           + self.commitment * _masked_mse(residual, q.detach(), valid))
-            quantized = quantized + q
-            residual = residual - q.detach()
-            codes.append(idx)
-
-        if trainable:
-            self._initialized.fill_(True)
-            self._steps += 1
-
-        return z + (quantized - z).detach(), loss, torch.stack(codes, dim=-1)
+        # The codebook is an EMA buffer, so `self.training` alone decides whether
+        # it moves -- and stage 2 holds this network as a frozen submodule whose
+        # `eval()` Lightning undoes on every epoch by recursing `model.train()`.
+        # Freezing on "no parameter wants a gradient" keeps the stage-2
+        # vocabulary fixed without depending on the mode flag surviving.
+        frozen = not any(p.requires_grad for p in self.parameters())
+        z_q, codes, losses = self.quantizer(
+            z, mask=None if pad_mask is None else ~pad_mask, freeze_codebook=frozen)
+        return z_q, losses.sum(), codes
 
     def lookup(self, codes):
         """Sum the residual stages back into one feature vector per face.
 
         Out-of-range indices are clamped rather than raising: a stage-2
         transformer samples from a softmax and can emit anything, and a decoder
-        that crashes on bad input cannot be measured.
+        that crashes on bad input cannot be measured. This also folds away the
+        ``-1`` that `quantize` returns for padded faces.
         """
-        codes = codes.clamp(0, self.codebook_size - 1)
-        z_q = None
-        for k, codebook in enumerate(self.codebooks):
-            q = codebook(codes[..., k])
-            z_q = q if z_q is None else z_q + q
-        return z_q
+        return self.quantizer.get_output_from_indices(
+            codes.clamp(0, self.codebook_size - 1))
 
     def decode(self, z_q, pad_mask=None):
         """Per-coordinate logits.
@@ -301,6 +252,10 @@ class MeshVQVAE(nn.Module):
                     "distinct_per_stage": [], "perplexity_per_stage": []}
 
         def occupancy(flat):
+            # `quantize` returns -1 for padded faces; those are not codes.
+            flat = flat[flat >= 0]
+            if flat.numel() == 0:
+                return 0, 0.0
             counts = torch.bincount(flat, minlength=self.codebook_size).float()
             p = counts / counts.sum()
             nz = p[p > 0]
@@ -326,32 +281,27 @@ class MeshVQVAE(nn.Module):
         return (~pad_mask).to(z.dtype)
 
 
-def _masked_mse(a, b, valid):
-    """Mean squared error over the feature axis, averaged over valid faces."""
-    return (((a - b) ** 2).mean(dim=-1) * valid).sum() / valid.sum().clamp(min=1)
-
-
 class MeshVQVAEModule(L.LightningModule):
     """Stage-1 training: reconstruct a mesh's own faces through the codebook.
 
-    Loss is cross-entropy on the coordinate logits plus the quantizer's codebook
-    and commitment terms, exactly as the paper trains it end to end.
+    Loss is cross-entropy on the coordinate logits plus the quantizer's
+    commitment term, exactly as the paper trains it end to end.
 
-    The two terms are not commensurable -- `recon` is cross-entropy in nats
-    (order 3), `vq_loss` a raw MSE in `d_model` space summed over `depth`
-    residual stages (order 20 at d_model=256) -- so `vq_weight` scales the
-    quantizer side. Run mesh-vqvae-1 summed them unweighted and the codebook
-    term carried ~85% of the objective while the codebook collapsed from 511 to
-    52 live entries.
+    There is no weight on the quantizer side here: the codebook is updated by
+    EMA, not by gradient, so the only term that reaches this objective is the
+    commitment loss, already scaled by `commitment` inside `ResidualVQ`. Run
+    mesh-vqvae-1 instead added a raw codebook MSE in `d_model` space -- order 20
+    against a cross-entropy of order 3 -- which carried ~85% of the objective and
+    of `val_loss`, and is why that run's best checkpoint was epoch 0.
+    Monitor `val_recon_ce`, never `val_loss`.
     """
 
     def __init__(self, num_bins=NUM_BINS, codebook_size=1024, depth=3,
                  d_model=256, n_head=8, num_layers=4, dropout=0.1,
-                 max_faces=512, commitment=0.25, vq_weight=0.1, restart_every=100,
+                 max_faces=512, commitment=0.1, decay=0.8, rotation_trick=False,
                  lr=1e-4, lr_scheduler="none", lr_decay_steps=50, lr_decay_rate=0.5):
         super().__init__()
         self.save_hyperparameters()
-        self.vq_weight = vq_weight
         self.lr = lr
         self.lr_scheduler = lr_scheduler
         self.lr_decay_steps = lr_decay_steps
@@ -360,7 +310,7 @@ class MeshVQVAEModule(L.LightningModule):
             num_bins=num_bins, codebook_size=codebook_size, depth=depth,
             d_model=d_model, n_head=n_head, num_layers=num_layers,
             dropout=dropout, max_faces=max_faces, commitment=commitment,
-            restart_every=restart_every,
+            decay=decay, rotation_trick=rotation_trick,
         )
 
     def _shared_step(self, batch):
@@ -382,7 +332,7 @@ class MeshVQVAEModule(L.LightningModule):
         # stay comparable to mesh-vqvae-1/2; the per-stage ones are the diagnostic.
         per_stage = {f"codes_used_s{k}": torch.tensor(float(d))
                      for k, d in enumerate(stats["distinct_per_stage"])}
-        return recon + self.vq_weight * vq_loss, {
+        return recon + vq_loss, {
             "recon_ce": recon.detach(), "vq_loss": vq_loss.detach(),
             "bin_mae": err.mean(), "acc_1bin": (err <= 1).float().mean(),
             "codes_used": torch.tensor(float(stats["distinct"])),
