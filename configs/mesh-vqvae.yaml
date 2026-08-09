@@ -56,6 +56,13 @@ mesh_vqvae:
   # optimized toward being quantizable rather than reconstructable and the
   # codebook collapsed 511 -> 52 live entries by epoch 10. Sweep 0.03/0.1/0.3.
   vq_weight: 0.1
+  # Steps between restarts of codebook entries that went unused. Entries are
+  # also seeded from real encoder residuals on the first batch -- without that,
+  # they start ~1700x closer to the origin than the encoder output ever gets,
+  # argmin picks on rounding noise, and the few rows that win step 0 are the
+  # only ones that can ever receive gradient (mesh-vqvae-2: 28 live of 1024).
+  # Watch codes_used_s0/s1/s2, not just the pooled codes_used.
+  restart_every: 100
 
 training:
   # Items are single meshes here, not (LOD1, LOD2) pairs of 1800-token

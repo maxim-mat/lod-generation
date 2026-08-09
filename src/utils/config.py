@@ -182,6 +182,12 @@ class MeshVQVAEConfig:
     # the codebook term dominate both the gradient and any metric monitoring
     # it. Sweep this before touching the quantizer itself.
     vq_weight: float = 0.1
+    # Training steps between restarts of unused codebook entries. nn.Embedding's
+    # backward only reaches selected rows, so an entry that stops being chosen is
+    # frozen permanently; resampling it from live encoder residuals is the only
+    # way back. 0 disables the restart (the entries are still seeded from data
+    # on the first batch).
+    restart_every: int = 100
 
 @dataclass
 class EarlyStoppingConfig:

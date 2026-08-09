@@ -74,6 +74,7 @@ def train_mesh_vqvae(cfg: Config):
         max_faces=max_faces,
         commitment=cfg.mesh_vqvae.commitment,
         vq_weight=cfg.mesh_vqvae.vq_weight,
+        restart_every=cfg.mesh_vqvae.restart_every,
         lr=cfg.training.lr,
         lr_scheduler=cfg.training.lr_scheduler,
         lr_decay_steps=cfg.training.lr_decay_steps,

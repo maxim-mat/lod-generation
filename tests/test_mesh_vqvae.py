@@ -102,6 +102,69 @@ def test_usage_counts_distinct_codes():
     assert 1.0 < stats["perplexity"] < 3.0 + 1e-6
 
 
+def test_codebooks_are_seeded_from_encoder_outputs():
+    """Entries initialized near the origin are unreachable from a transformer
+    output: every candidate distance equals ||z|| to within rounding, argmin
+    picks on noise, and only the rows that win the first step ever get gradient
+    again (run mesh-vqvae-2 froze at 28 live entries of 1024 this way)."""
+    def nearest(model, z):
+        """Mean distance from each encoder output to its closest entry."""
+        d = torch.cdist(z.flatten(0, -2), model.codebooks[0].weight)
+        return float(d.min(dim=-1).values.mean())
+
+    model = _vqvae().eval()          # eval: quantize must not seed
+    z = model.encode(_coords())
+    before = nearest(model, z)
+    model.quantize(z)
+    assert not bool(model._initialized) and nearest(model, z) == before
+
+    model.train()
+    model.quantize(z)
+    assert bool(model._initialized)
+    # Entries are now drawn from z itself, so the nearest one sits on top of it.
+    assert nearest(model, z) < 0.1 * before
+
+
+def test_unused_entries_are_resampled_not_left_frozen():
+    """`nn.Embedding` backward only touches selected rows, so an entry that
+    stops being selected is frozen for good unless something resamples it."""
+    model = _vqvae(restart_every=1).train()
+    z = model.encode(_coords())
+    model.quantize(z)                       # seeds, then records usage
+    dead = model._usage[0] == 0
+    assert bool(dead.any()), "no unused entries; test cannot check the restart"
+
+    frozen = model.codebooks[0].weight[dead].clone()
+    model.quantize(z)                       # restart pass
+    assert not torch.allclose(model.codebooks[0].weight[dead], frozen)
+
+
+def test_a_frozen_codebook_is_never_resampled():
+    """Stage 2 holds the tokenizer as a submodule, so Lightning's per-epoch
+    `model.train()` recurses in and undoes the `eval()` it was constructed with.
+    Resampling there would rewrite the vocabulary the transformer is being
+    trained to predict, mid-run."""
+    model = _vqvae(restart_every=1).train()
+    z = model.encode(_coords())
+    model.quantize(z)                       # seeds while still trainable
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    before = model.codebooks[0].weight.clone()
+    model.quantize(z.detach())
+    assert torch.equal(model.codebooks[0].weight, before)
+
+
+def test_codebook_stats_reports_each_stage_separately():
+    """Pooling the stages hides the classic residual-VQ failure: stage 0 healthy
+    while every later stage has collapsed onto one entry."""
+    codes = torch.tensor([[0, 5, 5], [1, 5, 5], [2, 5, 5], [3, 5, 5]])   # [4 faces, 3 stages]
+    stats = _vqvae().codebook_stats(codes)
+    assert stats["distinct_per_stage"] == [4, 1, 1]
+    assert stats["perplexity_per_stage"][1] == 1.0
+    assert stats["distinct"] == 5           # pooled {0,1,2,3,5}, as before
+
+
 def test_tokenize_is_deterministic_in_eval():
     """Stage 2 trains on these codes; they must not move between epochs."""
     model, coords = _vqvae().eval(), _coords()
