@@ -51,6 +51,11 @@ mesh_vqvae:
   dropout: 0.1
   max_faces: null        # null = size it from the corpus's longest mesh
   commitment: 0.25       # van den Oord et al. (2017) standard value
+  # Scales the quantizer loss against the reconstruction cross-entropy. At 1.0
+  # (run mesh-vqvae-1) the codebook term was ~6x recon_ce, so the encoder was
+  # optimized toward being quantizable rather than reconstructable and the
+  # codebook collapsed 511 -> 52 live entries by epoch 10. Sweep 0.03/0.1/0.3.
+  vq_weight: 0.1
 
 training:
   # Items are single meshes here, not (LOD1, LOD2) pairs of 1800-token
@@ -66,17 +71,24 @@ training:
   lr_scheduler: "cosine"
   lr_decay_steps: 50
   lr_decay_rate: 0.5
+  # Monitor reconstruction, NOT val_loss. val_loss carries the quantizer term,
+  # which legitimately *rises* as the codebook commits -- in mesh-vqvae-1 its
+  # best value was epoch 0, before any training, so early stopping fired at
+  # epoch 10 and the restored checkpoint was the untrained model (test metrics
+  # came back identical to epoch-0 val). recon_ce was still falling monotonically
+  # when the run was killed. It is also the quantity this file's gate is
+  # written against.
   early_stopping:
     enabled: true
-    monitor: val_loss
+    monitor: val_recon_ce
     patience: 10
     mode: min
   checkpoint:
     enabled: true
-    monitor: val_loss
+    monitor: val_recon_ce
     mode: min
     save_top_k: 3
-    filename: "{epoch:02d}-{val_loss:.4f}"
+    filename: "{epoch:02d}-{val_recon_ce:.4f}"
 
 trainer:
   accelerator: auto

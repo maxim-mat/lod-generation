@@ -176,6 +176,12 @@ class MeshVQVAEConfig:
     # Weight on the term pulling the encoder toward the codebook
     # (van den Oord et al., 2017). 0.25 is the standard value.
     commitment: float = 0.25
+    # Weight on the whole quantizer loss where it meets the reconstruction
+    # cross-entropy. The two are in different units (nats vs. squared distance
+    # in d_model space, summed over `depth` stages), so an unweighted sum lets
+    # the codebook term dominate both the gradient and any metric monitoring
+    # it. Sweep this before touching the quantizer itself.
+    vq_weight: float = 0.1
 
 @dataclass
 class EarlyStoppingConfig:

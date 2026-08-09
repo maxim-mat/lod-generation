@@ -117,6 +117,19 @@ def test_module_training_step_returns_a_finite_loss():
     assert torch.isfinite(loss) and float(loss) > 0
 
 
+def test_vq_weight_scales_the_quantizer_term_only():
+    """`recon_ce` is cross-entropy in nats; `vq_loss` is a raw MSE in d_model
+    space summed over `depth` stages. Summing them unweighted let the codebook
+    term carry ~85% of the objective (run mesh-vqvae-1), so it needs a knob."""
+    module = MeshVQVAEModule(num_bins=NUM_BINS, codebook_size=CODEBOOK, depth=DEPTH,
+                             d_model=16, n_head=2, num_layers=1, dropout=0.0,
+                             vq_weight=0.1).eval()
+    batch = {"coords": _coords(), "pad_mask": torch.zeros(B, F, dtype=torch.bool)}
+    with torch.no_grad():
+        loss, metrics = module._shared_step(batch)
+    assert torch.allclose(loss, metrics["recon_ce"] + 0.1 * metrics["vq_loss"], atol=1e-6)
+
+
 def test_padded_faces_do_not_contribute_to_the_loss():
     """Buildings have different face counts; padding must not train the decoder."""
     module = MeshVQVAEModule(num_bins=NUM_BINS, codebook_size=CODEBOOK, depth=DEPTH,

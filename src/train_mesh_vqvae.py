@@ -73,6 +73,7 @@ def train_mesh_vqvae(cfg: Config):
         dropout=cfg.mesh_vqvae.dropout,
         max_faces=max_faces,
         commitment=cfg.mesh_vqvae.commitment,
+        vq_weight=cfg.mesh_vqvae.vq_weight,
         lr=cfg.training.lr,
         lr_scheduler=cfg.training.lr_scheduler,
         lr_decay_steps=cfg.training.lr_decay_steps,

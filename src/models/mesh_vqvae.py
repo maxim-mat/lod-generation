@@ -249,14 +249,22 @@ class MeshVQVAEModule(L.LightningModule):
 
     Loss is cross-entropy on the coordinate logits plus the quantizer's codebook
     and commitment terms, exactly as the paper trains it end to end.
+
+    The two terms are not commensurable -- `recon` is cross-entropy in nats
+    (order 3), `vq_loss` a raw MSE in `d_model` space summed over `depth`
+    residual stages (order 20 at d_model=256) -- so `vq_weight` scales the
+    quantizer side. Run mesh-vqvae-1 summed them unweighted and the codebook
+    term carried ~85% of the objective while the codebook collapsed from 511 to
+    52 live entries.
     """
 
     def __init__(self, num_bins=NUM_BINS, codebook_size=1024, depth=3,
                  d_model=256, n_head=8, num_layers=4, dropout=0.1,
-                 max_faces=512, commitment=0.25, lr=1e-4,
+                 max_faces=512, commitment=0.25, vq_weight=0.1, lr=1e-4,
                  lr_scheduler="none", lr_decay_steps=50, lr_decay_rate=0.5):
         super().__init__()
         self.save_hyperparameters()
+        self.vq_weight = vq_weight
         self.lr = lr
         self.lr_scheduler = lr_scheduler
         self.lr_decay_steps = lr_decay_steps
@@ -282,7 +290,7 @@ class MeshVQVAEModule(L.LightningModule):
 
         err = (logits[valid].argmax(-1) - coords[valid]).abs().float()
         stats = self.network.codebook_stats(codes[valid])
-        return recon + vq_loss, {
+        return recon + self.vq_weight * vq_loss, {
             "recon_ce": recon.detach(), "vq_loss": vq_loss.detach(),
             "bin_mae": err.mean(), "acc_1bin": (err <= 1).float().mean(),
             "codes_used": torch.tensor(float(stats["distinct"])),
