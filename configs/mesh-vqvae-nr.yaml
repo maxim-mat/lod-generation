@@ -66,20 +66,30 @@ training:
   lr_scheduler: "cosine"
   lr_decay_steps: 50
   lr_decay_rate: 0.5
-  # val_recon_ce, not val_loss -- though on this path they are equal, since the
-  # commitment term is dropped from the objective when the encoder is frozen.
-  # Keeping the name pinned means the stage-1 and stage-1b curves are comparable.
+  # val_noisy_recon_ce, NOT val_recon_ce. The Gumbel noise is gated on training
+  # mode, so an ordinary validation pass sees clean argmin codes -- which makes
+  # val_recon_ce a measurement of the one thing this stage is not optimizing.
+  # Monitoring it would early-stop the fine-tune exactly when it starts trading
+  # clean-code accuracy for robustness, which is the trade it exists to make,
+  # and save_top_k would keep whichever checkpoint had changed least from
+  # stage 1. val_noisy_recon_ce is the same cross-entropy measured through the
+  # noise, on a fixed draw so the curve compares like with like.
+  #
+  # val_recon_ce is still logged, and watching both is the point: robustness
+  # should cost a little clean-code accuracy, not all of it. If val_recon_ce
+  # runs away while val_noisy_recon_ce improves, noise_temp is too high and the
+  # decoder is learning to ignore the codes and read the condition instead.
   early_stopping:
     enabled: true
-    monitor: val_recon_ce
+    monitor: val_noisy_recon_ce
     patience: 5
     mode: min
   checkpoint:
     enabled: true
-    monitor: val_recon_ce
+    monitor: val_noisy_recon_ce
     mode: min
     save_top_k: 3
-    filename: "{epoch:02d}-{val_recon_ce:.4f}"
+    filename: "{epoch:02d}-{val_noisy_recon_ce:.4f}"
 
 trainer:
   accelerator: auto

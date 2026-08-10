@@ -163,7 +163,7 @@ def test_forward_accepts_the_continuous_condition():
 
 def test_shared_step_loss_is_finite_and_trains_the_transformer_only():
     m = _module()
-    loss, _, _ = m._shared_step(_batch())
+    loss, _, _, _ = m._shared_step(_batch())
     assert torch.isfinite(loss) and float(loss) > 0
 
     loss.backward()
@@ -201,6 +201,39 @@ def test_decode_tokens_survives_a_truncated_sequence():
         partial = torch.tensor([m.bos] + list(range(PER_FACE - 1)))
         verts, faces = m.decode_tokens(partial)
     assert faces.shape == (0, 3) and verts.shape == (0, 3)
+
+
+def test_decode_tokens_conditions_a_noise_resistant_decoder():
+    """Stage 1b fine-tunes the decoder *with* the LOD1 condition injected, so
+    stage 2 has to hand it back at decode time. Without this the fine-tuned
+    decoder runs at `cond=None` -- a train/inference mismatch that makes the
+    fine-tune worse than not doing it."""
+    vq = _vqvae()
+    vq.conditioned_decoder = True
+    m = MeshTransformerModule(num_bins=NUM_BINS, d_model=16, n_head=2,
+                              num_layers=1, dropout=0.0, max_seq_len=64,
+                              vqvae=vq).eval()
+    batch = _batch()
+    with torch.no_grad():
+        cond, tgt, cond_pad, _ = m._prepare(batch)
+        plain = m.decode_tokens(tgt[0])[0]
+        conditioned = m.decode_tokens(tgt[0], cond=cond[0][~cond_pad[0]])[0]
+    assert plain.shape == conditioned.shape
+    assert not np.allclose(plain, conditioned), "the condition never reached the decoder"
+
+
+def test_a_plain_decoder_ignores_a_condition():
+    """A stage-1 decoder that never saw a condition has untrained `cond_proj`
+    and `segment_embed` weights. Feeding it one would inject random vectors
+    into the decoder input, so the flag -- not the caller -- decides."""
+    m = _module().eval()
+    assert m.vqvae.conditioned_decoder is False
+    batch = _batch()
+    with torch.no_grad():
+        cond, tgt, cond_pad, _ = m._prepare(batch)
+        plain = m.decode_tokens(tgt[0])[0]
+        offered = m.decode_tokens(tgt[0], cond=cond[0][~cond_pad[0]])[0]
+    assert np.array_equal(plain, offered), "an untrained condition path was used"
 
 
 def test_generate_emits_code_tokens_within_the_vocabulary():

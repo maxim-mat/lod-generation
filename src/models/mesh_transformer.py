@@ -323,11 +323,19 @@ class MeshTransformerModule(L.LightningModule):
         # A face survives only if all nine of its coordinates are real.
         return coords, pad_mask.reshape(tokens.shape[0], -1, 9).any(dim=-1)
 
-    def decode_tokens(self, tokens):
+    def decode_tokens(self, tokens, cond=None):
         """A generated sequence to ``(verts, faces)`` in the unit box.
 
         The one place that knows which tokenizer produced the sequence, so
         `run_mesh_eval` does not have to.
+
+        Args:
+            tokens: [L] ids for one mesh.
+            cond: optional [Fc, d] encoded LOD1 features for *this* mesh, with
+                padding already trimmed. Used only when the VQ-VAE's decoder was
+                fine-tuned with a condition (`conditioned_decoder`); a plain
+                stage-1 decoder has untrained condition weights, so handing it
+                one would corrupt the decode rather than sharpen it.
         """
         # Callers hand this CPU tensors (the coordinate path is numpy anyway);
         # the VQ-VAE decode below is a forward pass on this module's device.
@@ -342,10 +350,21 @@ class MeshTransformerModule(L.LightningModule):
         codes = codes[: len(codes) - len(codes) % per_face]
         if len(codes) == 0:
             return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
-        return self.vqvae.detokenize(codes.reshape(-1, 3, depth))
+
+        if cond is not None and self.vqvae.conditioned_decoder:
+            cond = torch.as_tensor(cond).to(self.device)
+            cond = cond[None] if cond.dim() == 2 else cond
+        else:
+            cond = None
+        return self.vqvae.detokenize(codes.reshape(-1, 3, depth), cond=cond)
 
     def _shared_step(self, batch):
-        """Returns (loss, logits, targets); targets are PAD where masked out."""
+        """Returns (loss, logits, targets, cond); targets are PAD where masked out.
+
+        ``cond`` comes back because the noise-resistant decoder needs it at
+        decode time and recomputing `_prepare` to get it would re-run the
+        tokenizer.
+        """
         cond, tgt, cond_pad_mask, tgt_pad_mask = self._prepare(batch)
         logits = self.network(cond, tgt, cond_pad_mask, tgt_pad_mask)
 
@@ -360,7 +379,7 @@ class MeshTransformerModule(L.LightningModule):
             logits.reshape(-1, logits.shape[-1]), targets.reshape(-1),
             ignore_index=self.pad,
         )
-        return loss, logits, targets
+        return loss, logits, targets, (cond, cond_pad_mask)
 
     def _token_metrics(self, logits, targets, scale=None):
         """Teacher-forced token statistics. Pure tensor ops -- no host sync.
@@ -436,7 +455,21 @@ class MeshTransformerModule(L.LightningModule):
             self.log(f"{prefix}_{name}", value, on_step=on_step, on_epoch=True,
                      prog_bar=name in ("token_acc", "coord_mae_m"))
 
-    def _log_tf_chamfer(self, logits, targets, batch, prefix, batch_idx, stride):
+    def _item_cond(self, condition, i):
+        """The [Fc, d] condition for item ``i``, unpadded, or None.
+
+        None on the coordinate path (ids, not features) and whenever the decoder
+        was not fine-tuned to expect one.
+        """
+        cond, cond_pad = condition if condition else (None, None)
+        if cond is None or not cond.is_floating_point():
+            return None
+        if self.vqvae is None or not self.vqvae.conditioned_decoder:
+            return None
+        return cond[i] if cond_pad is None else cond[i][~cond_pad[i]]
+
+    def _log_tf_chamfer(self, logits, targets, batch, prefix, batch_idx, stride,
+                        condition=None):
         """Surface distance between the teacher-forced decode and its target.
 
         Read this as *the metric size of a typical token error*, not as
@@ -459,8 +492,9 @@ class MeshTransformerModule(L.LightningModule):
 
         center = batch["center"][i].detach().cpu().numpy()
         scale = batch["scale"][i].detach().cpu().numpy()
-        gen = self.decode_tokens(pred[real].detach())
-        ref = self.decode_tokens(targets[i][real].detach())
+        item_cond = self._item_cond(condition, i)
+        gen = self.decode_tokens(pred[real].detach(), cond=item_cond)
+        ref = self.decode_tokens(targets[i][real].detach(), cond=item_cond)
         if len(gen[1]) == 0 or len(ref[1]) == 0:
             return
 
@@ -472,21 +506,23 @@ class MeshTransformerModule(L.LightningModule):
                      batch_size=logits.shape[0])
 
     def training_step(self, batch, batch_idx):
-        loss, logits, targets = self._shared_step(batch)
+        loss, logits, targets, condition = self._shared_step(batch)
         self._log_token_metrics(loss, logits, targets, batch, "train", on_step=True)
         # Strided on train only: every step would stall the pipeline on a sync.
         # `_trainer`, not `trainer`: the property raises when detached, which a
         # unit test calling training_step directly always is.
         trainer = getattr(self, "_trainer", None)
         stride = trainer.log_every_n_steps if trainer is not None else 0
-        self._log_tf_chamfer(logits, targets, batch, "train", batch_idx, stride)
+        self._log_tf_chamfer(logits, targets, batch, "train", batch_idx, stride,
+                             condition)
         return loss
 
     def _eval_step(self, batch, prefix, batch_idx=0):
-        loss, logits, targets = self._shared_step(batch)
+        loss, logits, targets, condition = self._shared_step(batch)
         self._log_token_metrics(loss, logits, targets, batch, prefix, on_step=False)
         # Every eval batch: one sample each, and eval is not on the hot path.
-        self._log_tf_chamfer(logits, targets, batch, prefix, batch_idx, stride=1)
+        self._log_tf_chamfer(logits, targets, batch, prefix, batch_idx, stride=1,
+                             condition=condition)
         return loss
 
     def validation_step(self, batch, batch_idx):

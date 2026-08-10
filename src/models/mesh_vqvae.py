@@ -95,8 +95,13 @@ class MeshVQVAE(nn.Module):
     def __init__(self, num_bins=NUM_BINS, codebook_size=1024, depth=3,
                  d_model=256, n_head=8, num_layers=4, dropout=0.1,
                  max_faces=512, commitment=0.1, decay=0.8, rotation_trick=False,
-                 codebook_dim=None):
+                 codebook_dim=None, conditioned_decoder=False):
         super().__init__()
+        # True once the noise-resistant fine-tune has trained the decoder with a
+        # condition. Callers must not feed one otherwise: `cond_proj` and
+        # `segment_embed` would still be at their initialization, so offering a
+        # condition to a plain stage-1 decoder injects noise into its input.
+        self.conditioned_decoder = conditioned_decoder
         self.num_bins = num_bins
         self.codebook_size = codebook_size
         self.depth = depth
@@ -482,11 +487,18 @@ class MeshVQVAEModule(L.LightningModule):
         self.lr_decay_rate = lr_decay_rate
         self.noise_resistant = noise_resistant
         self.noise_temp = noise_temp
+        # Fixes the Gumbel draw behind `noisy_recon_ce`, so that metric measures
+        # the decoder rather than the sample. Not the run seed: this must stay
+        # the same across epochs, and across a resume.
+        self.noise_seed = 20260810
         self.network = MeshVQVAE(
             num_bins=num_bins, codebook_size=codebook_size, depth=depth,
             d_model=d_model, n_head=n_head, num_layers=num_layers,
             dropout=dropout, max_faces=max_faces, commitment=commitment,
             decay=decay, rotation_trick=rotation_trick, codebook_dim=codebook_dim,
+            # Carried in the hyperparameters, so a checkpoint knows whether its
+            # decoder expects a condition and stage 2 does not have to be told.
+            conditioned_decoder=noise_resistant,
         )
         if noise_resistant:
             # Everything the codes depend on. `pos_embed` is shared with the
@@ -559,13 +571,48 @@ class MeshVQVAEModule(L.LightningModule):
         self._log({"loss": loss.detach(), **metrics}, "train", on_step=True)
         return loss
 
-    def validation_step(self, batch, batch_idx):
+    @torch.no_grad()
+    def _noisy_recon_ce(self, batch):
+        """Reconstruction cross-entropy from *noised* codes.
+
+        `gumbel_sample` gates on the codebook module's training flag, so an
+        ordinary validation pass sees clean argmin codes however high
+        `noise_temp` is set -- which makes `val_recon_ce` a measurement of the
+        one thing this fine-tune is not optimizing. Running the quantizer in
+        train mode for one extra pass is what un-gates the noise.
+
+        Safe because the EMA is gated separately, on whether anything can move
+        the encoder: `quantize` computes `freeze_codebook` from
+        `encoder.requires_grad`, which the fine-tune has already turned off.
+        """
+        quantizer = self.network.quantizer
+        was_training = quantizer.training
+        rng = torch.random.get_rng_state()
+        try:
+            quantizer.train()
+            # A fixed draw, so epoch-to-epoch movement in this metric is the
+            # decoder improving rather than the sample changing under it.
+            torch.manual_seed(self.noise_seed)
+            return self._shared_step(batch)[1]["recon_ce"]
+        finally:
+            quantizer.train(was_training)
+            torch.random.set_rng_state(rng)
+
+    def _eval_metrics(self, batch):
+        """``(loss, metrics)`` for a validation or test batch."""
         loss, metrics = self._shared_step(batch)
+        if self.noise_resistant:
+            # What `mesh-vqvae-nr.yaml` monitors. See `_noisy_recon_ce`.
+            metrics["noisy_recon_ce"] = self._noisy_recon_ce(batch)
+        return loss, metrics
+
+    def validation_step(self, batch, batch_idx):
+        loss, metrics = self._eval_metrics(batch)
         self._log({"loss": loss.detach(), **metrics}, "val", on_step=False)
         return loss
 
     def test_step(self, batch, batch_idx):
-        loss, metrics = self._shared_step(batch)
+        loss, metrics = self._eval_metrics(batch)
         self._log({"loss": loss.detach(), **metrics}, "test", on_step=False)
         return loss
 

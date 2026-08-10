@@ -397,6 +397,89 @@ def test_noise_resistant_leaves_the_codebook_alone():
     assert torch.allclose(module.network.quantizer.codebooks, before, atol=1e-4)
 
 
+def _nr_module(**kw):
+    return MeshVQVAEModule(num_bins=NUM_BINS, codebook_size=CODEBOOK, depth=DEPTH,
+                           d_model=16, n_head=2, num_layers=1, dropout=0.0,
+                           noise_resistant=True, noise_temp=1e3, **kw)
+
+
+def _nr_batch():
+    return {"coords": _coords(), "pad_mask": torch.zeros(B, F, dtype=torch.bool),
+            "cond": _coords(), "cond_pad_mask": torch.zeros(B, F, dtype=torch.bool)}
+
+
+def _warm(module, batch):
+    """One pass to get `kmeans_init` out of the way.
+
+    That init is stochastic and rewrites the codebook, so anything measuring
+    determinism or RNG hygiene has to happen after it -- in a real run it fires
+    on the first training batch, long before any validation.
+    """
+    module._eval_metrics(batch)
+    return module
+
+
+def test_noise_resistant_reports_reconstruction_from_noised_codes():
+    """`val_recon_ce` is measured with clean argmin codes -- the Gumbel noise is
+    gated on training mode, so validation never sees it. Monitoring that would
+    early-stop the fine-tune exactly when it begins trading clean-code accuracy
+    for the robustness it exists to buy, so the noisy figure is reported too."""
+    module, batch = _nr_module().eval(), _nr_batch()
+    _, metrics = _warm(module, batch)._eval_metrics(batch)
+    assert "noisy_recon_ce" in metrics
+    assert torch.isfinite(metrics["noisy_recon_ce"])
+    # Only that it differs, not that it is worse: an untrained decoder emits
+    # near-uniform logits whatever codes it is handed, so the *direction* is
+    # meaningless here. Differing at all is what proves the noise reached the
+    # quantizer; `test_sample_temp_perturbs_codes_only_while_training` pins the
+    # mechanism.
+    assert not torch.equal(metrics["noisy_recon_ce"], metrics["recon_ce"])
+
+
+def test_the_noisy_metric_is_not_a_random_variable():
+    """Seeded, so the early-stopping curve compares like with like. An unseeded
+    draw would make every epoch's value partly noise and the patience counter
+    fire on sampling luck."""
+    module, batch = _nr_module().eval(), _nr_batch()
+    _warm(module, batch)
+    a = module._eval_metrics(batch)[1]["noisy_recon_ce"]
+    b = module._eval_metrics(batch)[1]["noisy_recon_ce"]
+    assert torch.equal(a, b)
+
+
+def test_measuring_the_noisy_metric_does_not_disturb_training_rng():
+    """It runs the quantizer in train mode to un-gate the noise, so it has to
+    put both the module mode and the global RNG stream back."""
+    module, batch = _nr_module().eval(), _nr_batch()
+    _warm(module, batch)
+    quantizer = module.network.quantizer
+    torch.manual_seed(7)
+    before_state = torch.random.get_rng_state()
+    module._eval_metrics(batch)
+    assert torch.equal(torch.random.get_rng_state(), before_state), "RNG stream moved"
+    assert not quantizer.training, "quantizer left in train mode"
+
+
+def test_the_noisy_pass_does_not_move_the_codebook():
+    """Un-gating the noise means running the quantizer in train mode, which is
+    also what un-gates the EMA. The freeze has to hold through it."""
+    module = _nr_module()
+    book = module.network.quantizer.layers[0]._codebook
+    module._eval_metrics(_nr_batch())            # seeds
+    sizes = book.cluster_size.clone()
+    module._eval_metrics(_nr_batch())
+    assert torch.equal(book.cluster_size, sizes)
+
+
+def test_plain_stage_one_reports_no_noisy_metric():
+    """Nothing to be robust to when the codes are argmin anyway."""
+    module = MeshVQVAEModule(num_bins=NUM_BINS, codebook_size=CODEBOOK, depth=DEPTH,
+                             d_model=16, n_head=2, num_layers=1, dropout=0.0)
+    _, metrics = module._eval_metrics({"coords": _coords(),
+                                       "pad_mask": torch.zeros(B, F, dtype=torch.bool)})
+    assert "noisy_recon_ce" not in metrics
+
+
 def test_noise_resistant_needs_a_condition():
     """Fine-tuning without one would silently train an unconditioned decoder --
     the paper's whole point is that the condition is what corrects bad codes."""

@@ -226,3 +226,6 @@ __marimo__/
 AGENTS.md
 CLAUDE.md
 /.memsearch
+# Pipeline stage logs (run_pipeline.sh)
+logs/
+pipeline.out

@@ -54,9 +54,14 @@ def _n_polygons(cj):
     return len(next(iter(cj["CityObjects"].values()))["geometry"][0]["boundaries"][0])
 
 
-def _to_metres(model, tokens, center, scale):
-    """Decode through whichever tokenizer the model was built with."""
-    verts, faces = model.decode_tokens(tokens)
+def _to_metres(model, tokens, center, scale, cond=None):
+    """Decode through whichever tokenizer the model was built with.
+
+    ``cond`` is this mesh's encoded LOD1 features, handed back to a
+    noise-resistant decoder that was fine-tuned with them; `decode_tokens`
+    drops it for any other decoder.
+    """
+    verts, faces = model.decode_tokens(tokens, cond=cond)
     return verts * scale + center, faces
 
 
@@ -121,10 +126,11 @@ def run_mesh_eval(model, dataset, indices, cfg, max_new_tokens, seed=1234,
             scale = batch["scale"][k].cpu().numpy()
             tokens = out[k].cpu()
 
-            gen = _to_metres(model, tokens, centre, scale)
+            item_cond = model._item_cond((cond, cond_pad), k)
+            gen = _to_metres(model, tokens, centre, scale, item_cond)
             # The reference is the ground truth through the *same* tokenizer, so
             # the comparison isolates model error from tokenizer loss.
-            ref = _to_metres(model, tgt[k].cpu(), centre, scale)
+            ref = _to_metres(model, tgt[k].cpu(), centre, scale, item_cond)
 
             row = mesh_metrics(gen, ref, taus=tuple(cfg.taus),
                                n_points=cfg.n_points, voxel_m=cfg.voxel_m)

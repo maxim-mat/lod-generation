@@ -62,17 +62,27 @@ training:
   lr_scheduler: "cosine"
   lr_decay_steps: 50
   lr_decay_rate: 0.5
+  # NOT val_loss. Cross-entropy over nominal code ids rises through confidence
+  # rather than error: in run mesh-3 it went 2.651 -> 3.063 over epochs 9-19
+  # while val_token_acc stayed flat (0.4349 -> 0.4355) and val_tf_chamfer_m
+  # actually improved (0.381 -> 0.371). Monitoring it early-stops on calibration
+  # and saves the least-confident checkpoint rather than the best one.
+  #
+  # val_gen_chamfer_m would be the honest geometric choice but is gated to
+  # every_n_epochs, and EarlyStopping breaks on a metric missing most epochs.
+  # val_token_acc and val_tf_chamfer_m are both logged every validation epoch;
+  # accuracy is the less noisy of the two (tf_chamfer is one sample per batch).
   early_stopping:
     enabled: true
-    monitor: val_loss
+    monitor: val_token_acc
     patience: 10
-    mode: min
+    mode: max
   checkpoint:
     enabled: true
-    monitor: val_loss
-    mode: min
+    monitor: val_token_acc
+    mode: max
     save_top_k: 3
-    filename: "{epoch:02d}-{val_loss:.4f}"
+    filename: "{epoch:02d}-{val_token_acc:.4f}"
 
 trainer:
   accelerator: auto
