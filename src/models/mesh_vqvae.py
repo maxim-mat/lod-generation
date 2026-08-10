@@ -225,23 +225,42 @@ class MeshVQVAE(nn.Module):
         """
         coords = self._batched(coords)
         b, f, _ = coords.shape
-        ids = torch.zeros((b, f, VERTS_PER_FACE), dtype=torch.long, device=coords.device)
-        counts = torch.zeros(b, dtype=torch.long, device=coords.device)
-        for i in range(b):
-            verts = coords[i].reshape(-1, 3)
-            keep = (None if pad_mask is None
-                    else (~pad_mask[i]).repeat_interleave(VERTS_PER_FACE))
-            # A padded face's coordinates are arbitrary; letting them define
-            # vertices would shift the indices of the real ones.
-            uniq, inverse = torch.unique(verts if keep is None else verts[keep],
-                                         dim=0, return_inverse=True)
-            counts[i] = len(uniq)
-            flat = ids[i].reshape(-1)
-            if keep is None:
-                flat[:] = inverse
-            else:
-                flat[keep] = inverse
-                flat[~keep] = len(uniq)          # the pad vertex
+        nb = self.num_bins
+        # Clamped only against key aliasing: an out-of-range coordinate would
+        # overflow its digit and collide with a different vertex. The callers
+        # already keep coordinates on the grid, so this never bites in practice.
+        v = coords.clamp(0, nb - 1).reshape(b, f, VERTS_PER_FACE, 3)
+
+        # One integer key per vertex, monotone in (x, y, z) lexicographic order
+        # -- which is exactly the order `torch.unique(dim=0)` produces. That is
+        # what makes this a drop-in for the per-mesh loop it replaces: the ids
+        # come out identical, not merely equivalent up to relabelling.
+        key = (v[..., 0] * nb + v[..., 1]) * nb + v[..., 2]
+
+        # Offset per mesh so two meshes never share a vertex, reserving the slot
+        # just above each mesh's range for its padded faces. A padded face's
+        # coordinates are arbitrary; letting them define vertices would shift the
+        # indices of the real ones.
+        stride = nb ** 3 + 1
+        mesh = torch.arange(b, device=coords.device)[:, None, None]
+        key = key + mesh * stride
+        if pad_mask is not None:
+            key = torch.where(pad_mask[:, :, None], mesh * stride + nb ** 3, key)
+
+        uniq, inverse = torch.unique(key.reshape(-1), return_inverse=True)
+        ids = inverse.reshape(b, f, VERTS_PER_FACE)
+
+        # `unique` sorts, and the keys are mesh-ordered, so each mesh's ids form
+        # a contiguous ascending block. Subtracting the block start turns the
+        # global numbering back into the per-mesh one.
+        per_mesh = torch.bincount(uniq // stride, minlength=b)
+        ids = ids - (torch.cumsum(per_mesh, 0) - per_mesh)[:, None, None]
+
+        # The reserved key is the largest in its mesh, so it sorts last: the pad
+        # vertex lands at exactly `counts`, one past the real ones.
+        counts = per_mesh
+        if pad_mask is not None:
+            counts = per_mesh - pad_mask.any(dim=1).long()
         return ids, counts
 
     def quantize(self, z, faces, counts=None, pad_mask=None, sample_temp=0.0):

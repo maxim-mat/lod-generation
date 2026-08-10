@@ -54,7 +54,7 @@ mesh_vqvae:
 training:
   # Items are single buildings here, not both LODs, so an epoch is half the
   # length of the stage-1 run's at the same batch size.
-  batch_size: 64
+  batch_size: 512
   train_val_test_split:
     - 0.8
     - 0.1

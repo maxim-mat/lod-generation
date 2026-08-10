@@ -1,18 +1,19 @@
 # LOD1-conditioned mesh transformer over VQ-VAE codes (MeshAnything, arXiv:2406.10163)
-# Usage: python main.py --train --config configs/mesh3-train.yaml
+# Usage: python main.py --train --config configs/mesh4-train.yaml
 #
 # Stage 2. Requires a trained stage-1 checkpoint from configs/mesh-vqvae.yaml --
 # set mesh_model.vqvae_ckpt below before running, there is no default that works.
 #
-# SUPERSEDED by configs/mesh4-train.yaml, which carries the width and batch size
-# run mesh-3 actually used (d_model 512, batch 32). Kept for reference only.
+# Supersedes mesh3-train.yaml, at the width and batch size run mesh-3 actually
+# used (d_model 512, batch 32) rather than what that file on disk said.
 #
 # What changes vs mesh-1/mesh-2: the target is codes rather than coordinates,
 # and the LOD1 condition goes through the same VQ-VAE encoder *unquantized*.
 # Quantizing the condition would only discard precision on an input that is
 # never sampled; see the design spec. The sequence is the same length either
 # way -- quantization is per vertex, so a face costs 3 vertices x depth 3 = 9
-# tokens, exactly what 9 coordinates cost.
+# tokens, exactly what 9 coordinates cost. The codebook buys a learned
+# vocabulary and a decoder that tolerates imperfect codes, not compression.
 #
 # Coordinate-token metrics (bin_mae, bin_mae_x/y/z, coord_mae_m, acc_1bin) do
 # not exist on this path -- a code id is a nominal label, so |code_a - code_b|
@@ -46,7 +47,7 @@ mesh_data:
 
 # Transformer settings (MeshModelConfig)
 mesh_model:
-  d_model: 256
+  d_model: 512
   n_head: 8
   num_layers: 6
   dropout: 0.1
@@ -56,7 +57,7 @@ mesh_model:
   vqvae_ckpt: null
 
 training:
-  batch_size: 8          # sequences are long; attention is quadratic in length
+  batch_size: 32          # sequences are long; attention is quadratic in length
   train_val_test_split:
     - 0.8
     - 0.1
@@ -100,7 +101,7 @@ logging:
     - wandb
   project_name: lod-generation
   experiment_name: initial-runs
-  run_name: mesh-3
+  run_name: mesh-4
   save_dir: outputs
   wandb_entity: maxim-lod
   wandb_offline: false

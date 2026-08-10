@@ -54,9 +54,13 @@ mesh_vqvae:
   codebook_size: 1024
   depth: 3               # codes per *vertex*; x3 vertices = 9 tokens per face
   d_model: 256
-  # Narrower than d_model, at MeshGPT's 192/512 ratio. Stage 2 embeds a code by
+  # Width of the code vectors, independent of d_model. Stage 2 embeds a code by
   # projecting this vector, so it is also that projection's input width.
-  codebook_dim: 96
+  # MeshGPT's dim_codebook is 192 against a model dim of 512; this takes the
+  # absolute number rather than the ratio, so at d_model 256 the codebook is
+  # 75% of the model width instead of their 37.5%. Deliberate -- ~96 would be
+  # the ratio-matched value if the codes turn out to be over-provisioned.
+  codebook_dim: 192
   n_head: 8
   num_layers: 4          # encoder and decoder each
   dropout: 0.1
@@ -71,19 +75,25 @@ mesh_vqvae:
   commitment: 0.1
   decay: 0.8             # codebook EMA decay
   # Rotation trick (arXiv:2410.06424) in place of the straight-through
-  # estimator. Off = what MeshAnything actually did; the paper postdates it.
-  # Worth an A/B once there is a settled baseline to compare against: its
-  # reported win is an order of magnitude on quantization error, which is the
-  # side that matters here (recon_ce / bin_mae), since codebook usage is
-  # already healthy with kmeans_init + EMA + dead-code revival.
-  rotation_trick: false
+  # estimator: the gradient at the code is rotated onto the encoder output
+  # rather than copy-pasted. ON here, which is a deliberate departure from
+  # MeshAnything -- that paper predates it. lucidrains/meshgpt-pytorch does
+  # pass rotation_trick=True on current main, but that also postdates
+  # MeshAnything, so it is not evidence of what the paper ran.
+  #
+  # Its reported win is an order of magnitude on quantization error, which is
+  # the side that matters here (recon_ce / bin_mae). Note it cannot be A/B'd by
+  # inspecting the quantizer alone: it changes only the gradient reaching the
+  # encoder, so any forward-only comparison shows nothing. Judge it on
+  # val_recon_ce against a rotation_trick: false run.
+  rotation_trick: true
   # Stage 1b lives in configs/mesh-vqvae-nr.yaml, not here.
   noise_resistant: false
 
 training:
   # Items are single meshes here, not (LOD1, LOD2) pairs of 1800-token
-  # sequences, so this can be far larger than the transformer's 8.
-  batch_size: 64
+  # sequences, so this can be far larger than the transformer's 32.
+  batch_size: 512
   train_val_test_split:
     - 0.8
     - 0.1
@@ -124,7 +134,7 @@ logging:
     - wandb
   project_name: lod-generation
   experiment_name: initial-runs
-  run_name: mesh-vqvae-1
+  run_name: mesh-vqvae-4
   save_dir: outputs
   wandb_entity: maxim-lod
   wandb_offline: false
