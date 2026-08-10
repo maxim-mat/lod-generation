@@ -149,8 +149,15 @@ def create_callbacks(cfg: Config, save_dir: Path) -> list:
             verbose=True,
         ))
         
-    # LR Monitor
-    callbacks.append(LearningRateMonitor(logging_interval="step"))
+    # LR Monitor -- only when there is somewhere to write it. Lightning does not
+    # ignore a logger-less LearningRateMonitor, it refuses the run:
+    #   MisconfigurationException: Cannot use `LearningRateMonitor` callback
+    #   with `Trainer` that has no logger.
+    # `logging.loggers: []` is a legitimate configuration (the pipeline's smoke
+    # mode uses it so a throwaway run creates no wandb run), and create_loggers
+    # returns [] for it, which train() passes to the Trainer as logger=False.
+    if cfg.logging.loggers:
+        callbacks.append(LearningRateMonitor(logging_interval="step"))
     
     # Rich Progress Bar
     try:

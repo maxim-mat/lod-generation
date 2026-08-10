@@ -23,6 +23,61 @@ def test_callback_present_when_enabled(tmp_path):
     assert "GenerativeEvalCallback" in names
 
 
+def test_lr_monitor_is_skipped_when_there_is_no_logger(tmp_path):
+    """`LearningRateMonitor` has nowhere to write when `logging.loggers` is
+    empty, and Lightning refuses the Trainer outright rather than ignoring it:
+
+        MisconfigurationException: Cannot use `LearningRateMonitor` callback
+        with `Trainer` that has no logger.
+
+    An empty logger list is a legitimate configuration -- the pipeline's smoke
+    mode uses it so a throwaway run creates no wandb run -- so the callback has
+    to be conditional on there being something to log to.
+    """
+    cfg = Config()
+    cfg.logging.loggers = []
+    assert "LearningRateMonitor" not in [type(c).__name__ for c in create_callbacks(cfg, tmp_path)]
+
+    cfg.logging.loggers = ["tensorboard"]
+    assert "LearningRateMonitor" in [type(c).__name__ for c in create_callbacks(cfg, tmp_path)]
+
+
+def test_a_loggerless_fit_survives_the_callbacks(tmp_path):
+    """The check that actually reproduces the failure.
+
+    Lightning validates this in `LearningRateMonitor.setup`, which runs on
+    `fit` -- not on `Trainer(...)`. An earlier version of this test only built
+    the Trainer and passed while the bug was still present.
+    """
+    import lightning as L
+    from torch.utils.data import DataLoader, TensorDataset
+
+    class Tiny(L.LightningModule):
+        def __init__(self):
+            super().__init__()
+            self.layer = torch.nn.Linear(1, 1)
+
+        def training_step(self, batch, _):
+            return self.layer(batch[0]).square().mean()
+
+        def configure_optimizers(self):
+            return torch.optim.SGD(self.parameters(), lr=0.1)
+
+    cfg = Config()
+    cfg.logging.loggers = []
+    cfg.generative_eval.enabled = False
+    # This module logs nothing, and the default config's early stopping watches
+    # a diffusion metric. Off, so the test fails only on the logger question.
+    cfg.training.early_stopping.enabled = False
+    loader = DataLoader(TensorDataset(torch.zeros(2, 1)), batch_size=1)
+    # No enable_* overrides: create_callbacks supplies the checkpoint and
+    # progress bar itself, and Lightning rejects a Trainer that disables what
+    # its callback list contains. This is the real configuration.
+    L.Trainer(logger=False, callbacks=create_callbacks(cfg, tmp_path), max_epochs=1,
+              accelerator="cpu", devices=1,
+              default_root_dir=str(tmp_path)).fit(Tiny(), loader)
+
+
 def test_face_centroid_consistency_zero_when_centered():
     # 3 vertices + 1 face node sitting exactly at their centroid
     coords = np.array([[0, 0, 0], [3, 0, 0], [0, 3, 0], [1, 1, 0]], dtype=float)
