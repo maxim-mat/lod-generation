@@ -253,7 +253,9 @@ class MeshTransformerModule(L.LightningModule):
         The one place that knows which tokenizer produced the sequence, so
         `run_mesh_eval` does not have to.
         """
-        tokens = torch.as_tensor(tokens).reshape(-1)
+        # Callers hand this CPU tensors (the coordinate path is numpy anyway);
+        # the VQ-VAE decode below is a forward pass on this module's device.
+        tokens = torch.as_tensor(tokens).reshape(-1).to(self.device)
         if self.vqvae is None:
             return detokenize(tokens.cpu().numpy(), self.num_bins)
 
