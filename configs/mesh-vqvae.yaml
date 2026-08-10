@@ -7,8 +7,16 @@
 #
 # Success is NOT "beat the coordinate tokenizer" -- the decoder predicts logits
 # over the same 128 bins, so its reconstruction ceiling is that tokenizer's
-# measured 0.107 m chamfer plus whatever the codebook loses. What is being
-# bought is 9 -> 3 tokens per face and a decoder that tolerates imperfect codes.
+# measured 0.107 m chamfer plus whatever the codebook loses. What is bought is a
+# decoder that tolerates imperfect codes; there is no token compression, because
+# quantization is per vertex (3 vertices x depth 3 = 9 tokens per face, the
+# reference's `face_per_token = num_quantizers * 3`).
+#
+# The earlier per-face variant gave 3 tokens per face and looked like a win
+# until it was measured: 3 codes carrying 9 coordinates is a bottleneck 2x
+# narrower than the data, and run mesh-vqvae-3 bottomed out at 0.246 m -- which
+# then capped stage-2 run mesh-3 no matter how well it predicted.
+#
 # Gate: val reconstruction within ~0.15 m, and a codebook actually in use --
 # watch val_codes_used and val_codebook_ppl, not just the loss.
 
@@ -44,8 +52,11 @@ mesh_vqvae:
   # from val_codes_used -- raise it if usage saturates, lower it if most entries
   # never fire.
   codebook_size: 1024
-  depth: 3               # codes per face; the paper's setting, 3x compression
+  depth: 3               # codes per *vertex*; x3 vertices = 9 tokens per face
   d_model: 256
+  # Narrower than d_model, at MeshGPT's 192/512 ratio. Stage 2 embeds a code by
+  # projecting this vector, so it is also that projection's input width.
+  codebook_dim: 96
   n_head: 8
   num_layers: 4          # encoder and decoder each
   dropout: 0.1
@@ -66,6 +77,8 @@ mesh_vqvae:
   # side that matters here (recon_ce / bin_mae), since codebook usage is
   # already healthy with kmeans_init + EMA + dead-code revival.
   rotation_trick: false
+  # Stage 1b lives in configs/mesh-vqvae-nr.yaml, not here.
+  noise_resistant: false
 
 training:
   # Items are single meshes here, not (LOD1, LOD2) pairs of 1800-token

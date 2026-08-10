@@ -45,15 +45,53 @@ class _FaceView(Dataset):
         return tokens.reshape(-1, 9)
 
 
-def face_collate_fn(batch):
-    """Right-pad to the longest mesh; ``pad_mask`` is True at padded faces."""
-    width = max(len(faces) for faces in batch)
-    coords = torch.zeros((len(batch), width, 9), dtype=torch.long)
-    mask = torch.ones((len(batch), width), dtype=torch.bool)
-    for i, faces in enumerate(batch):
+class _PairView(Dataset):
+    """One item per building: its LOD2 mesh, with its LOD1 mesh as condition.
+
+    For the noise-resistant decoder fine-tune (arXiv:2406.10163 section 4.2),
+    which needs the shape condition alongside the mesh being reconstructed.
+
+    LOD2 only, unlike `_FaceView`, because that is all stage 2 ever decodes --
+    the LOD1 condition is encoded, never quantized. Serving LOD1 items here too
+    would hand the decoder a batch where condition and target are the same mesh,
+    and it would learn to copy the condition instead of correcting bad codes.
+    """
+
+    def __init__(self, split):
+        self.split = split
+
+    def __len__(self):
+        return len(self.split)
+
+    def __getitem__(self, index):
+        item = self.split[index]
+        return {"coords": item["tgt"][1:-1].reshape(-1, 9),   # strip BOS/EOS
+                "cond": item["cond"].reshape(-1, 9)}
+
+
+def _pad_faces(seqs):
+    """Right-pad ``[F, 9]`` meshes to the longest; mask is True at padding."""
+    width = max(len(faces) for faces in seqs)
+    coords = torch.zeros((len(seqs), width, 9), dtype=torch.long)
+    mask = torch.ones((len(seqs), width), dtype=torch.bool)
+    for i, faces in enumerate(seqs):
         coords[i, : len(faces)] = faces
         mask[i, : len(faces)] = False
+    return coords, mask
+
+
+def face_collate_fn(batch):
+    """Right-pad to the longest mesh; ``pad_mask`` is True at padded faces."""
+    coords, mask = _pad_faces(batch)
     return {"coords": coords, "pad_mask": mask}
+
+
+def pair_collate_fn(batch):
+    """`face_collate_fn` for the mesh and its condition, padded independently."""
+    coords, mask = _pad_faces([item["coords"] for item in batch])
+    cond, cond_mask = _pad_faces([item["cond"] for item in batch])
+    return {"coords": coords, "pad_mask": mask,
+            "cond": cond, "cond_pad_mask": cond_mask}
 
 
 class MeshVQVAEDataModule(L.LightningDataModule):
@@ -62,11 +100,17 @@ class MeshVQVAEDataModule(L.LightningDataModule):
     Takes the same arguments as `MeshDataModule` and delegates to it rather than
     re-reading the corpus, so the two stages cannot drift apart on split ratios,
     seed, margins or `max_faces`.
+
+    Args:
+        condition (bool): serve `(LOD2 mesh, LOD1 condition)` pairs instead of
+            single meshes. What the noise-resistant decoder fine-tune needs;
+            plain stage-1 training does not use a condition.
     """
 
-    def __init__(self, batch_size=16, **mesh_datamodule_kwargs):
+    def __init__(self, batch_size=16, condition=False, **mesh_datamodule_kwargs):
         super().__init__()
         self.batch_size = batch_size
+        self.condition = condition
         self.inner = MeshDataModule(**mesh_datamodule_kwargs)
 
     def setup(self, stage=None):
@@ -80,11 +124,13 @@ class MeshVQVAEDataModule(L.LightningDataModule):
         return (self.inner.max_seq_len + 8) // 9
 
     def _loader(self, split, shuffle):
+        view, collate = ((_PairView, pair_collate_fn) if self.condition
+                         else (_FaceView, face_collate_fn))
         return DataLoader(
-            _FaceView(split), batch_size=self.batch_size, shuffle=shuffle,
+            view(split), batch_size=self.batch_size, shuffle=shuffle,
             num_workers=self.inner.num_workers,
             persistent_workers=self.inner.persistent_workers,
-            collate_fn=face_collate_fn, pin_memory=True,
+            collate_fn=collate, pin_memory=True,
         )
 
     def train_dataloader(self):

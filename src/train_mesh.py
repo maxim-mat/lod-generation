@@ -43,9 +43,9 @@ def _load_vqvae(cfg: Config):
         raise ValueError(
             f"VQ-VAE was trained at num_bins={vqvae.num_bins} but mesh_data "
             f"says {cfg.mesh_data.num_bins}; the codebook would be meaningless.")
-    logger.info("Loaded frozen VQ-VAE from %s: %d codes x depth %d -> %d tokens "
-                "per face", cfg.mesh_model.vqvae_ckpt, vqvae.codebook_size,
-                vqvae.depth, vqvae.depth)
+    logger.info("Loaded frozen VQ-VAE from %s: %d codes x 3 vertices x depth %d "
+                "-> %d tokens per face", cfg.mesh_model.vqvae_ckpt,
+                vqvae.codebook_size, vqvae.depth, vqvae.tokens_per_face)
     return vqvae
 
 
@@ -87,11 +87,11 @@ def train_mesh(cfg: Config):
     # index past the positional embedding mid-run.
     max_seq_len = cfg.mesh_model.max_seq_len or datamodule.max_seq_len
     if vqvae is not None and cfg.mesh_model.max_seq_len is None:
-        # Codes, not coordinates: `depth` per face instead of 9, plus BOS. The
-        # dataset's figure counts coordinate tokens and would oversize the
-        # positional embedding by 3x.
+        # Codes, not coordinates: `3 * depth` per face, plus BOS. That equals 9
+        # at the paper's depth, so the sequence is the same length as the
+        # coordinate path -- the codebook buys a vocabulary, not compression.
         faces = (datamodule.max_seq_len + 8) // 9
-        max_seq_len = faces * vqvae.depth + 1
+        max_seq_len = faces * vqvae.tokens_per_face + 1
     logger.info("max_seq_len = %d (dataset longest segment: %d coordinate tokens)",
                 max_seq_len, datamodule.max_seq_len)
 

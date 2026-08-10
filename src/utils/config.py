@@ -147,8 +147,8 @@ class MeshModelConfig:
     max_seq_len: Optional[int] = None
     # "coord" -- 9 discretized coordinates per face, an exact inverse, the
     # measurement baseline and the default. "vqvae" -- codes from a trained
-    # stage-1 checkpoint, `depth` per face, and the LOD1 condition goes through
-    # the same encoder unquantized (see the design spec for why not quantized).
+    # stage-1 checkpoint, `3 * depth` per face, and the LOD1 condition goes
+    # through the same encoder unquantized (see the design spec for why not).
     tokenizer: str = "coord"
     # Stage-1 checkpoint. Required when tokenizer == "vqvae"; the codebook is
     # loaded frozen, so nothing here can move the vocabulary mid-run.
@@ -163,10 +163,22 @@ class MeshVQVAEConfig:
     the train/val/test split.
     """
     codebook_size: int = 1024
-    # Residual stages, i.e. codes per face. 3 is the paper's setting and gives
-    # the 9 -> 3 token compression that is the whole point of the codebook.
+    # Residual stages, i.e. codes per *vertex*. 3 is the paper's setting; with 3
+    # vertices to a face that is 9 tokens per face -- the same count as raw
+    # coordinates, because the codebook buys a learned vocabulary rather than
+    # compression (`face_per_token = num_quantizers * 3` in the reference).
+    # Quantizing one feature per face instead gave 3 tokens and a bottleneck 2x
+    # narrower than the data, which capped reconstruction at 0.246 m against the
+    # coordinate tokenizer's 0.107 m.
     depth: int = 3
     d_model: int = 256        # must be divisible by n_head
+    # Width of the code vectors, independent of d_model. MeshGPT's
+    # `project_dim_codebook = Linear(curr_dim, dim_codebook * nvf)` uses 192
+    # against a model dim of 512, so codes live in a narrower space than the
+    # transformer that reads them. None ties it to d_model, which is a
+    # coincidence rather than a design. Stage 2 embeds code ids by projecting
+    # these vectors, so this is also the input width of that projection.
+    codebook_dim: Optional[int] = None
     n_head: int = 8
     num_layers: int = 4
     dropout: float = 0.1
@@ -191,6 +203,21 @@ class MeshVQVAEConfig:
     # its stated failure mode (paper §6) is codewords near zero norm, which is
     # what `kmeans_init` exists to prevent.
     rotation_trick: bool = False
+    # Noise-resistant decoder fine-tune (arXiv:2406.10163 §4.2). A *second*
+    # stage-1 run: load `init_from`, freeze everything the codes depend on, and
+    # retrain the decoder alone with the LOD1 condition injected and codes drawn
+    # with Gumbel noise. This is what makes the decoder tolerate the imperfect
+    # tokens a transformer emits -- without it the decoder has only ever seen
+    # its own encoder's exact codes, which is the reason to prefer a learned
+    # vocabulary over the coordinate tokenizer in the first place.
+    noise_resistant: bool = False
+    # Gumbel temperature for that fine-tune. Higher = codes further from the
+    # ones the encoder would have picked. Ignored unless noise_resistant.
+    noise_temp: float = 1.0
+    # Stage-1 checkpoint to initialize from. Required when noise_resistant:
+    # starting the fine-tune from scratch trains a decoder against a codebook
+    # that means nothing yet.
+    init_from: Optional[str] = None
 
 @dataclass
 class EarlyStoppingConfig:

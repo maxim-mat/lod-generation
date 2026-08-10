@@ -34,9 +34,17 @@ def train_mesh_vqvae(cfg: Config):
     save_dir = Path(cfg.logging.save_dir, cfg.logging.experiment_name, cfg.logging.run_name)
     save_dir.mkdir(parents=True, exist_ok=True)
 
+    noise_resistant = cfg.mesh_vqvae.noise_resistant
+    if noise_resistant and not cfg.mesh_vqvae.init_from:
+        raise ValueError("mesh_vqvae.noise_resistant requires mesh_vqvae.init_from "
+                         "(the stage-1 checkpoint whose decoder is fine-tuned); "
+                         "from scratch it would train against a meaningless codebook.")
+
     logger.info("Initializing mesh VQ-VAE datamodule...")
     datamodule = MeshVQVAEDataModule(
         batch_size=cfg.training.batch_size,
+        # The fine-tune needs the LOD1 condition alongside each LOD2 mesh.
+        condition=noise_resistant,
         dataset_dir=cfg.mesh_data.dataset_dir,
         lod_in=cfg.mesh_data.lod_in,
         lod_out=cfg.mesh_data.lod_out,
@@ -63,9 +71,10 @@ def train_mesh_vqvae(cfg: Config):
     logger.info("max_faces = %d (corpus longest mesh: %d faces)",
                 max_faces, datamodule.max_faces_seen)
 
-    model = MeshVQVAEModule(
+    fresh = dict(
         num_bins=cfg.mesh_data.num_bins,
         codebook_size=cfg.mesh_vqvae.codebook_size,
+        codebook_dim=cfg.mesh_vqvae.codebook_dim,
         depth=cfg.mesh_vqvae.depth,
         d_model=cfg.mesh_vqvae.d_model,
         n_head=cfg.mesh_vqvae.n_head,
@@ -79,10 +88,28 @@ def train_mesh_vqvae(cfg: Config):
         lr_scheduler=cfg.training.lr_scheduler,
         lr_decay_steps=cfg.training.lr_decay_steps,
         lr_decay_rate=cfg.training.lr_decay_rate,
+        noise_resistant=noise_resistant,
+        noise_temp=cfg.mesh_vqvae.noise_temp,
     )
-    logger.info("Codebook: %d entries x depth %d -> %d tokens per face "
-                "(coordinate tokenizer uses 9)", cfg.mesh_vqvae.codebook_size,
-                cfg.mesh_vqvae.depth, cfg.mesh_vqvae.depth)
+    if noise_resistant:
+        # Weights, not a resume: the fine-tune is a fresh run with its own
+        # optimizer and its own architecture arguments, which come from the
+        # checkpoint so a config typo cannot quietly reshape the codebook.
+        model = MeshVQVAEModule.load_from_checkpoint(
+            cfg.mesh_vqvae.init_from, map_location="cpu",
+            noise_resistant=True, noise_temp=cfg.mesh_vqvae.noise_temp,
+            lr=cfg.training.lr, lr_scheduler=cfg.training.lr_scheduler,
+            lr_decay_steps=cfg.training.lr_decay_steps,
+            lr_decay_rate=cfg.training.lr_decay_rate)
+        logger.info("Noise-resistant fine-tune from %s: decoder only, LOD1 "
+                    "condition injected, codes sampled at temperature %.3g",
+                    cfg.mesh_vqvae.init_from, cfg.mesh_vqvae.noise_temp)
+    else:
+        model = MeshVQVAEModule(**fresh)
+    net = model.network
+    logger.info("Codebook: %d entries x 3 vertices x depth %d -> %d tokens per "
+                "face (coordinate tokenizer uses 9)", net.codebook_size,
+                net.depth, net.tokens_per_face)
 
     exp_loggers = create_loggers(cfg, save_dir)
     callbacks = create_callbacks(cfg, save_dir)

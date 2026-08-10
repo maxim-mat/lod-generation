@@ -53,14 +53,41 @@ class MeshTransformer(nn.Module):
     """
 
     def __init__(self, vocab_size, d_model=256, n_head=8, num_layers=6,
-                 dropout=0.1, max_seq_len=4096, cond_dim=None):
+                 dropout=0.1, max_seq_len=4096, cond_dim=None,
+                 codebook=None, tokens_per_face=None):
         super().__init__()
         self.max_seq_len = max_seq_len
         # Under the VQ-VAE tokenizer the condition arrives as continuous
         # per-face features rather than token ids, so it needs a projection
         # instead of a lookup. None keeps the coordinate path exactly as it was.
         self.cond_proj = nn.Linear(cond_dim, d_model) if cond_dim else None
-        self.token_embed = nn.Embedding(vocab_size, d_model)
+
+        self.codebook_size = 0 if codebook is None else codebook.shape[0]
+        self.tokens_per_face = tokens_per_face
+        if codebook is None:
+            self.token_embed = nn.Embedding(vocab_size, d_model)
+        else:
+            # A code id is embedded by looking its vector up in the frozen
+            # codebook and projecting it, as in MeshAnything's `embed_with_vae`
+            # (whose `embed_tokens` is commented "# not used"). Two codes that
+            # are close in codebook space then arrive as nearly the same vector
+            # instead of two unrelated rows the model has to relate from data.
+            #
+            # A buffer, not a live reference to the VQ-VAE: registering that
+            # module twice would duplicate stage 1 in the checkpoint. Stage 2
+            # freezes the codebook, so a snapshot stays exact -- and it travels
+            # with the checkpoint, which a reference would not.
+            self.token_embed = None
+            self.register_buffer("codebook", codebook.detach().clone())
+            self.code_proj = nn.Linear(codebook.shape[1], d_model)
+            # BOS/EOS/PAD have no codebook vector, so they keep a free table.
+            self.extra_embed = nn.Embedding(vocab_size - self.codebook_size, d_model)
+            # Which of the `tokens_per_face` slots inside a face this token
+            # fills -- which vertex, which residual stage -- plus one slot for
+            # each special. MeshAnything's `OPTFacePositionalEmbedding`, sized
+            # `face_per_token + 3` with the specials at 0..2.
+            self.face_pos_embed = nn.Embedding(tokens_per_face + 3, d_model)
+
         self.pos_embed = nn.Embedding(max_seq_len, d_model)
         # Which half of the prefix a position belongs to. Without it the model
         # has to infer the LOD1/LOD2 boundary from the BOS token alone.
@@ -74,6 +101,29 @@ class MeshTransformer(nn.Module):
         self.blocks = nn.TransformerEncoder(layer, num_layers=num_layers)
         self.norm = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size)
+
+    def embed_tokens(self, ids):
+        """[B, L] ids to [B, L, d], where ``ids[:, 0]`` is the segment's first token.
+
+        On the coordinate path this is a plain lookup. On the code path a code
+        is `code_proj(codebook[id])`, the specials come from `extra_embed`, and
+        every token additionally carries its slot within the face.
+        """
+        if self.token_embed is not None:
+            return self.token_embed(ids)
+
+        is_code = ids < self.codebook_size
+        codes = self.code_proj(self.codebook[ids.clamp(max=self.codebook_size - 1)])
+        special = (ids - self.codebook_size).clamp(min=0)
+        out = torch.where(is_code[..., None], codes, self.extra_embed(special))
+
+        # The target segment is [BOS, code 0, code 1, ...], so the token at
+        # index i is code i-1 and fills slot (i-1) % tokens_per_face. Specials
+        # take slots 0..2, mirroring the reference's `% face_per_token + 3`.
+        index = torch.arange(ids.shape[1], device=ids.device)
+        slot = 3 + (index - 1) % self.tokens_per_face
+        slot = torch.where(is_code, slot[None].expand_as(ids), special)
+        return out + self.face_pos_embed(slot)
 
     def forward(self, cond, tgt, cond_pad_mask=None, tgt_pad_mask=None):
         """Next-token logits for the target sequence.
@@ -110,8 +160,8 @@ class MeshTransformer(nn.Module):
         # The two halves are embedded separately because under the VQ-VAE
         # tokenizer they no longer share a vocabulary: the condition is a
         # projected face feature, the target a code id.
-        cond_h = self.cond_proj(cond) if cond.is_floating_point() else self.token_embed(cond)
-        x = torch.cat([cond_h, self.token_embed(tgt[:, :-1])], dim=1)
+        cond_h = self.cond_proj(cond) if cond.is_floating_point() else self.embed_tokens(cond)
+        x = torch.cat([cond_h, self.embed_tokens(tgt[:, :-1])], dim=1)
         h = self.drop(x + self.pos_embed(pos) + self.segment_embed(segment))
 
         # Bool, not the float mask from generate_square_subsequent_mask: torch
@@ -166,9 +216,12 @@ class MeshTransformerModule(L.LightningModule):
             vqvae.eval()
             for p in vqvae.parameters():
                 p.requires_grad_(False)
-            # Each residual stage gets its own id block. Sharing one block would
-            # make "code 5" ambiguous between stages, which decode cannot undo.
-            base = vqvae.codebook_size * vqvae.depth
+            # One id space of `codebook_size`, as in MeshAnything
+            # (`vocab_size = self.tokenizer.codebook_size + 3`). The residual
+            # stage is carried by *position* -- it is the fastest-varying index
+            # of the [F, 3, depth] layout, and `lookup` reads it off that axis --
+            # so a per-stage id offset only tripled this softmax.
+            base = vqvae.codebook_size
             self.bos, self.eos, self.pad = base, base + 1, base + 2
             vocab, cond_dim = base + 3, vqvae.head.in_features
 
@@ -176,7 +229,29 @@ class MeshTransformerModule(L.LightningModule):
             vocab_size=vocab, d_model=d_model, n_head=n_head,
             num_layers=num_layers, dropout=dropout, max_seq_len=max_seq_len,
             cond_dim=cond_dim,
+            # Shared across residual stages, so one book is the whole vocabulary.
+            codebook=None if vqvae is None else vqvae.quantizer.codebooks[0],
+            tokens_per_face=None if vqvae is None else vqvae.tokens_per_face,
         )
+
+    def train(self, mode=True):
+        """Keep the frozen tokenizer in eval, whatever Lightning does.
+
+        `nn.Module.train` recurses into submodules, and Lightning calls
+        `model.train()` at the start of every training epoch -- which re-enables
+        the VQ-VAE's dropout. `_prepare` runs that tokenizer inside
+        `training_step`, so the effect is that the *target labels* are resampled
+        each epoch (~8% of code ids move at dropout 0.1) while validation, run
+        under `eval()`, scores against clean ones. Two different label
+        distributions, and a train/val loss gap that is partly an artifact.
+
+        The `requires_grad` guard in `MeshVQVAE.quantize` covers the codebook
+        EMA; this covers module mode, which is a different question.
+        """
+        super().train(mode)
+        if self.vqvae is not None:
+            self.vqvae.eval()
+        return self
 
     # ------------------------------------------------------------------
     # Batch -> this model's vocabulary
@@ -203,12 +278,13 @@ class MeshTransformerModule(L.LightningModule):
             body_pad = batch.get("tgt_pad_mask")
             body_pad = body_pad[:, 1:] if body_pad is not None else torch.zeros_like(body, dtype=torch.bool)
             coords, faces_pad = self._faces(body, body_pad | (body >= self.num_bins))
-            codes = self.vqvae.tokenize(coords, faces_pad)
+            codes = self.vqvae.tokenize(coords, faces_pad)      # [B, F, 3, depth]
 
-            # Offset each stage into its own id block, then flatten face-major.
-            offset = torch.arange(self.vqvae.depth, device=codes.device) * self.vqvae.codebook_size
-            flat = (codes + offset).flatten(start_dim=1)
-            valid = (~faces_pad).repeat_interleave(self.vqvae.depth, dim=1)
+            # Flatten to the reference's `b (nf nv q)`: face-major, then vertex,
+            # with the residual stage varying fastest.
+            per_face = self.vqvae.tokens_per_face
+            flat = codes.flatten(start_dim=1)
+            valid = (~faces_pad).repeat_interleave(per_face, dim=1)
 
             # Padding is always a suffix, so the valid codes are a prefix and
             # EOS goes at index 1 + count.
@@ -260,14 +336,13 @@ class MeshTransformerModule(L.LightningModule):
             return detokenize(tokens.cpu().numpy(), self.num_bins)
 
         depth, size = self.vqvae.depth, self.vqvae.codebook_size
-        codes = tokens[tokens < depth * size]
-        codes = codes[: len(codes) - len(codes) % depth].reshape(-1, depth)
+        per_face = self.vqvae.tokens_per_face
+        codes = tokens[tokens < size]
+        # Whole faces only: a trailing partial face has no vertices to decode.
+        codes = codes[: len(codes) - len(codes) % per_face]
         if len(codes) == 0:
             return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
-        # Undo the per-stage offset; a stage-2 sample can land in the wrong
-        # block, so clamp rather than trust it.
-        offset = torch.arange(depth, device=codes.device) * size
-        return self.vqvae.detokenize((codes - offset).clamp(0, size - 1))
+        return self.vqvae.detokenize(codes.reshape(-1, 3, depth))
 
     def _shared_step(self, batch):
         """Returns (loss, logits, targets); targets are PAD where masked out."""
@@ -320,7 +395,7 @@ class MeshTransformerModule(L.LightningModule):
             # stages are strictly harder, and that split is what shows it.
             stage = torch.arange(targets.shape[1], device=targets.device) % self.vqvae.depth
             for k in range(self.vqvae.depth):
-                sel = keep & (stage == k) & (targets < self.vqvae.codebook_size * self.vqvae.depth)
+                sel = keep & (stage == k) & (targets < self.vqvae.codebook_size)
                 out[f"code_acc_{k}"] = (((pred == targets) & sel).sum()
                                         / sel.sum().clamp(min=1))
         else:

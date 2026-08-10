@@ -1,0 +1,104 @@
+# Stage 1b: noise-resistant decoder (MeshAnything, arXiv:2406.10163 section 4.2)
+# Usage: python main.py --train --config configs/mesh-vqvae-nr.yaml
+#
+# Takes a finished stage-1 checkpoint and retrains its *decoder alone* with:
+#   * the LOD1 mesh injected into the decoder as the shape condition, and
+#   * codes drawn with Gumbel noise instead of argmin.
+#
+# Why this stage exists at all. A plain VQ-VAE decoder has only ever seen the
+# exact codes its own encoder produced. A stage-2 transformer emits codes that
+# are merely close -- run mesh-3 got 43.6% of them exactly right -- and the
+# decoder has no training signal for the rest. "A decoder that maps imperfect
+# codes onto the manifold of faces it was trained on" is the reason to prefer a
+# learned vocabulary over the exact coordinate tokenizer, and this stage is
+# where that property actually comes from. Without it the codebook is strictly
+# worse than coordinates: same 128 bins, plus quantization loss.
+#
+# Everything under mesh_vqvae except noise_* and init_from is ignored: the
+# architecture is read from the checkpoint, so a typo here cannot reshape the
+# codebook the stage-2 run was trained against.
+
+mode: train
+config_set: mesh_vqvae
+seed: 42
+
+data:
+  dataset_dir: data/The Hague/mini
+
+# Must match the stage-1 run exactly -- the split included. A building the
+# decoder fine-tunes on must not be in the transformer's test split.
+mesh_data:
+  dataset_dir: data/The Hague/mini
+  lod_in: LOD1_synth
+  lod_out: LOD2
+  num_bins: 128
+  margin_lo: [0.0, 0.0, 0.0]
+  margin_hi: [0.0, 0.0, 0.1]
+  max_faces: 200
+  max_files: null
+  num_workers: 10
+  persistent_workers: false
+
+mesh_vqvae:
+  noise_resistant: true
+  # No default that works: point this at the stage-1 checkpoint to fine-tune.
+  init_from: null
+  # Gumbel temperature on the codebook logits. Higher means the decoder is
+  # shown codes further from the ones the encoder would have picked, so it is
+  # the knob for how much transformer error the decoder is asked to absorb.
+  # Too high and it learns to ignore the codes and read the condition instead --
+  # watch val_recon_ce against the stage-1 run's final value: a fine-tune that
+  # improves robustness should cost a little clean-code accuracy, not all of it.
+  noise_temp: 1.0
+
+training:
+  # Items are single buildings here, not both LODs, so an epoch is half the
+  # length of the stage-1 run's at the same batch size.
+  batch_size: 64
+  train_val_test_split:
+    - 0.8
+    - 0.1
+    - 0.1
+  # An order below stage 1: this is a fine-tune of an already-converged decoder.
+  lr: 1e-5
+  max_epochs: 30
+  gradient_clip_val: 1.0
+  lr_scheduler: "cosine"
+  lr_decay_steps: 50
+  lr_decay_rate: 0.5
+  # val_recon_ce, not val_loss -- though on this path they are equal, since the
+  # commitment term is dropped from the objective when the encoder is frozen.
+  # Keeping the name pinned means the stage-1 and stage-1b curves are comparable.
+  early_stopping:
+    enabled: true
+    monitor: val_recon_ce
+    patience: 5
+    mode: min
+  checkpoint:
+    enabled: true
+    monitor: val_recon_ce
+    mode: min
+    save_top_k: 3
+    filename: "{epoch:02d}-{val_recon_ce:.4f}"
+
+trainer:
+  accelerator: auto
+  devices: 1
+  precision: "32"
+  log_every_n_steps: 50
+
+logging:
+  loggers:
+    - wandb
+  project_name: lod-generation
+  experiment_name: initial-runs
+  run_name: mesh-vqvae-nr-1
+  save_dir: outputs
+  wandb_entity: maxim-lod
+  wandb_offline: false
+  log_model: false
+
+generative_eval:
+  enabled: false
+
+resume_from: null
