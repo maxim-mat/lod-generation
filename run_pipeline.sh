@@ -113,7 +113,12 @@ mkdir -p "$LOG_DIR"
 # expansions use the guarded ${COMMON[@]+"${COMMON[@]}"} form. It has to stay an
 # array expansion: the dataset path contains a space ("data/The Hague/mini").
 
-log() { echo "[pipeline $(date +%H:%M:%S)] $*"; }
+# Diagnostics go to stderr, always. `best_ckpt` and `pick` return their value on
+# stdout and are called inside $( ), so a log line on stdout is silently
+# captured into the checkpoint path -- which then reached OmegaConf as
+# `mesh_vqvae.init_from=[pipeline 17:28:03] WARNING: ...` and died in the YAML
+# parser. Keeping stdout for values only makes that unrepresentable.
+log() { echo "[pipeline $(date +%H:%M:%S)] $*" >&2; }
 
 # "<run dir>\t<mode>\t<monitor>" as the training code will actually resolve
 # them -- read through the project's own loader so an override here cannot drift
@@ -137,16 +142,20 @@ PY
 # is excluded -- Lightning always writes it, and it is the final epoch rather
 # than the best one.
 best_ckpt() {
-  local dir="$1/checkpoints" mode="${2:-min}" order picked
+  local dir="$1/checkpoints" mode="${2:-min}" monitor="${3:-the monitored metric}" order picked
   if [[ "$mode" == "max" ]]; then order="-gr"; else order="-g"; fi
   picked=$(find "$dir" -maxdepth 1 -name '*.ckpt' ! -name 'last.ckpt' 2>/dev/null \
     | sed -E 's|.*-([0-9]+\.[0-9]+)\.ckpt$|\1 &|' \
     | grep -E '^[0-9]' | sort "$order" | head -1 | cut -d' ' -f2-)
   if [[ -z "$picked" ]]; then
-    # No metric-named checkpoint (early stop before the first save, or a
-    # renamed template). last.ckpt is the honest fallback, but say so loudly.
+    # No metric-named checkpoint. Usually means validation never produced the
+    # monitored metric, so ModelCheckpoint saved nothing but last.ckpt -- worth
+    # looking into rather than shrugging at, so list what is actually there.
     picked="$dir/last.ckpt"
-    log "WARNING: no metric-named checkpoint in $dir, falling back to last.ckpt"
+    log "WARNING: no metric-named checkpoint in $dir"
+    log "WARNING: found: $(find "$dir" -maxdepth 1 -name '*.ckpt' -printf '%f ' 2>/dev/null || echo '(nothing)')"
+    log "WARNING: check the stage log -- did validation run and log $monitor?"
+    log "WARNING: falling back to last.ckpt"
     [[ -f "$picked" ]] || { log "FATAL: no checkpoint at all in $dir"; exit 1; }
   fi
   echo "$picked"
@@ -159,8 +168,8 @@ pick() {
   info=$(run_info "$config" ${COMMON[@]+"${COMMON[@]}"})
   dir=${info%%$'\t'*}; info=${info#*$'\t'}
   mode=${info%%$'\t'*}; monitor=${info#*$'\t'}
-  ckpt=$(best_ckpt "$dir" "$mode")
-  log "$label best checkpoint ($mode of $monitor): $ckpt" >&2
+  ckpt=$(best_ckpt "$dir" "$mode" "$monitor")
+  log "$label best checkpoint ($mode of $monitor): $ckpt"
   echo "$ckpt"
 }
 
