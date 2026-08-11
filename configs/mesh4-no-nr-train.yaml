@@ -1,0 +1,128 @@
+# LOD1-conditioned mesh transformer over VQ-VAE codes (MeshAnything, arXiv:2406.10163)
+# Usage: python main.py --train --config configs/mesh4-train.yaml
+#
+# Stage 2. Requires a trained stage-1 checkpoint from configs/mesh-vqvae.yaml --
+# set mesh_model.vqvae_ckpt below before running, there is no default that works.
+#
+# Supersedes mesh3-train.yaml, at the width and batch size run mesh-3 actually
+# used (d_model 512, batch 32) rather than what that file on disk said.
+#
+# What changes vs mesh-1/mesh-2: the target is codes rather than coordinates,
+# and the LOD1 condition goes through the same VQ-VAE encoder *unquantized*.
+# Quantizing the condition would only discard precision on an input that is
+# never sampled; see the design spec. The sequence is the same length either
+# way -- quantization is per vertex, so a face costs 3 vertices x depth 3 = 9
+# tokens, exactly what 9 coordinates cost. The codebook buys a learned
+# vocabulary and a decoder that tolerates imperfect codes, not compression.
+#
+# Coordinate-token metrics (bin_mae, bin_mae_x/y/z, coord_mae_m, acc_1bin) do
+# not exist on this path -- a code id is a nominal label, so |code_a - code_b|
+# is meaningless. code_acc_0..2 replace them, one per residual stage.
+
+mode: train
+config_set: mesh
+seed: 42
+
+# The diffusion `data:` block is not read under config_set: mesh, but
+# DataConfig.dataset_dir is MISSING and OmegaConf resolves the whole schema, so
+# it still needs a value. Left deliberately non-real so nothing quietly uses it.
+data:
+  dataset_dir: data/The Hague/mini
+
+# Mesh dataset settings (MeshDataConfig)
+mesh_data:
+  dataset_dir: data/The Hague/mini
+  lod_in: LOD1_synth
+  lod_out: LOD2
+  num_bins: 128
+  # Headroom below / above the LOD1 box, per axis (x, y, z), as a fraction of
+  # its scale. p99 on mini is 0 on every side but +z, which buys room for the
+  # ridge above the median roof height. All six are settable; see the load log.
+  margin_lo: [0.0, 0.0, 0.0]
+  margin_hi: [0.0, 0.0, 0.1]
+  max_faces: 200
+  max_files: null
+  num_workers: 10
+  persistent_workers: false
+
+# Transformer settings (MeshModelConfig)
+mesh_model:
+  d_model: 512
+  n_head: 8
+  num_layers: 6
+  dropout: 0.1
+  max_seq_len: null      # null = size it from the data, in codes not coordinates
+  tokenizer: vqvae
+  # No default that works: point this at outputs/<experiment>/<run>/checkpoints/<best>.ckpt
+  vqvae_ckpt: outputs/initial-runs/mesh-vqvae-4/checkpoints/last.ckpt
+
+training:
+  batch_size: 16          # sequences are long; attention is quadratic in length
+  train_val_test_split:
+    - 0.8
+    - 0.1
+    - 0.1
+  lr: 1e-3
+  max_epochs: 100
+  gradient_clip_val: 1.0
+  lr_scheduler: "cosine"
+  lr_decay_steps: 50
+  lr_decay_rate: 0.5
+  # NOT val_loss. Cross-entropy over nominal code ids rises through confidence
+  # rather than error: in run mesh-3 it went 2.651 -> 3.063 over epochs 9-19
+  # while val_token_acc stayed flat (0.4349 -> 0.4355) and val_tf_chamfer_m
+  # actually improved (0.381 -> 0.371). Monitoring it early-stops on calibration
+  # and saves the least-confident checkpoint rather than the best one.
+  #
+  # val_gen_chamfer_m would be the honest geometric choice but is gated to
+  # every_n_epochs, and EarlyStopping breaks on a metric missing most epochs.
+  # val_token_acc and val_tf_chamfer_m are both logged every validation epoch;
+  # accuracy is the less noisy of the two (tf_chamfer is one sample per batch).
+  early_stopping:
+    enabled: true
+    monitor: val_token_acc
+    patience: 10
+    mode: max
+  checkpoint:
+    enabled: true
+    monitor: val_token_acc
+    mode: max
+    save_top_k: 3
+    filename: "{epoch:02d}-{val_token_acc:.4f}"
+
+trainer:
+  accelerator: auto
+  devices: 1
+  precision: "32"
+  log_every_n_steps: 50
+
+logging:
+  loggers:
+    - wandb
+  project_name: lod-generation
+  experiment_name: initial-runs
+  run_name: mesh-4-no-nr
+  save_dir: outputs
+  wandb_entity: maxim-lod
+  wandb_offline: false
+  log_model: false
+
+# Free-running generation scored against the paired ground-truth LOD2. The
+# unconditional generative_eval does not apply here and is gated off by
+# config_set in create_callbacks, so it needs no block.
+#
+# Ceilings measured on mini (raw LOD2 vs its own 128-bin round trip), which is
+# the best any model can score: chamfer 0.155 m, footprint IoU 0.992,
+# volumetric IoU 0.991 (defined for 75% -- the rest are not watertight at source).
+mesh_eval:
+  enabled: true
+  every_n_epochs: 10     # generate() is ~1800 sequential forwards, no KV cache
+  n_val: 8
+  n_test: 32
+  batch_size: 8
+  n_points: 4096
+  taus: [0.25, 0.5]
+  voxel_m: 0.25
+  save_samples: 8
+
+resume_from: null

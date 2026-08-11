@@ -20,6 +20,8 @@ wandb>=0.15.0
 # Visualization
 plotly>=5.14.0
 rich>=13.0.0  # Optional, but nice for progress bars
+streamlit>=1.30.0  # src/outlier_explorer.py
+pyproj>=3.6.0      # EPSG:28992 -> WGS84 for the explorer's map links
 
 # Development & Notebooks
 jupyter>=1.0.0
