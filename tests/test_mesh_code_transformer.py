@@ -6,6 +6,7 @@ with a frozen VQ-VAE. These check that conversion, since every downstream
 number depends on it being exactly right.
 """
 import numpy as np
+import pytest
 import torch
 
 from src.dataset.mesh_dataset import specials, vocab_size
@@ -203,23 +204,51 @@ def test_decode_tokens_survives_a_truncated_sequence():
     assert faces.shape == (0, 3) and verts.shape == (0, 3)
 
 
-def test_decode_tokens_conditions_a_noise_resistant_decoder():
-    """Stage 1b fine-tunes the decoder *with* the LOD1 condition injected, so
-    stage 2 has to hand it back at decode time. Without this the fine-tuned
-    decoder runs at `cond=None` -- a train/inference mismatch that makes the
-    fine-tune worse than not doing it."""
+def _nr_module():
+    """Stage 2 against a decoder that went through the 1b noise-resistant fine-tune."""
     vq = _vqvae()
     vq.conditioned_decoder = True
-    m = MeshTransformerModule(num_bins=NUM_BINS, d_model=16, n_head=2,
-                              num_layers=1, dropout=0.0, max_seq_len=64,
-                              vqvae=vq).eval()
-    batch = _batch()
+    return MeshTransformerModule(num_bins=NUM_BINS, d_model=16, n_head=2,
+                                 num_layers=1, dropout=0.0, max_seq_len=64,
+                                 vqvae=vq).eval()
+
+
+def test_decode_tokens_conditions_a_noise_resistant_decoder():
+    """Stage 1b fine-tunes the decoder *with* the LOD1 condition injected, so
+    stage 2 has to hand it back at decode time.
+
+    Asserted on what reaches `MeshVQVAE.detokenize` rather than on the decoded
+    mesh: this is a plumbing contract -- unpadded [Fc, d] in, batched [1, Fc, d]
+    out -- and an untrained toy decoder's argmax is free to land on the same
+    bins for two different conditions, which makes the mesh comparison flaky.
+    """
+    m = _nr_module()
+    seen = {}
+    inner = m.vqvae.detokenize
+
+    def spy(codes, cond=None):
+        seen["cond"] = cond
+        return inner(codes, cond=cond)
+
+    m.vqvae.detokenize = spy
     with torch.no_grad():
-        cond, tgt, cond_pad, _ = m._prepare(batch)
-        plain = m.decode_tokens(tgt[0])[0]
-        conditioned = m.decode_tokens(tgt[0], cond=cond[0][~cond_pad[0]])[0]
-    assert plain.shape == conditioned.shape
-    assert not np.allclose(plain, conditioned), "the condition never reached the decoder"
+        cond, tgt, cond_pad, _ = m._prepare(_batch())
+        c = cond[0][~cond_pad[0]]
+        m.decode_tokens(tgt[0], cond=c)
+
+    assert seen["cond"] is not None, "the condition never reached the decoder"
+    assert torch.equal(seen["cond"], c[None]), "condition batched or reshaped wrongly"
+
+
+def test_decode_tokens_refuses_to_run_a_noise_resistant_decoder_unconditioned():
+    """The failure this guards against is silent: `cond=None` on a fine-tuned
+    decoder still returns a mesh, just a scrambled one, which reads downstream
+    as a broken model or a broken dataset rather than a missing argument."""
+    m = _nr_module()
+    with torch.no_grad():
+        _, tgt, _, _ = m._prepare(_batch())
+        with pytest.raises(ValueError, match="conditioned_decoder"):
+            m.decode_tokens(tgt[0])
 
 
 def test_a_plain_decoder_ignores_a_condition():
@@ -234,6 +263,94 @@ def test_a_plain_decoder_ignores_a_condition():
         plain = m.decode_tokens(tgt[0])[0]
         offered = m.decode_tokens(tgt[0], cond=cond[0][~cond_pad[0]])[0]
     assert np.array_equal(plain, offered), "an untrained condition path was used"
+
+
+def _opt_module():
+    """Stage 2 on an OPT backbone, at toy size.
+
+    A local `OPTConfig` rather than `facebook/opt-350m`: the test must not need
+    the hub, and the contract being checked -- embeddings in, next-token logits
+    out, same shapes -- does not depend on the size.
+    """
+    from transformers import OPTConfig
+
+    cfg = OPTConfig(vocab_size=CODEBOOK + 3, hidden_size=32, word_embed_proj_dim=16,
+                    num_hidden_layers=2, num_attention_heads=4, ffn_dim=64,
+                    max_position_embeddings=128, dropout=0.0)
+    return MeshTransformerModule(num_bins=NUM_BINS, dropout=0.0, vqvae=_vqvae(),
+                                 backbone="opt", opt_config=cfg)
+
+
+def test_opt_backbone_matches_the_scratch_contract():
+    """Everything downstream -- _prepare, generate, decode_tokens, mesh_eval --
+    goes through `network(cond, tgt, ...)`. If the two backbones agree there,
+    swapping them is a config change and nothing else."""
+    m = _opt_module().eval()
+    batch = _batch()
+    with torch.no_grad():
+        cond, tgt, cond_pad, tgt_pad = m._prepare(batch)
+        logits = m.network(cond, tgt, cond_pad, tgt_pad)
+    assert logits.shape == (B, tgt.shape[1] - 1, CODEBOOK + 3)
+    assert torch.isfinite(logits).all()
+
+
+def test_opt_backbone_embeds_codes_from_the_codebook_too():
+    """The embedding is shared with the scratch stack, so the OPT path must not
+    quietly fall back to a free table -- and must not use OPT's own."""
+    m = _opt_module().eval()
+    assert m.network.token_embed is None
+    assert m.network.face_pos_embed.num_embeddings == PER_FACE + 3
+    # OPT's 50k language vocabulary is dropped: input arrives as inputs_embeds,
+    # so the table survives only as the tied output projection.
+    assert m.network.opt.lm_head.out_features == CODEBOOK + 3
+
+
+def test_opt_backbone_trains_and_generates():
+    m = _opt_module()
+    loss, _, _, _ = m._shared_step(_batch())
+    assert torch.isfinite(loss) and float(loss) > 0
+    loss.backward()
+    assert any(p.grad is not None and float(p.grad.abs().sum()) > 0
+               for p in m.network.opt.parameters()), "OPT backbone got no gradient"
+    assert all(p.grad is None or float(p.grad.abs().sum()) == 0
+               for p in m.vqvae.parameters()), "frozen VQ-VAE received gradient"
+
+    m.eval()
+    with torch.no_grad():
+        cond, _, cond_pad, _ = m._prepare(_batch())
+        out = m.generate(cond, cond_pad, max_new_tokens=6, temperature=0.0)
+    assert out.shape[0] == B and int(out.max()) < CODEBOOK + 3
+
+
+def test_opt_position_budget_is_shared_between_the_halves():
+    """Unlike the scratch backbone, OPT counts positions straight through, so
+    the condition eats into the target's budget. Silently truncating there would
+    corrupt every sequence past the limit, so it raises."""
+    from transformers import OPTConfig
+
+    cfg = OPTConfig(vocab_size=CODEBOOK + 3, hidden_size=32, word_embed_proj_dim=16,
+                    num_hidden_layers=1, num_attention_heads=4, ffn_dim=64,
+                    max_position_embeddings=8, dropout=0.0)
+    m = MeshTransformerModule(num_bins=NUM_BINS, dropout=0.0, vqvae=_vqvae(),
+                              backbone="opt", opt_config=cfg).eval()
+    with torch.no_grad():
+        cond, tgt, cond_pad, tgt_pad = m._prepare(_batch())
+        try:
+            m.network(cond, tgt, cond_pad, tgt_pad)
+        except ValueError as e:
+            assert "max_position_embeddings" in str(e)
+            return
+    raise AssertionError("a sequence past OPT's positions was accepted")
+
+
+def test_unknown_backbone_is_rejected():
+    try:
+        MeshTransformerModule(num_bins=NUM_BINS, d_model=16, n_head=2, num_layers=1,
+                              max_seq_len=64, backbone="llama")
+    except ValueError as e:
+        assert "backbone" in str(e).lower()
+        return
+    raise AssertionError("an unknown backbone was accepted")
 
 
 def test_generate_emits_code_tokens_within_the_vocabulary():

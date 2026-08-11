@@ -107,7 +107,16 @@ def train_mesh(cfg: Config):
         lr_decay_steps=cfg.training.lr_decay_steps,
         lr_decay_rate=cfg.training.lr_decay_rate,
         vqvae=vqvae,
+        backbone=cfg.mesh_model.backbone,
+        opt_name=cfg.mesh_model.opt_name,
+        opt_pretrained=cfg.mesh_model.opt_pretrained,
     )
+    if cfg.mesh_model.backbone == "opt":
+        params = sum(p.numel() for p in model.network.opt.parameters())
+        logger.info("Backbone: %s (%s), %.0fM parameters, positions %d shared "
+                    "between condition and target", cfg.mesh_model.opt_name,
+                    "pretrained" if cfg.mesh_model.opt_pretrained else "random init",
+                    params / 1e6, model.network.max_seq_len)
 
     exp_loggers = create_loggers(cfg, save_dir)
     callbacks = create_callbacks(cfg, save_dir)

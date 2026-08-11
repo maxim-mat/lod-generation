@@ -153,6 +153,21 @@ class MeshModelConfig:
     # Stage-1 checkpoint. Required when tokenizer == "vqvae"; the codebook is
     # loaded frozen, so nothing here can move the vocabulary mid-run.
     vqvae_ckpt: Optional[str] = None
+    # "scratch" -- the transformer defined here, sized by d_model / n_head /
+    # num_layers / max_seq_len above. "opt" -- an OPT backbone, which is what
+    # the paper adopts for stage 2; those four fields are then read from the
+    # OPT config instead and only `dropout` still applies.
+    #
+    # OPT is ~331M parameters against ~20M for the scratch model at d_model 512.
+    # On a 16k-building corpus that is a large bet on the pretrained
+    # initialization doing the regularizing, so treat it as an experiment
+    # against a measured scratch baseline, not as a default.
+    backbone: str = "scratch"
+    opt_name: str = "facebook/opt-350m"
+    # Load OPT's weights, or only its architecture. The reference builds it with
+    # `from_config` (random) and loads its own checkpoint, so a warm start from
+    # the language model is the paper's text rather than its released code.
+    opt_pretrained: bool = True
 
 @dataclass
 class MeshVQVAEConfig:

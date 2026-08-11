@@ -1,0 +1,124 @@
+# Stage 2 on an OPT backbone (MeshAnything, arXiv:2406.10163 section 4.3)
+# Usage: python main.py --train --config configs/mesh5-train.yaml
+#
+# mesh4-train.yaml with mesh_model.backbone: opt. Everything else about the
+# pipeline is unchanged -- same VQ-VAE, same codes, same condition -- so this is
+# an A/B on the backbone alone, and the two runs are directly comparable.
+#
+# What it is buying, and what it costs. The paper adopts OPT-350M for stage 2;
+# this is ~331M parameters against ~20M for the from-scratch stack at d_model
+# 512. Run mesh-3 already overfit a 20M model by epoch 9 on 16k buildings, so
+# 16x the capacity is a bet on the pretrained initialization doing the
+# regularizing. Note that bet is not something the released reference confirms:
+# its inference code builds the backbone with `from_config` (random weights) and
+# loads MeshAnything's own checkpoint, so a warm start from the language model
+# is paper text rather than published code. `opt_pretrained: false` runs the
+# other arm of that question.
+#
+# One structural difference from the scratch backbone: OPT's positions run
+# straight through the condition into the target instead of restarting per
+# segment, so the two halves share one budget of max_position_embeddings=2048.
+# At max_faces 200 that is 200 condition faces + 1 BOS + 1800 codes = 2001, with
+# 47 to spare. Raising max_faces past ~204 will raise in forward rather than
+# silently truncate.
+#
+# First run downloads facebook/opt-350m from the HF hub (~700 MB).
+
+mode: train
+config_set: mesh
+seed: 42
+
+data:
+  dataset_dir: data/The Hague/mini
+
+# Identical to mesh-vqvae.yaml and mesh4-train.yaml -- the split is seeded from
+# these, and a building in the transformer's test set must never have trained
+# the tokenizer.
+mesh_data:
+  dataset_dir: data/The Hague/mini
+  lod_in: LOD1_synth
+  lod_out: LOD2
+  num_bins: 128
+  margin_lo: [0.0, 0.0, 0.0]
+  margin_hi: [0.0, 0.0, 0.1]
+  max_faces: 200
+  max_files: null
+  num_workers: 10
+  persistent_workers: false
+
+mesh_model:
+  backbone: opt
+  opt_name: facebook/opt-350m
+  opt_pretrained: true
+  # d_model / n_head / num_layers / max_seq_len are read from the OPT config on
+  # this path and ignored here. Only dropout still applies, and it overrides
+  # OPT's own.
+  dropout: 0.1
+  max_seq_len: null
+  tokenizer: vqvae
+  # No default that works: point this at the stage-1 checkpoint.
+  vqvae_ckpt: null
+
+training:
+  # 32 -> 4. Roughly 331M parameters means ~5-6 GB of AdamW state before any
+  # activations, and the sequences are ~2000 tokens. Raise it if it fits; this
+  # is the first thing to tune, and the first thing to blame for an OOM.
+  batch_size: 4
+  train_val_test_split:
+    - 0.8
+    - 0.1
+    - 0.1
+  # An order below mesh4's 1e-3. That value suits a small model trained from
+  # scratch and would wreck a pretrained backbone in the first few hundred
+  # steps; this is the usual range for fine-tuning one.
+  lr: 5e-5
+  max_epochs: 100
+  gradient_clip_val: 1.0
+  lr_scheduler: "cosine"
+  lr_decay_steps: 50
+  lr_decay_rate: 0.5
+  # Same reasoning as mesh4-train.yaml: cross-entropy over nominal code ids
+  # rises through confidence rather than error, so it selects on calibration.
+  early_stopping:
+    enabled: true
+    monitor: val_token_acc
+    patience: 10
+    mode: max
+  checkpoint:
+    enabled: true
+    monitor: val_token_acc
+    mode: max
+    save_top_k: 3
+    filename: "{epoch:02d}-{val_token_acc:.4f}"
+
+trainer:
+  accelerator: auto
+  devices: 1
+  # bf16, not 32: a 331M backbone in fp32 is most of an 80 GB card before
+  # activations. Switch back to "32" only to rule out a precision problem.
+  precision: "bf16-mixed"
+  log_every_n_steps: 50
+
+logging:
+  loggers:
+    - wandb
+  project_name: lod-generation
+  experiment_name: initial-runs
+  run_name: mesh-5
+  save_dir: outputs
+  wandb_entity: maxim-lod
+  wandb_offline: false
+  log_model: false
+
+mesh_eval:
+  enabled: true
+  every_n_epochs: 10
+  n_val: 8
+  n_test: 32
+  batch_size: 8
+  n_points: 4096
+  taus: [0.25, 0.5]
+  voxel_m: 0.25
+  save_samples: 8
+
+resume_from: null

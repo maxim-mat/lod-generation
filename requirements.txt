@@ -24,3 +24,5 @@ rich>=13.0.0  # Optional, but nice for progress bars
 # Development & Notebooks
 jupyter>=1.0.0
 pytest>=7.0.0
+# OPT backbone for the mesh transformer (mesh_model.backbone: opt)
+transformers>=4.39

@@ -40,23 +40,28 @@ from src.eval.mesh_metrics import chamfer_distance, surface_distances
 logger = logging.getLogger(__name__)
 
 
-class MeshTransformer(nn.Module):
-    """Decoder-only transformer over ``[LOD1 tokens] + [BOS, LOD2 tokens, EOS]``.
+class MeshEmbedding(nn.Module):
+    """How a mesh sequence becomes vectors, independent of what consumes them.
+
+    Shared by the from-scratch stack and the OPT-backed one so there is a single
+    implementation of the part that is easy to get subtly wrong: a code id is
+    embedded from the frozen codebook, the specials come from a small free
+    table, and every token carries both its slot within a face and which half of
+    the sequence it belongs to.
 
     Args:
-        vocab_size (int): coordinate bins plus BOS/EOS/PAD.
-        d_model (int): channel width; must be divisible by n_head.
-        max_seq_len (int): capacity of the learned positional embedding.
-            Positions restart per segment, so it must cover the longer of
-            ``len(cond)`` and ``len(tgt) - 1``, not their sum;
-            `MeshDataset.max_seq_len` reports what the data needs.
+        vocab_size (int): coordinate bins, or codebook entries, plus BOS/EOS/PAD.
+        d_model (int): width of the vectors handed to the backbone.
+        cond_dim (int, optional): width of the continuous LOD1 features under
+            the VQ-VAE tokenizer. None keeps the coordinate path, where the
+            condition is token ids.
+        codebook (Tensor, optional): ``[codebook_size, codebook_dim]`` snapshot.
+        tokens_per_face (int, optional): 3 vertices x depth, for the face slot.
     """
 
-    def __init__(self, vocab_size, d_model=256, n_head=8, num_layers=6,
-                 dropout=0.1, max_seq_len=4096, cond_dim=None,
-                 codebook=None, tokens_per_face=None):
+    def __init__(self, vocab_size, d_model, cond_dim=None, codebook=None,
+                 tokens_per_face=None):
         super().__init__()
-        self.max_seq_len = max_seq_len
         # Under the VQ-VAE tokenizer the condition arrives as continuous
         # per-face features rather than token ids, so it needs a projection
         # instead of a lookup. None keeps the coordinate path exactly as it was.
@@ -88,19 +93,18 @@ class MeshTransformer(nn.Module):
             # `face_per_token + 3` with the specials at 0..2.
             self.face_pos_embed = nn.Embedding(tokens_per_face + 3, d_model)
 
-        self.pos_embed = nn.Embedding(max_seq_len, d_model)
-        # Which half of the prefix a position belongs to. Without it the model
+        # Which half of the sequence a position belongs to. Without it the model
         # has to infer the LOD1/LOD2 boundary from the BOS token alone.
         self.segment_embed = nn.Embedding(2, d_model)
-        self.drop = nn.Dropout(dropout)
 
-        layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_head, dim_feedforward=4 * d_model,
-            dropout=dropout, activation="gelu", batch_first=True, norm_first=True,
-        )
-        self.blocks = nn.TransformerEncoder(layer, num_layers=num_layers)
-        self.norm = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, vocab_size)
+    def embed_cond(self, cond):
+        """The LOD1 prefix: a projection of face features, or a token lookup.
+
+        The two halves are embedded separately because under the VQ-VAE
+        tokenizer they no longer share a vocabulary: the condition is a
+        projected face feature, the target a code id.
+        """
+        return self.cond_proj(cond) if cond.is_floating_point() else self.embed_tokens(cond)
 
     def embed_tokens(self, ids):
         """[B, L] ids to [B, L, d], where ``ids[:, 0]`` is the segment's first token.
@@ -124,6 +128,37 @@ class MeshTransformer(nn.Module):
         slot = 3 + (index - 1) % self.tokens_per_face
         slot = torch.where(is_code, slot[None].expand_as(ids), special)
         return out + self.face_pos_embed(slot)
+
+
+class MeshTransformer(MeshEmbedding):
+    """Decoder-only transformer over ``[LOD1 tokens] + [BOS, LOD2 tokens, EOS]``.
+
+    Trained from scratch. `MeshOPTTransformer` is the alternative backbone.
+
+    Args:
+        vocab_size (int): coordinate bins plus BOS/EOS/PAD.
+        d_model (int): channel width; must be divisible by n_head.
+        max_seq_len (int): capacity of the learned positional embedding.
+            Positions restart per segment, so it must cover the longer of
+            ``len(cond)`` and ``len(tgt) - 1``, not their sum;
+            `MeshDataset.max_seq_len` reports what the data needs.
+    """
+
+    def __init__(self, vocab_size, d_model=256, n_head=8, num_layers=6,
+                 dropout=0.1, max_seq_len=4096, cond_dim=None,
+                 codebook=None, tokens_per_face=None):
+        super().__init__(vocab_size, d_model, cond_dim, codebook, tokens_per_face)
+        self.max_seq_len = max_seq_len
+        self.pos_embed = nn.Embedding(max_seq_len, d_model)
+        self.drop = nn.Dropout(dropout)
+
+        layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_head, dim_feedforward=4 * d_model,
+            dropout=dropout, activation="gelu", batch_first=True, norm_first=True,
+        )
+        self.blocks = nn.TransformerEncoder(layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size)
 
     def forward(self, cond, tgt, cond_pad_mask=None, tgt_pad_mask=None):
         """Next-token logits for the target sequence.
@@ -157,11 +192,7 @@ class MeshTransformer(nn.Module):
                          torch.arange(n_tgt - 1, device=device)])
         segment = (torch.arange(length, device=device) >= n_cond).long()
 
-        # The two halves are embedded separately because under the VQ-VAE
-        # tokenizer they no longer share a vocabulary: the condition is a
-        # projected face feature, the target a code id.
-        cond_h = self.cond_proj(cond) if cond.is_floating_point() else self.embed_tokens(cond)
-        x = torch.cat([cond_h, self.embed_tokens(tgt[:, :-1])], dim=1)
+        x = torch.cat([self.embed_cond(cond), self.embed_tokens(tgt[:, :-1])], dim=1)
         h = self.drop(x + self.pos_embed(pos) + self.segment_embed(segment))
 
         # Bool, not the float mask from generate_square_subsequent_mask: torch
@@ -175,13 +206,102 @@ class MeshTransformer(nn.Module):
         return self.head(self.norm(h[:, n_cond:]))
 
 
+class MeshOPTTransformer(MeshEmbedding):
+    """The same sequence, over an OPT backbone (MeshAnything's `ShapeOPT`).
+
+    The paper adopts OPT-350M for stage 2. This reaches that a different way
+    than the reference does, deliberately:
+
+      * The reference subclasses `OPTDecoder` to inject its embeddings, pinned
+        to `transformers==4.39.3`. Subclassing library internals across a major
+        version is a silent-breakage machine, and this project is on 5.x. Here
+        every embedding is built in `MeshEmbedding` and handed to OPT as
+        `inputs_embeds`, so no HF internal is touched.
+      * Positions therefore come from OPT and count straight through the
+        condition into the target, rather than restarting per segment. That is
+        what the reference does too, and what its fixed 257-token condition
+        makes safe. Ours is variable-length, so the segment embedding is doing
+        more work here than it does there.
+
+    Note the reference builds this with `from_config` -- random weights, then
+    its own checkpoint. Whether the published model was warm-started from OPT's
+    language weights is in the paper text only, not in the released code, which
+    is why `pretrained` is a switch rather than an assumption.
+
+    Args:
+        vocab_size (int): codebook entries plus BOS/EOS/PAD.
+        opt_name (str): HF model id, e.g. ``facebook/opt-350m``.
+        pretrained (bool): load OPT's weights, or only its architecture.
+        opt_config (OPTConfig, optional): bypass the hub entirely. Tests pass a
+            tiny config here; nothing else should need it.
+    """
+
+    def __init__(self, vocab_size, opt_name="facebook/opt-350m", pretrained=True,
+                 cond_dim=None, codebook=None, tokens_per_face=None,
+                 dropout=None, opt_config=None):
+        from transformers import AutoConfig, OPTConfig, OPTForCausalLM
+
+        if opt_config is not None:
+            opt = OPTForCausalLM(opt_config)
+        elif pretrained:
+            opt = OPTForCausalLM.from_pretrained(opt_name)
+        else:
+            opt = OPTForCausalLM(AutoConfig.from_pretrained(opt_name))
+        cfg = opt.config
+        if dropout is not None:
+            cfg.dropout = dropout
+
+        # Embeddings are `word_embed_proj_dim` wide -- OPT projects that up to
+        # hidden_size internally, which is why the two differ on 350m (512/1024).
+        super().__init__(vocab_size, cfg.word_embed_proj_dim, cond_dim, codebook,
+                         tokens_per_face)
+
+        # Drops OPT's 50k language vocabulary, which is dead weight here: input
+        # comes from `inputs_embeds`, so the table survives only as the tied
+        # output projection, and that only ever needs `vocab_size` rows. Worth
+        # ~51M parameters on opt-350m.
+        opt.resize_token_embeddings(vocab_size)
+        self.opt = opt
+        # The combined budget, not a per-segment one: OPT's positions run
+        # through both halves. `forward` checks against it.
+        self.max_seq_len = cfg.max_position_embeddings
+
+    def forward(self, cond, tgt, cond_pad_mask=None, tgt_pad_mask=None):
+        """Next-token logits for the target sequence. Same contract as
+        `MeshTransformer.forward`, so nothing downstream can tell them apart."""
+        n_cond, n_tgt = cond.shape[1], tgt.shape[1]
+        length = n_cond + n_tgt - 1
+        if length > self.max_seq_len:
+            raise ValueError(
+                f"Condition ({n_cond}) plus target ({n_tgt - 1}) is {length}, past "
+                f"OPT's max_position_embeddings={self.max_seq_len}. Unlike the "
+                "from-scratch backbone this budget is shared, because positions "
+                "run through both halves. Lower mesh_data.max_faces."
+            )
+
+        x = torch.cat([self.embed_cond(cond), self.embed_tokens(tgt[:, :-1])], dim=1)
+        segment = (torch.arange(length, device=x.device) >= n_cond).long()
+        x = x + self.segment_embed(segment)
+
+        # 1 at real tokens: HF's convention is the opposite of torch's
+        # key_padding_mask, so the masks are inverted rather than passed through.
+        if cond_pad_mask is not None and tgt_pad_mask is not None:
+            attn = (~torch.cat([cond_pad_mask, tgt_pad_mask[:, :-1]], dim=1)).long()
+        else:
+            attn = torch.ones(x.shape[:2], dtype=torch.long, device=x.device)
+
+        out = self.opt(inputs_embeds=x, attention_mask=attn)
+        return out.logits[:, n_cond:]
+
+
 class MeshTransformerModule(L.LightningModule):
     """Lightning wrapper: next-token cross-entropy over the LOD2 token sequence."""
 
     def __init__(self, num_bins=NUM_BINS, d_model=256, n_head=8, num_layers=6,
                  dropout=0.1, max_seq_len=4096, lr=1e-4,
                  lr_scheduler="none", lr_decay_steps=50, lr_decay_rate=0.5,
-                 vqvae=None):
+                 vqvae=None, backbone="scratch", opt_name="facebook/opt-350m",
+                 opt_pretrained=True, opt_config=None):
         """
         Args:
             num_bins (int): coordinate discretization used by the tokenizer.
@@ -197,7 +317,9 @@ class MeshTransformerModule(L.LightningModule):
         super().__init__()
         # The tokenizer is a module, not a hyperparameter: pickling it into the
         # checkpoint would store a second copy of stage 1 in every stage-2 file.
-        self.save_hyperparameters(ignore=["vqvae"])
+        # `opt_config` likewise -- it is a test hook, and a checkpoint that
+        # carried one would rebuild the tiny stand-in instead of the real model.
+        self.save_hyperparameters(ignore=["vqvae", "opt_config"])
 
         self.num_bins = num_bins
         self.lr = lr
@@ -225,14 +347,28 @@ class MeshTransformerModule(L.LightningModule):
             self.bos, self.eos, self.pad = base, base + 1, base + 2
             vocab, cond_dim = base + 3, vqvae.head.in_features
 
-        self.network = MeshTransformer(
-            vocab_size=vocab, d_model=d_model, n_head=n_head,
-            num_layers=num_layers, dropout=dropout, max_seq_len=max_seq_len,
-            cond_dim=cond_dim,
-            # Shared across residual stages, so one book is the whole vocabulary.
-            codebook=None if vqvae is None else vqvae.quantizer.codebooks[0],
-            tokens_per_face=None if vqvae is None else vqvae.tokens_per_face,
-        )
+        # Shared across residual stages, so one book is the whole vocabulary.
+        codebook = None if vqvae is None else vqvae.quantizer.codebooks[0]
+        per_face = None if vqvae is None else vqvae.tokens_per_face
+
+        if backbone == "scratch":
+            self.network = MeshTransformer(
+                vocab_size=vocab, d_model=d_model, n_head=n_head,
+                num_layers=num_layers, dropout=dropout, max_seq_len=max_seq_len,
+                cond_dim=cond_dim, codebook=codebook, tokens_per_face=per_face,
+            )
+        elif backbone == "opt":
+            # d_model / n_head / num_layers / max_seq_len come from the OPT
+            # config instead; leaving them in the signature keeps one set of
+            # hyperparameters for both backbones rather than two.
+            self.network = MeshOPTTransformer(
+                vocab_size=vocab, opt_name=opt_name, pretrained=opt_pretrained,
+                cond_dim=cond_dim, codebook=codebook, tokens_per_face=per_face,
+                dropout=dropout, opt_config=opt_config,
+            )
+        else:
+            raise ValueError(f"Unknown backbone: {backbone!r}. Expected "
+                             "'scratch' or 'opt'.")
 
     def train(self, mode=True):
         """Keep the frozen tokenizer in eval, whatever Lightning does.
@@ -331,11 +467,16 @@ class MeshTransformerModule(L.LightningModule):
 
         Args:
             tokens: [L] ids for one mesh.
-            cond: optional [Fc, d] encoded LOD1 features for *this* mesh, with
-                padding already trimmed. Used only when the VQ-VAE's decoder was
-                fine-tuned with a condition (`conditioned_decoder`); a plain
-                stage-1 decoder has untrained condition weights, so handing it
-                one would corrupt the decode rather than sharpen it.
+            cond: [Fc, d] encoded LOD1 features for *this* mesh, with padding
+                already trimmed. Required when the VQ-VAE's decoder was
+                fine-tuned with a condition (`conditioned_decoder`), ignored
+                otherwise: a plain stage-1 decoder has untrained condition
+                weights, so handing it one would corrupt the decode rather than
+                sharpen it. `_item_cond` produces it from a `_prepare` batch.
+
+        Raises:
+            ValueError: the decoder went through the stage-1b fine-tune and no
+                condition was given.
         """
         # Callers hand this CPU tensors (the coordinate path is numpy anyway);
         # the VQ-VAE decode below is a forward pass on this module's device.
@@ -351,7 +492,20 @@ class MeshTransformerModule(L.LightningModule):
         if len(codes) == 0:
             return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
 
-        if cond is not None and self.vqvae.conditioned_decoder:
+        if self.vqvae.conditioned_decoder:
+            # Loudly, not silently. `cond=None` here still returns a mesh --
+            # a scrambled one, because the decoder was fine-tuned with the
+            # condition prepended and never learned to work without it. That
+            # reads downstream as a broken model or a broken dataset, which is
+            # a far more expensive thing to debug than a missing argument.
+            if cond is None:
+                raise ValueError(
+                    "This VQ-VAE went through the stage-1b fine-tune "
+                    "(conditioned_decoder=True), so its decoder needs the LOD1 "
+                    "condition it was trained with. Pass "
+                    "cond=model._item_cond((cond, cond_pad), i) from the same "
+                    "`_prepare` batch as these tokens."
+                )
             cond = torch.as_tensor(cond).to(self.device)
             cond = cond[None] if cond.dim() == 2 else cond
         else:
