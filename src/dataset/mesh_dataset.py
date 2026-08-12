@@ -21,6 +21,7 @@ rather than reimplemented.
 import json
 import logging
 import os
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -37,16 +38,36 @@ logger = logging.getLogger(__name__)
 # thing the model needs, and the specials keep their offsets relative to it.
 NUM_BINS = 128
 BOS, EOS, PAD = NUM_BINS, NUM_BINS + 1, NUM_BINS + 2
+# Adjacent Mesh Tokenization's interruption token, the paper's '&'. Sits *above*
+# the existing three so the coordinate vocabulary keeps its exact layout and a
+# checkpoint trained before AMT still has the right number of output rows.
+BREAK = NUM_BINS + 3
 
 
-def vocab_size(num_bins=NUM_BINS):
-    """Coordinate bins plus BOS / EOS / PAD."""
-    return num_bins + 3
+def vocab_size(num_bins=NUM_BINS, tokenization="coord"):
+    """Coordinate bins plus BOS / EOS / PAD, and BREAK under AMT.
+
+    Args:
+        num_bins (int): coordinate discretization.
+        tokenization (str): ``"coord"`` (default) or ``"amt"``. Only AMT pays
+            for the break token, so existing runs are bit-identical.
+    """
+    return num_bins + (4 if tokenization == "amt" else 3)
 
 
 def specials(num_bins=NUM_BINS):
-    """(bos, eos, pad) token ids for a given bin count."""
+    """(bos, eos, pad) token ids for a given bin count.
+
+    Deliberately still a 3-tuple: several call sites unpack it as one, and BREAK
+    is not a sequence delimiter in the same sense -- it appears *inside* the
+    mesh body. Use `break_token` for that.
+    """
     return num_bins, num_bins + 1, num_bins + 2
+
+
+def break_token(num_bins=NUM_BINS):
+    """AMT's '&' interruption token for a given bin count."""
+    return num_bins + 3
 
 
 # ----------------------------------------------------------------------
@@ -153,6 +174,85 @@ def canonicalize(verts, faces):
     return uniq[order], faces
 
 
+def signed_volume(verts, faces):
+    """Divergence-theorem volume. Meaningful only for a closed surface.
+
+    Positive when the winding puts normals outward, which is the convention
+    `canonicalize` preserves and every downstream normal metric assumes.
+    """
+    if len(faces) == 0:
+        return 0.0
+    tri = np.asarray(verts, dtype=float)[np.asarray(faces, dtype=np.int64)]
+    return float(np.einsum("ij,ij->i",
+                           tri[:, 0], np.cross(tri[:, 1], tri[:, 2])).sum() / 6.0)
+
+
+def fix_winding(verts, faces):
+    """Make winding consistent across shared edges, then orient outward.
+
+    Two triangles sharing an edge are consistently wound exactly when they
+    traverse that edge in *opposite* directions. This walks the face-adjacency
+    graph from an arbitrary seed per connected component, flipping any face that
+    disagrees with the neighbour it was reached from, then flips the whole mesh
+    if the resulting signed volume is negative.
+
+    trimesh's `fix_normals(multibody=False)`, which is what MeshAnything's
+    `main.py` calls after decoding (`buaacyw/MeshAnything`).
+
+    Lives here rather than in `src.eval` because `amt_detokenize` *needs* it:
+    AMT stores a face as "the previous two vertices plus one new one", which
+    fixes the triangle but not which way round it is wound. See that function.
+
+    Args:
+        verts: [V, 3] coordinates, used only for the final outward test.
+        faces: [F, 3] vertex indices.
+
+    Returns:
+        np.ndarray: [F, 3] int64, some rows reversed.
+    """
+    faces = np.asarray(faces, dtype=np.int64)
+    if len(faces) == 0:
+        return faces
+
+    edge_faces = defaultdict(list)
+    for fi, (a, b, c) in enumerate(faces):
+        for u, v in ((a, b), (b, c), (c, a)):
+            if u != v:                      # a degenerate edge joins nothing
+                edge_faces[(min(u, v), max(u, v))].append(fi)
+
+    flip = np.zeros(len(faces), dtype=bool)
+    seen = np.zeros(len(faces), dtype=bool)
+
+    for seed in range(len(faces)):
+        if seen[seed]:
+            continue
+        seen[seed] = True
+        stack = [seed]
+        while stack:
+            fi = stack.pop()
+            tri = faces[fi][::-1] if flip[fi] else faces[fi]
+            for i in range(3):
+                u, v = int(tri[i]), int(tri[(i + 1) % 3])
+                if u == v:
+                    continue
+                for fj in edge_faces[(min(u, v), max(u, v))]:
+                    if seen[fj]:
+                        continue
+                    seen[fj] = True
+                    g = faces[fj]
+                    # fj is unvisited so its flip flag is still False; if it
+                    # walks (u, v) the same way round, the two disagree.
+                    flip[fj] = any(int(g[k]) == u and int(g[(k + 1) % 3]) == v
+                                   for k in range(3))
+                    stack.append(fj)
+
+    out = faces.copy()
+    out[flip] = out[flip][:, ::-1]
+    if signed_volume(verts, out) < 0:
+        out = out[:, ::-1]
+    return out
+
+
 # ----------------------------------------------------------------------
 # Tokenizer
 # ----------------------------------------------------------------------
@@ -192,6 +292,152 @@ def detokenize(tokens, num_bins=NUM_BINS):
     faces = np.arange(len(q), dtype=np.int64).reshape(-1, 3)
     q, faces = canonicalize(q, faces)
     return dequantize(q, num_bins), faces
+
+
+# ----------------------------------------------------------------------
+# Adjacent Mesh Tokenization (MeshAnything V2, arXiv:2408.02555, Algorithm 1)
+# ----------------------------------------------------------------------
+
+def _amt_strip(faces):
+    """Algorithm 1: faces to a vertex-index walk, ``None`` marking a break.
+
+    A face adjacent to the previous one costs a *single* new vertex, because its
+    other two are the last two already in the sequence. When no unvisited
+    adjacent face exists the walk emits a break and restarts from the
+    lowest-indexed unvisited face -- the paper's '&'.
+
+    Ties are broken by lowest face index, which is what keeps the output unique
+    per mesh: `canonicalize` has already fixed that order, and the paper relies
+    on the same ("we consistently choose the face with the earlier index in the
+    sorted list whenever there are multiple choices").
+
+    Deliberately no vertex swap ('$', V2 section 3.1). It buys a further ~8%
+    compression at slightly worse accuracy in the paper's own Table 2, and costs
+    a second special token plus a case in the inverse.
+
+    Args:
+        faces: [F, 3] vertex indices, already canonical.
+
+    Returns:
+        list: vertex indices, with ``None`` where a break belongs.
+    """
+    n = len(faces)
+    if n == 0:
+        return []
+
+    edge_faces = defaultdict(list)
+    for fi, (a, b, c) in enumerate(faces):
+        for u, v in ((a, b), (b, c), (c, a)):
+            if u != v:
+                edge_faces[(min(u, v), max(u, v))].append(fi)
+
+    unvisited = set(range(n))
+    seq, cursor = [], 0
+
+    def take_lowest_unvisited():
+        nonlocal cursor
+        while cursor < n and cursor not in unvisited:
+            cursor += 1
+        return cursor if cursor < n else None
+
+    start = take_lowest_unvisited()
+    unvisited.discard(start)
+    seq.extend(int(v) for v in faces[start])
+
+    while unvisited:
+        u, v = seq[-2], seq[-1]
+        third = None
+        for fj in sorted(edge_faces.get((min(u, v), max(u, v)), [])):
+            if fj not in unvisited:
+                continue
+            rest = [int(w) for w in faces[fj] if w != u and w != v]
+            if rest:                       # a degenerate face has no third vertex
+                third, _ = rest[0], unvisited.discard(fj)
+                break
+        if third is not None:
+            seq.append(third)
+            continue
+
+        nxt = take_lowest_unvisited()
+        if nxt is None:
+            break
+        unvisited.discard(nxt)
+        seq.append(None)
+        seq.extend(int(w) for w in faces[nxt])
+
+    return seq
+
+
+def amt_tokenize(verts, faces, num_bins=NUM_BINS):
+    """Triangle mesh in [-0.5, 0.5] to an AMT token sequence.
+
+    Same canonical order and same quantization as `tokenize` -- AMT changes only
+    how the face list is spelled out, not the geometry or the sort. A vertex
+    costs 3 coordinate tokens; a break costs 1.
+
+    Measured on `data/The Hague/mini` LOD2: 0.55x the coordinate tokenizer's
+    length, against ~0.49x reported on Objaverse.
+
+    Returns:
+        np.ndarray: [L] int64, no BOS/EOS (the dataset adds those).
+    """
+    q, f = canonicalize(quantize(verts, num_bins), faces)
+    brk = break_token(num_bins)
+
+    out = []
+    for entry in _amt_strip(f):
+        if entry is None:
+            out.append(brk)
+        else:
+            out.extend(int(c) for c in q[entry])
+    return np.asarray(out, dtype=np.int64)
+
+
+def amt_detokenize(tokens, num_bins=NUM_BINS):
+    """Inverse of `amt_tokenize`: reverse Algorithm 1.
+
+    Within a strip the first three vertices are a face and every vertex after
+    that closes one with the preceding two -- a triangle strip. A break resets
+    the strip. BOS/EOS/PAD and any trailing partial vertex are dropped, so a
+    truncated generation still decodes the faces it managed to close.
+
+    **Winding is recovered, not stored.** AMT records that three vertices form a
+    triangle but not which way round it is wound: the reconstruction always
+    reads `(previous two, new)`, which for a consistently wound closed mesh is
+    the *reverse* of the original face. `fix_winding` repairs that -- consistent
+    across shared edges, then outward by the volume test -- which is exactly why
+    the reference runs `fix_normals()` after decoding. On an open or badly
+    broken mesh the global flip is a guess, so AMT is a poorer fit there than
+    the coordinate tokenizer, whose inverse is exact.
+
+    Returns:
+        tuple: (verts [V, 3] float, faces [F, 3] int64) in [-0.5, 0.5].
+    """
+    brk = break_token(num_bins)
+    tokens = np.asarray(tokens, dtype=np.int64).reshape(-1)
+    tokens = tokens[(tokens >= 0) & ((tokens < num_bins) | (tokens == brk))]
+
+    tris, strip, buf = [], [], []
+    for t in tokens:
+        if t == brk:
+            strip, buf = [], []
+            continue
+        buf.append(int(t))
+        if len(buf) < 3:
+            continue
+        strip.append(buf)
+        buf = []
+        if len(strip) >= 3:
+            tris.append(strip[-3] + strip[-2] + strip[-1])
+
+    if not tris:
+        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
+
+    q = np.asarray(tris, dtype=np.int64).reshape(-1, 3)   # one row per face vertex
+    faces = np.arange(len(q), dtype=np.int64).reshape(-1, 3)
+    q, faces = canonicalize(q, faces)
+    verts = dequantize(q, num_bins)
+    return verts, fix_winding(verts, faces)
 
 
 # ----------------------------------------------------------------------
@@ -301,9 +547,14 @@ class MeshDataset(Dataset):
 
     def __init__(self, dataset_dir, lod_in="LOD1_synth", lod_out="LOD2",
                  num_bins=NUM_BINS, margin_lo=(0.0, 0.0, 0.0),
-                 margin_hi=(0.0, 0.0, 0.1), max_faces=None, max_files=None):
+                 margin_hi=(0.0, 0.0, 0.1), max_faces=None, max_files=None,
+                 tokenization="coord"):
         self.dataset_dir = Path(dataset_dir)
         self.num_bins = num_bins
+        if tokenization not in ("coord", "amt"):
+            raise ValueError(f"Unknown tokenization: {tokenization!r}. "
+                             "Expected 'coord' or 'amt'.")
+        self.tokenization = tokenization
         self.margin_lo = np.broadcast_to(np.asarray(margin_lo, dtype=float), (3,))
         self.margin_hi = np.broadcast_to(np.asarray(margin_hi, dtype=float), (3,))
         self.bos, self.eos, self.pad = specials(num_bins)
@@ -331,10 +582,21 @@ class MeshDataset(Dataset):
         # exceeded by a batch that pairs the longest condition with the longest
         # target. The condition contributes 9 tokens per face, the target those
         # plus BOS (the trailing EOS is never fed back in).
-        self.max_seq_len = max((max(9 * len(a[1]), 9 * len(b[1]) + 1)
-                                for a, b in self.pairs), default=1)
-        logger.info("MeshDataset: %d buildings, longest segment %d tokens",
-                    len(self.ids), self.max_seq_len)
+        if self.tokenization == "amt":
+            # AMT's length depends on face *adjacency*, not just face count, so
+            # unlike the 9-per-face formula it cannot be derived -- it has to be
+            # measured. One tokenizing pass over the corpus at load (~1 ms per
+            # building); the alternative is a 10-per-face upper bound that would
+            # oversize the positional embedding by ~2x and throw away the
+            # compression this tokenizer exists for.
+            self.max_seq_len = max((max(len(item["cond"]), len(item["tgt"]) - 1)
+                                    for item in (self[i] for i in range(len(self.ids)))),
+                                   default=1)
+        else:
+            self.max_seq_len = max((max(9 * len(a[1]), 9 * len(b[1]) + 1)
+                                    for a, b in self.pairs), default=1)
+        logger.info("MeshDataset: %d buildings, %s tokenizer, longest segment %d tokens",
+                    len(self.ids), self.tokenization, self.max_seq_len)
         self._log_overflow()
 
     def _log_overflow(self):
@@ -396,8 +658,9 @@ class MeshDataset(Dataset):
         v_out_n, _, _ = normalize_to_unit_box(
             v_out, ref=v_in, margin_lo=self.margin_lo, margin_hi=self.margin_hi)
 
-        cond = tokenize(v_in_n, f_in, self.num_bins)
-        body = tokenize(v_out_n, f_out, self.num_bins)
+        tok = amt_tokenize if self.tokenization == "amt" else tokenize
+        cond = tok(v_in_n, f_in, self.num_bins)
+        body = tok(v_out_n, f_out, self.num_bins)
         tgt = np.concatenate([[self.bos], body, [self.eos]])
 
         return {

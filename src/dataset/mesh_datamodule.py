@@ -33,8 +33,10 @@ class MeshDataModule(L.LightningDataModule):
                  num_bins=NUM_BINS, margin_lo=(0.0, 0.0, 0.0),
                  margin_hi=(0.0, 0.0, 0.1), max_faces=None, max_files=None,
                  batch_size=8, train_val_test_split=(0.8, 0.1, 0.1),
-                 num_workers=0, persistent_workers=False, seed=42):
+                 num_workers=0, persistent_workers=False, seed=42,
+                 tokenization="coord"):
         super().__init__()
+        self.tokenization = tokenization
         self.dataset_dir = dataset_dir
         self.lod_in = lod_in
         self.lod_out = lod_out
@@ -64,6 +66,7 @@ class MeshDataModule(L.LightningDataModule):
             num_bins=self.num_bins, margin_lo=self.margin_lo,
             margin_hi=self.margin_hi,
             max_faces=self.max_faces, max_files=self.max_files,
+            tokenization=self.tokenization,
         )
         total = len(self.full_dataset)
         if total == 0:

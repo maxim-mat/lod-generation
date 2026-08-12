@@ -91,6 +91,19 @@ class MeshDataConfig:
     # Coordinate discretization. 128 is the MeshAnything/MeshGPT default; it
     # bounds how exactly the tokenizer can reproduce a mesh.
     num_bins: int = 128
+    # How the face list is spelled out as a sequence. Orthogonal to
+    # `mesh_model.tokenizer`, which chooses what a token *is*:
+    #   "coord" -- three vertices per face, 9 tokens. The exact inverse, and the
+    #       default, so every existing run and checkpoint is unaffected.
+    #   "amt"   -- Adjacent Mesh Tokenization (MeshAnything V2,
+    #       arXiv:2408.02555, Algorithm 1): one new vertex per face wherever it
+    #       is adjacent to the previous one, with a break token otherwise.
+    #       Measured 0.55x the sequence length on The Hague/mini LOD2, against
+    #       ~0.49x reported on Objaverse. Adds one id to the vocabulary.
+    # AMT requires `mesh_model.tokenizer: coord` -- V2 drops the VQ-VAE for
+    # exactly this reason, and the combination raises rather than silently
+    # ignoring one of them.
+    tokenization: str = "coord"
     # Per-axis (x, y, z) headroom below / above the LOD1 normalization box, as a
     # fraction of its scale, so LOD2 geometry outside that box is not quantized
     # flat onto a box face. Split by side, and settable on all six, because the
@@ -153,6 +166,13 @@ class MeshModelConfig:
     # Stage-1 checkpoint. Required when tokenizer == "vqvae"; the codebook is
     # loaded frozen, so nothing here can move the vocabulary mid-run.
     vqvae_ckpt: Optional[str] = None
+    # Masking Invalid Predictions (MeshAnything V2 section 3.2, from PolyGen):
+    # at sampling time, zero out logits for tokens that cannot legally follow --
+    # EOS in the middle of a face, a break straight after a break, a break
+    # before a strip has three vertices. Affects generation only, never
+    # training, so it can be turned on for an existing checkpoint. Off by
+    # default so an existing run's samples stay reproducible.
+    mask_invalid: bool = False
     # "scratch" -- the transformer defined here, sized by d_model / n_head /
     # num_layers / max_seq_len above. "opt" -- an OPT backbone, which is what
     # the paper adopts for stage 2; those four fields are then read from the

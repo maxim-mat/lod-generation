@@ -34,10 +34,99 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.dataset.mesh_dataset import NUM_BINS, detokenize, specials, vocab_size
+from src.dataset.mesh_dataset import (
+    NUM_BINS,
+    amt_detokenize,
+    break_token,
+    detokenize,
+    specials,
+    vocab_size,
+)
 from src.eval.mesh_metrics import chamfer_distance, surface_distances
 
 logger = logging.getLogger(__name__)
+
+
+def invalid_logits_mask(tgt, vocab, num_bins, tokenization="coord", pad=None):
+    """Which next tokens are structurally illegal, given the sequence so far.
+
+    "Masking Invalid Predictions", MeshAnything V2 section 3.2, inherited from
+    PolyGen (Nash et al., 2020). A decoder-only model can end a sequence in the
+    middle of a face or emit two breaks in a row; nothing in the loss forbids
+    it, and the result decodes to a mesh missing its last triangle. Masking the
+    logits at sampling time makes those states unreachable instead of merely
+    unlikely.
+
+    Rules, all keyed off how far into the current face/strip the sequence is:
+      * BOS and PAD are never legal after position 0 -- they are not mesh
+        content, and PAD in particular would be read back as padding.
+      * On the coordinate path a face is 9 tokens, so EOS is legal only on a
+        multiple of 9.
+      * Under AMT a vertex is 3 tokens and a strip needs 3 vertices before it
+        describes a face, so BREAK and EOS are legal only on a vertex boundary
+        with at least 3 vertices standing -- the paper's "at least three
+        vertices must be generated before allowing any interruptions", which
+        also rules out a break straight after a break.
+
+    Coordinate tokens are never masked, so the mask can never block the whole
+    vocabulary and deadlock sampling.
+
+    Args:
+        tgt: [B, L] tokens generated so far, including the leading BOS.
+        vocab (int): width of the logits, from `vocab_size`.
+        num_bins (int): coordinate discretization.
+        tokenization (str): ``"coord"`` or ``"amt"``.
+        pad (int, optional): PAD id. Defaults to the coordinate layout's.
+
+    Returns:
+        Tensor: [B, vocab] bool, True where sampling that token is illegal.
+    """
+    bos, eos, pad_id = specials(num_bins)
+    pad = pad_id if pad is None else pad
+    brk = break_token(num_bins)
+
+    device = tgt.device
+    b = tgt.shape[0]
+    mask = torch.zeros((b, vocab), dtype=torch.bool, device=device)
+
+    # Never re-open the sequence, never emit padding as content.
+    for tok in (bos, pad):
+        if tok < vocab:
+            mask[:, tok] = True
+
+    body = tgt[:, 1:]                      # drop the leading BOS
+    is_coord = (body >= 0) & (body < num_bins)
+
+    if body.shape[1] == 0:
+        # Nothing emitted yet: no face stands, so only coordinates are legal.
+        for tok in (eos, brk):
+            if tok < vocab:
+                mask[:, tok] = True
+        return mask
+
+    if tokenization == "amt":
+        # Coordinates since the last break: a break resets the strip, so only
+        # the tail after the final break counts toward the 3-vertex rule.
+        is_break = body == brk
+        # Index of the most recent break per row, -1 when there is none.
+        idx = torch.arange(body.shape[1], device=device)[None].expand_as(body)
+        last_break = torch.where(is_break, idx, torch.full_like(idx, -1)).max(dim=1).values
+        after = (idx > last_break[:, None]) & is_coord
+        n = after.sum(dim=1)
+        closed = (n % 3 == 0) & (n >= 9)   # whole vertices, and a face standing
+        if brk < vocab:
+            mask[:, brk] = ~closed
+        if eos < vocab:
+            mask[:, eos] = ~closed
+    else:
+        n = is_coord.sum(dim=1)
+        # `n >= 9` as well as the boundary: every LOD1 condition has exactly one
+        # correct answer and it always has at least one face, so an immediate
+        # EOS is never right. Mirrors AMT's three-vertex rule below.
+        if eos < vocab:
+            mask[:, eos] = ((n % 9) != 0) | (n < 9)
+
+    return mask
 
 
 class MeshEmbedding(nn.Module):
@@ -301,7 +390,8 @@ class MeshTransformerModule(L.LightningModule):
                  dropout=0.1, max_seq_len=4096, lr=1e-4,
                  lr_scheduler="none", lr_decay_steps=50, lr_decay_rate=0.5,
                  vqvae=None, backbone="scratch", opt_name="facebook/opt-350m",
-                 opt_pretrained=True, opt_config=None):
+                 opt_pretrained=True, opt_config=None,
+                 tokenization="coord", mask_invalid=False):
         """
         Args:
             num_bins (int): coordinate discretization used by the tokenizer.
@@ -327,10 +417,28 @@ class MeshTransformerModule(L.LightningModule):
         self.lr_decay_steps = lr_decay_steps
         self.lr_decay_rate = lr_decay_rate
 
+        # Adjacent Mesh Tokenization (MeshAnything V2, arXiv:2408.02555). Only
+        # meaningful on the coordinate path: under the VQ-VAE the sequence is
+        # codes, and V2 drops the VQ-VAE precisely so AMT can operate on
+        # coordinates. Rejected rather than ignored, because a config naming
+        # both would otherwise silently get neither.
+        if tokenization not in ("coord", "amt"):
+            raise ValueError(f"Unknown tokenization: {tokenization!r}. "
+                             "Expected 'coord' or 'amt'.")
+        if tokenization == "amt" and vqvae is not None:
+            raise ValueError(
+                "tokenization='amt' cannot be combined with a VQ-VAE tokenizer: "
+                "AMT rewrites the *coordinate* sequence, while the VQ-VAE replaces "
+                "it with codes. MeshAnything V2 drops the VQ-VAE for this reason "
+                "(arXiv:2408.02555 section 3.2). Set mesh_model.tokenizer: coord."
+            )
+        self.tokenization = tokenization
+        self.mask_invalid = mask_invalid
+
         self.vqvae = vqvae
         if vqvae is None:
             self.bos, self.eos, self.pad = specials(num_bins)
-            vocab, cond_dim = vocab_size(num_bins), None
+            vocab, cond_dim = vocab_size(num_bins, tokenization), None
         else:
             # Frozen: stage 2 must not move the vocabulary underneath the codes
             # it is learning to predict, and a drifting codebook would make the
@@ -482,7 +590,8 @@ class MeshTransformerModule(L.LightningModule):
         # the VQ-VAE decode below is a forward pass on this module's device.
         tokens = torch.as_tensor(tokens).reshape(-1).to(self.device)
         if self.vqvae is None:
-            return detokenize(tokens.cpu().numpy(), self.num_bins)
+            inverse = amt_detokenize if self.tokenization == "amt" else detokenize
+            return inverse(tokens.cpu().numpy(), self.num_bins)
 
         depth, size = self.vqvae.depth, self.vqvae.codebook_size
         per_face = self.vqvae.tokens_per_face
@@ -740,6 +849,18 @@ class MeshTransformerModule(L.LightningModule):
             step = torch.cat([tgt, torch.full_like(tgt[:, :1], self.pad)], dim=1)
             logits = self.network(cond, step, cond_pad_mask,
                                   torch.zeros_like(step, dtype=torch.bool))[:, -1]
+
+            # Masking Invalid Predictions (MeshAnything V2 section 3.2, after
+            # PolyGen): make structurally impossible tokens unreachable rather
+            # than merely unlikely. -inf, not a small penalty, so it survives
+            # any temperature. Coordinates are never masked, so this cannot
+            # starve the softmax.
+            if self.mask_invalid and self.vqvae is None:
+                bad = invalid_logits_mask(tgt, logits.shape[-1], self.num_bins,
+                                          tokenization=self.tokenization,
+                                          pad=self.pad)
+                logits = logits.masked_fill(bad, float("-inf"))
+
             if temperature <= 0:
                 nxt = logits.argmax(dim=-1)
             else:

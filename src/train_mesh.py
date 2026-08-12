@@ -70,6 +70,7 @@ def train_mesh(cfg: Config):
         margin_hi=list(cfg.mesh_data.margin_hi),
         max_faces=cfg.mesh_data.max_faces,
         max_files=cfg.mesh_data.max_files,
+        tokenization=cfg.mesh_data.tokenization,
         batch_size=cfg.training.batch_size,
         train_val_test_split=tuple(cfg.training.train_val_test_split),
         num_workers=cfg.mesh_data.num_workers,
@@ -110,6 +111,10 @@ def train_mesh(cfg: Config):
         backbone=cfg.mesh_model.backbone,
         opt_name=cfg.mesh_model.opt_name,
         opt_pretrained=cfg.mesh_model.opt_pretrained,
+        # Must match the datamodule's, or the model decodes with the wrong
+        # inverse and the vocabulary is one id short.
+        tokenization=cfg.mesh_data.tokenization,
+        mask_invalid=cfg.mesh_model.mask_invalid,
     )
     if cfg.mesh_model.backbone == "opt":
         params = sum(p.numel() for p in model.network.opt.parameters())

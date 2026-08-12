@@ -31,13 +31,21 @@ Faithfulness notes, both deliberate:
     calls.
 """
 import logging
-from collections import defaultdict
 
 import numpy as np
 
-from src.dataset.mesh_dataset import canonicalize
+# `fix_winding` / `signed_volume` live with the other geometry primitives rather
+# than here: `amt_detokenize` needs winding repair as part of its inverse, and
+# importing this module from the dataset would be a cycle. Re-exported so this
+# module still reads as the reference's three steps in one place.
+from src.dataset.mesh_dataset import canonicalize, fix_winding, signed_volume
 
 logger = logging.getLogger(__name__)
+
+_signed_volume = signed_volume        # back-compat for the self-check below
+
+__all__ = ["weld", "drop_duplicate_faces", "fix_winding", "postprocess",
+           "n_degenerate", "report", "signed_volume"]
 
 
 def weld(verts, faces):
@@ -77,78 +85,6 @@ def drop_duplicate_faces(faces):
         return faces
     _, keep = np.unique(np.sort(faces, axis=1), axis=0, return_index=True)
     return faces[np.sort(keep)]
-
-
-def _signed_volume(verts, faces):
-    """Divergence-theorem volume; meaningful only for a closed surface."""
-    if len(faces) == 0:
-        return 0.0
-    tri = np.asarray(verts, dtype=float)[faces]
-    return float(np.einsum("ij,ij->i",
-                           tri[:, 0], np.cross(tri[:, 1], tri[:, 2])).sum() / 6.0)
-
-
-def fix_winding(verts, faces):
-    """`fix_normals`: make winding consistent, then orient outward.
-
-    Two triangles sharing an edge are consistently wound exactly when they
-    traverse that edge in *opposite* directions. This walks the face-adjacency
-    graph from an arbitrary seed per connected component, flipping any face that
-    disagrees with the neighbour it was reached from, then flips the whole mesh
-    if the resulting signed volume is negative (i.e. normals point inward).
-
-    Winding carries the inside/outside distinction for these closed building
-    solids, so this is a correctness step, not cosmetics -- `signed_volume` and
-    every normal-based metric read it.
-
-    Args:
-        verts: [V, 3] coordinates, used only for the final volume test.
-        faces: [F, 3] vertex indices.
-
-    Returns:
-        np.ndarray: [F, 3] int64, some rows reversed.
-    """
-    faces = np.asarray(faces, dtype=np.int64)
-    if len(faces) == 0:
-        return faces
-
-    edge_faces = defaultdict(list)
-    for fi, (a, b, c) in enumerate(faces):
-        for u, v in ((a, b), (b, c), (c, a)):
-            if u != v:                      # a degenerate edge joins nothing
-                edge_faces[(min(u, v), max(u, v))].append(fi)
-
-    flip = np.zeros(len(faces), dtype=bool)
-    seen = np.zeros(len(faces), dtype=bool)
-
-    for seed in range(len(faces)):
-        if seen[seed]:
-            continue
-        seen[seed] = True
-        stack = [seed]
-        while stack:
-            fi = stack.pop()
-            tri = faces[fi][::-1] if flip[fi] else faces[fi]
-            for i in range(3):
-                u, v = int(tri[i]), int(tri[(i + 1) % 3])
-                if u == v:
-                    continue
-                for fj in edge_faces[(min(u, v), max(u, v))]:
-                    if seen[fj]:
-                        continue
-                    seen[fj] = True
-                    g = faces[fj]
-                    # fj is unvisited so its flip flag is still False; if it
-                    # walks (u, v) the same way round, the two disagree.
-                    flip[fj] = any(int(g[k]) == u and int(g[(k + 1) % 3]) == v
-                                   for k in range(3))
-                    stack.append(fj)
-
-    out = faces.copy()
-    out[flip] = out[flip][:, ::-1]
-    if _signed_volume(verts, out) < 0:
-        out = out[:, ::-1]
-    return out
 
 
 def postprocess(verts, faces):

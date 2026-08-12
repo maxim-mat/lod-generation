@@ -431,6 +431,56 @@ compromising mesh quality." **Adopt it for the length, not for the accuracy.**
 Also from that table: `Unsort` scores CD 8.151 against baseline's 2.478.
 Canonical ordering is worth ~3x — whatever else changes, `canonicalize` stays.
 
+### Implemented (2026-08-12), toggleable and default-off
+
+Strictly additive: `vocab_size(num_bins)` still returns `num_bins + 3`, existing
+checkpoints still load, and every existing config resolves to the old behaviour.
+
+| piece | where | toggle |
+| --- | --- | --- |
+| `BREAK` token (`num_bins + 3`) | `mesh_dataset.py` | only under AMT |
+| `amt_tokenize` / `amt_detokenize` (Algorithm 1 and its inverse) | `mesh_dataset.py` | `mesh_data.tokenization: amt` |
+| `fix_winding` / `signed_volume` | `mesh_dataset.py` | always available |
+| `invalid_logits_mask` | `mesh_transformer.py` | `mesh_model.mask_invalid: true` |
+| pass-through | `mesh_datamodule.py`, `train_mesh.py`, `config.py` | — |
+| worked example | `configs/mesh-v2-train.yaml` | — |
+
+**Winding is recovered, not stored.** AMT records that three vertices form a
+triangle but not which way round; the inverse always reads `(previous two,
+new)`, which is the reverse of the original face on a consistently wound mesh.
+`amt_detokenize` therefore runs `fix_winding` — which is exactly why the
+reference runs `fix_normals()` after decoding. `fix_winding` moved from
+`src/eval/mesh_postprocess.py` into `mesh_dataset.py` for this: it is now part
+of a tokenizer inverse, not just eval cleanup, and importing eval from dataset
+would have been a cycle. `mesh_postprocess` re-exports it, so Issue 4's panels
+are unchanged.
+
+Measured on `data/The Hague/mini` (`max_files=6`, 1670 buildings):
+
+| signal | value |
+| --- | --- |
+| target sequence length, AMT / coord | 0.542 |
+| longest segment | 1630 -> 928 tokens (0.57x) |
+| buildings decoding to the *same mesh* under both tokenizers | **1670 / 1670** |
+
+That last row is the correctness result: AMT plus winding repair is not merely
+close, it is exact on every building in the sample.
+
+AMT and the VQ-VAE are mutually exclusive and the model raises rather than
+silently ignoring one — AMT rewrites the coordinate sequence, the VQ-VAE
+replaces it with codes.
+
+Masking rules implemented (`invalid_logits_mask`), all keyed off position within
+the current face/strip: BOS and PAD never legal; EOS only on a completed face
+(coord) or a closed 3-vertex strip (AMT); BREAK only on a vertex boundary with a
+strip standing, which also forbids two breaks in a row. Coordinates are never
+masked, so the mask cannot deadlock sampling — asserted directly.
+
+Tests: `tests/test_mesh_amt.py`, 29 cases, TDD (each watched failing first).
+Pre-existing unrelated failures remain: `test_mesh_tokenizer::test_margin_is_per_axis`
+(numpy 2 removed `ndarray.ptp`) and four in `test_mesh_code_transformer`
+(`transformers` not installed) — both confirmed identical on stashed code.
+
 ### Risks
 
 - AMT needs reliable face adjacency, which here depends on `canonicalize`'s
