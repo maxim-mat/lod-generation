@@ -183,6 +183,10 @@ class MeshModelConfig:
     # initialization doing the regularizing, so treat it as an experiment
     # against a measured scratch baseline, not as a default.
     backbone: str = "scratch"
+    # Any OPT id; the two sizes worth trying here are `facebook/opt-125m`
+    # (~125M, hidden 768, no embed projection) and `facebook/opt-350m` (~331M,
+    # hidden 1024 projected from 512), both 2048 positions. Every dimension is
+    # read from the loaded config, so switching is this line and nothing else.
     opt_name: str = "facebook/opt-350m"
     # Load OPT's weights, or only its architecture. The reference builds it with
     # `from_config` (random) and loads its own checkpoint, so a warm start from

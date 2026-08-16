@@ -325,7 +325,7 @@ class MeshOPTTransformer(MeshEmbedding):
             tiny config here; nothing else should need it.
     """
 
-    def __init__(self, vocab_size, opt_name="facebook/opt-350m", pretrained=True,
+    def __init__(self, vocab_size, opt_name="facebook/opt-350m", pretrained=False,
                  cond_dim=None, codebook=None, tokens_per_face=None,
                  dropout=None, opt_config=None):
         from transformers import AutoConfig, OPTConfig, OPTForCausalLM
