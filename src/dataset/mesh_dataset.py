@@ -179,10 +179,19 @@ def signed_volume(verts, faces):
 
     Positive when the winding puts normals outward, which is the convention
     `canonicalize` preserves and every downstream normal metric assumes.
+
+    Centred on the mesh first. The sum is origin-independent only when the
+    surface is closed -- the translation terms cancel against each other. On an
+    open one the residual is ``t . sum(area vectors)``, which in EPSG:7415 (|p|
+    ~ 82,000 / 454,000) swamps the volume: one real building read 7,439,739 m3
+    against a 3,553 m3 bounding box. `fix_winding` decides the outward flip on
+    this sign, so the noise reached the geometry. Costs nothing when closed --
+    measured drift over 1,646 closed meshes was <= 1.2e-06 relative.
     """
     if len(faces) == 0:
         return 0.0
     tri = np.asarray(verts, dtype=float)[np.asarray(faces, dtype=np.int64)]
+    tri = tri - tri.reshape(-1, 3).mean(axis=0)
     return float(np.einsum("ij,ij->i",
                            tri[:, 0], np.cross(tri[:, 1], tri[:, 2])).sum() / 6.0)
 

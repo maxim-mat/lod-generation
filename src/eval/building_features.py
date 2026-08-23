@@ -70,10 +70,16 @@ def signed_volume(verts, faces):
     concave ring carried opposite sign and cancelled -- but it goes through the
     same triangulator now so the two agree on what the surface is.
     """
+    # Centred first -- see `mesh_dataset.signed_volume`. Triangulation is
+    # translation-invariant, so the same centred array serves both.
+    v = np.asarray(verts, dtype=float)
+    used = sorted({i for face in faces for ring in face for i in ring})
+    if used:
+        v = v - v[used].mean(axis=0)
     vol = 0.0
     for face in faces:
-        for a, b, c in triangulate_face(face, verts):
-            vol += np.dot(verts[a], np.cross(verts[b], verts[c]))
+        for a, b, c in triangulate_face(face, v):
+            vol += np.dot(v[a], np.cross(v[b], v[c]))
     return abs(vol) / 6.0
 
 

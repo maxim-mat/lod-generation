@@ -212,6 +212,13 @@ def signed_volume(faces, verts):
     1/6 * sum(p . N).
     """
     v = np.asarray(verts, dtype=float)
+    # Centred first: the sum is origin-independent only for a closed shell, and
+    # RD coordinates are large enough that an open one returns nonsense (see
+    # `mesh_dataset.signed_volume`). A rigid translation, so a closed shell is
+    # unchanged.
+    used = sorted({i for face in faces for ring in face for i in ring})
+    if used:
+        v = v - v[used].mean(axis=0)
     total = 0.0
     for face in faces:
         area_vec = np.zeros(3)
