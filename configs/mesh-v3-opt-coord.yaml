@@ -15,8 +15,10 @@
 # 6.6x WORSE than echoing its LOD1 input. That is the specific mistake this
 # value exists to avoid.
 #
-# batch 8 x accumulate 2 keeps the effective batch at 16, matching the scratch
-# arms, at a memory cost 125M parameters can actually afford.
+# batch 4 x accumulate 4 keeps the effective batch at 16, matching every other
+# arm, with the smallest activation footprint that still gets there. Sequences
+# run to ~2000 tokens and attention is quadratic in that, so the micro-batch is
+# what peak memory actually tracks.
 
 mode: train
 config_set: mesh
@@ -61,8 +63,9 @@ mesh_model:
   mask_invalid: true
 
 training:
-  batch_size: 8
-  accumulate_grad_batches: 2   # effective batch 16 on every run
+  batch_size: 4
+  accumulate_grad_batches: 4   # effective batch 16 on every run,
+                               # at a quarter of the peak activation memory
   train_val_test_split: [0.8, 0.1, 0.1]
   lr: 1e-4
   max_epochs: 200

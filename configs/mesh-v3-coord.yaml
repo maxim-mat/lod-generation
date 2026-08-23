@@ -57,8 +57,9 @@ mesh_model:
   mask_invalid: true
 
 training:
-  batch_size: 16
-  accumulate_grad_batches: 1   # effective batch 16 on every run
+  batch_size: 4
+  accumulate_grad_batches: 4   # effective batch 16 on every run,
+                               # at a quarter of the peak activation memory
   train_val_test_split: [0.8, 0.1, 0.1]
   lr: 1e-3
   max_epochs: 200
