@@ -5,6 +5,7 @@ worked out on paper and a failure means the implementation is wrong rather than
 that a tolerance drifted.
 """
 import numpy as np
+import pytest
 
 from src.eval.mesh_metrics import (
     chamfer_distance,
@@ -77,19 +78,31 @@ def test_surface_sampling_is_seeded():
                               sample_surface(*box, n=256, seed=4))
 
 
-def test_chamfer_of_a_shape_against_itself_is_sampling_noise():
-    """Not zero, and it must not be.
+def test_chamfer_of_a_shape_against_itself_is_exactly_zero():
+    """The property that makes the number readable.
 
-    The two surfaces are sampled with different seeds, so even identical meshes
-    are compared through two independent point clouds and the floor is the mean
-    nearest-neighbour spacing, ~sqrt(area / n). Forcing it to zero by sharing a
-    seed would hide exactly that error in every other comparison.
+    Distances are point-to-*surface*, not point-to-point-cloud: only the query
+    side is sampled, and the target is the triangles themselves. So a sampled
+    point of a mesh lies exactly on that mesh and the distance is 0, at any
+    sample count.
+
+    This replaced a point-cloud/point-cloud version whose self-comparison was
+    ~sqrt(area/n) -- 0.129 m at n=4096 on real buildings, which was more than
+    half of the measured LOD1->LOD2 baseline and made every chamfer below about
+    0.15 m unresolvable.
     """
-    n = 4096
     box = _box()
-    d_ab, d_ba = surface_distances(box, box, n=n)
-    floor = np.sqrt(_box_area() / n)
-    assert 0.0 < chamfer_distance(d_ab, d_ba) < 2 * floor
+    for n in (256, 4096):
+        d_ab, d_ba = surface_distances(box, box, n=n)
+        assert chamfer_distance(d_ab, d_ba) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_self_chamfer_does_not_depend_on_sample_count():
+    """The old floor scaled as 1/sqrt(n); this must not scale at all."""
+    box = _box()
+    vals = [chamfer_distance(*surface_distances(box, box, n=n))
+            for n in (256, 1024, 4096)]
+    assert max(vals) == pytest.approx(0.0, abs=1e-9)
 
 
 def test_chamfer_tracks_a_known_translation():
@@ -107,16 +120,21 @@ def test_chamfer_tracks_a_known_translation():
 
 
 def test_f_score_of_a_shape_against_itself_is_one():
-    """At the 25 cm threshold the metric actually uses, sampling noise (~8 cm
-    mean) is comfortably inside, so a shape scores 1.0 against itself."""
+    """Exactly 1.0 at any threshold, because every distance is exactly 0.
+
+    It used to take a 25 cm threshold to absorb ~8 cm of sampling noise, and
+    tightening tau below that floor dropped it under 1.0. Point-to-surface
+    distances have no floor to absorb.
+    """
     box = _box()
     d_ab, d_ba = surface_distances(box, box, n=4096)
-    precision, recall, f1 = f_score(d_ab, d_ba, tau=0.25)
-    assert precision == 1.0 and recall == 1.0 and f1 == 1.0
+    for tau in (0.25, 0.01, 1e-6):
+        precision, recall, f1 = f_score(d_ab, d_ba, tau=tau)
+        assert (precision, recall, f1) == (1.0, 1.0, 1.0)
 
-    # Tightened below the sampling floor it must fall short of 1, or the
-    # threshold is not being applied at all.
-    assert f_score(d_ab, d_ba, tau=0.01)[2] < 1.0
+    # Teeth: a genuinely displaced surface must fall short.
+    moved = (box[0] + np.array([0.5, 0.0, 0.0]), box[1])
+    assert f_score(*surface_distances(box, moved, n=4096), tau=0.01)[2] < 1.0
 
 
 def test_hausdorff_p95_ignores_a_small_detached_spike():

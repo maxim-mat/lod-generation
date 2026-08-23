@@ -741,8 +741,10 @@ class MeshTransformerModule(L.LightningModule):
         bias. The free-running counterpart lives in `MeshEvalCallback`, and the
         gap between the two is the exposure-bias readout.
 
-        One sample per batch, strided, because it needs a host sync and two
-        KD-tree builds -- cheap per call, but not at every training step.
+        One sample per batch, strided, because it needs a host sync and an
+        exact point-to-surface query against both meshes -- ~44 ms at n=1024,
+        cheap per call but not at every training step. At `log_every_n_steps`
+        50 that is ~12 s per training epoch on this corpus.
         """
         if stride <= 0 or batch_idx % stride or "scale" not in batch:
             return

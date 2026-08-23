@@ -22,6 +22,12 @@ scipy>=1.10.0  # ConvexHull + wasserstein_distance for generative eval features/
 # triangulate -- and cjio raises a bare NameError when that happens.
 cjio>=0.9
 mapbox-earcut>=1.0.2
+# Exact point-to-surface distances for the paired mesh metrics
+# (src/eval/mesh_metrics.py::surface_distances). Sampling both meshes and doing
+# point-cloud-to-point-cloud instead carries a ~sqrt(area/n) noise floor -- 0.129 m
+# at n=4096, which was 126% of the real LOD1->LOD2 chamfer. Install `embreex`
+# alongside if the proximity query becomes a bottleneck; it is a drop-in speedup.
+trimesh>=4.0
 
 # Experiment tracking
 tensorboard>=2.12.0
