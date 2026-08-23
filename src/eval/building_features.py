@@ -11,6 +11,8 @@ import math
 import numpy as np
 from scipy.spatial import ConvexHull
 
+from src.geometry.geometry import triangulate_face
+
 CORE_FEATURES = [
     "area", "volume", "height_diff", "num_vertices", "num_faces",
     "convex_hull_area", "ave_centroid_distance", "bbox_diagonal",
@@ -35,31 +37,42 @@ _FEATURE_SETS = {"full": FULL_FEATURES, "welldefined": WELLDEFINED_FEATURES}
 
 
 def mesh_from_cityjson(cj):
-    """(verts[V,3], faces) from the first Solid; faces are outer-ring index lists."""
+    """(verts[V,3], faces) from the first Solid; faces are whole surfaces.
+
+    A face is the CityJSON surface as stored -- ``[exterior, hole, ...]``. This
+    used to keep ``ring[0]`` only, which made `surface_area` count the courtyards
+    as roof.
+    """
     verts = np.asarray(cj["vertices"], dtype=float)
     obj = next(iter(cj["CityObjects"].values()))
-    faces = [ring[0] for ring in obj["geometry"][0]["boundaries"][0]]
+    faces = list(obj["geometry"][0]["boundaries"][0])
     return verts, faces
 
 
-def _triangulate(face):
-    """Fan-triangulate a polygon ring into (i0,i1,i2) index triples."""
-    return [(face[0], face[k], face[k + 1]) for k in range(1, len(face) - 1)]
-
-
 def surface_area(verts, faces):
+    """Total area of the boundary surface.
+
+    Absolute per-triangle areas, so unlike `signed_volume` nothing cancels: a
+    fan across a concave ring inflated this directly (2.6x on the worst
+    footprint measured), and dropped holes added them to the total.
+    """
     total = 0.0
     for face in faces:
-        for a, b, c in _triangulate(face):
+        for a, b, c in triangulate_face(face, verts):
             total += 0.5 * np.linalg.norm(np.cross(verts[b] - verts[a], verts[c] - verts[a]))
     return float(total)
 
 
 def signed_volume(verts, faces):
-    """Divergence theorem; assumes CCW-outward rings (our converter guarantees this)."""
+    """Divergence theorem; assumes CCW-outward rings (our converter guarantees this).
+
+    Was already right under the old fan -- the triangles it threw outside a
+    concave ring carried opposite sign and cancelled -- but it goes through the
+    same triangulator now so the two agree on what the surface is.
+    """
     vol = 0.0
     for face in faces:
-        for a, b, c in _triangulate(face):
+        for a, b, c in triangulate_face(face, verts):
             vol += np.dot(verts[a], np.cross(verts[b], verts[c]))
     return abs(vol) / 6.0
 
@@ -70,7 +83,9 @@ def ring_perimeter(verts, faces):
     so downstream ratios (shape_index, density) stay finite on degenerate meshes."""
     for ref in (verts[:, 2].min(), verts[:, 2].max()):
         for face in faces:
-            ring = verts[face]
+            # The exterior ring is the footprint; a light well in the slab is
+            # flat at the same z but is not the building's outline.
+            ring = verts[face[0]]
             if len(ring) >= 2 and np.allclose(ring[:, 2], ref):
                 p = sum(np.linalg.norm(ring[k] - ring[(k + 1) % len(ring)])
                         for k in range(len(ring)))

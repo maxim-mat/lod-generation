@@ -13,6 +13,16 @@ numpy>=1.24.0
 pandas>=2.0.0
 scipy>=1.10.0  # ConvexHull + wasserstein_distance for generative eval features/distribution
 
+# CityJSON surface triangulation (src/geometry/geometry.py::triangulate_face).
+# mapbox-earcut is listed explicitly rather than via `cjio[export]`: that extra
+# also pulls `triangle2`, a repackaging of Shewchuk's Triangle, whose licence is
+# not OSI-approved (free for research, commercial needs a separate one). Both
+# cjio and trimesh declare their triangulation backends as *extras* only, so a
+# plain `pip install cjio` leaves the package importable but unable to
+# triangulate -- and cjio raises a bare NameError when that happens.
+cjio>=0.9
+mapbox-earcut>=1.0.2
+
 # Experiment tracking
 tensorboard>=2.12.0
 wandb>=0.15.0

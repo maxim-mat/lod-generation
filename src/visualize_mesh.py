@@ -14,21 +14,39 @@ from src.visualize_cityjson import cityjson_figure
 
 
 def mesh_figure(verts, faces, title="", color="#2a78d6"):
-    """Shaded triangle mesh with its wireframe on top."""
+    """Shaded triangle mesh with its wireframe on top.
+
+    Hovering any triangle names it. Plotly resolves a 3D hover to the nearest
+    vertex, so the surface is built from *unshared* vertices -- three per
+    triangle -- and each carries its own triangle's text. That triples the
+    vertex array (14k on the largest object here, which plotly handles fine)
+    and is invisible under ``flatshading``, but it is the only way a Mesh3d
+    can answer "which face is this".
+    """
     v, tri = np.asarray(verts, dtype=float), np.asarray(faces, dtype=np.int64)
     fig = go.Figure()
     if len(tri):
+        corner = v[tri.reshape(-1)]                  # [3F, 3], one set per tri
+        idx = np.arange(len(tri) * 3).reshape(-1, 3)
+        tri_text = [f"tri {t} · v {a},{b},{c}"
+                    for t, (a, b, c) in enumerate(tri) for _ in range(3)]
         fig.add_trace(go.Mesh3d(
-            x=v[:, 0], y=v[:, 1], z=v[:, 2],
-            i=tri[:, 0], j=tri[:, 1], k=tri[:, 2],
-            color=color, opacity=0.45, flatshading=True, hoverinfo="skip"))
+            x=corner[:, 0], y=corner[:, 1], z=corner[:, 2],
+            i=idx[:, 0], j=idx[:, 1], k=idx[:, 2],
+            color=color, opacity=0.45, flatshading=True,
+            hovertext=tri_text, hoverinfo="text"))
         # a-b-c-a then a NaN break, so all triangles are one trace
         seg = np.full((len(tri) * 5, 3), np.nan)
         for k, col in enumerate([0, 1, 2, 0]):
             seg[k::5] = v[tri[:, col]]
+        seg_text = [""] * (len(tri) * 5)
+        for t, (a, b, c) in enumerate(tri):
+            for k, vid in enumerate((a, b, c, a)):
+                seg_text[t * 5 + k] = f"tri {t} · vertex {vid}"
         fig.add_trace(go.Scatter3d(
             x=seg[:, 0], y=seg[:, 1], z=seg[:, 2], mode="lines",
-            line=dict(color=color, width=2), showlegend=False, hoverinfo="skip"))
+            line=dict(color=color, width=2), showlegend=False,
+            hovertext=seg_text, hoverinfo="text"))
     fig.update_layout(title=title, scene=dict(aspectmode="data"))
     return fig
 

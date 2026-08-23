@@ -139,6 +139,7 @@ def train_mesh(cfg: Config):
         devices=cfg.trainer.devices,
         precision=cfg.trainer.precision,
         gradient_clip_val=cfg.training.gradient_clip_val,
+        accumulate_grad_batches=cfg.training.accumulate_grad_batches,
         callbacks=callbacks,
         logger=exp_loggers if exp_loggers else False,
         log_every_n_steps=cfg.trainer.log_every_n_steps,

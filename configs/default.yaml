@@ -56,6 +56,10 @@ training:
   max_epochs: 200
   train_val_test_split: [0.8, 0.1, 0.1]
   gradient_clip_val: 1.0
+  # Effective batch = batch_size * this, at the same memory cost. 1 = off.
+  # Raising it does not rescale `lr`, and it divides steps-per-epoch by the
+  # same factor.
+  accumulate_grad_batches: 1
 
   # Early stopping
   early_stopping:

@@ -13,6 +13,7 @@ import numpy as np
 import plotly.graph_objects as go
 
 from src.filter_cityjson import world_vertices
+from src.geometry.geometry import triangulate_face
 
 # Validated categorical palette, same family as src/visualize_levi.py.
 SEMANTIC_COLORS = {
@@ -38,7 +39,11 @@ def load_cityjson(path):
 
 
 def _faces_with_types(geom):
-    """``(outer_ring, semantic_type)`` for each surface of one geometry."""
+    """``(rings, semantic_type)`` for each surface of one geometry.
+
+    ``rings`` is the whole surface -- exterior first, interior rings after.
+    Shading only the exterior is what drew courtyards as solid slab.
+    """
     boundaries = geom.get("boundaries", []) or []
     gtype = geom.get("type")
     sem = geom.get("semantics") or {}
@@ -60,7 +65,7 @@ def _faces_with_types(geom):
         if i < len(vals) and vals[i] is not None and vals[i] < len(surfaces):
             s = surfaces[vals[i]]
             stype = s.get("type") if s else None
-        out.append((face[0], stype))
+        out.append((face, stype))
     return out
 
 
@@ -81,31 +86,57 @@ def cityjson_figure(city_objects, vertices, title="", show_normals=False,
     """
     # Batched by semantic type, with NaN breaks between rings: one trace per
     # face would mean 5000+ traces on the larger outliers and a browser that
-    # cannot rotate them.
+    # cannot rotate them. Per-ring identity survives the batching as *per-point
+    # hovertext* instead -- plotly resolves a 3D hover to the nearest vertex, so
+    # tagging every vertex with the ring it came from names the face without
+    # costing a trace.
     lines, normals, mesh = {}, {}, {}
+    line_text, mesh_text = {}, {}
+    face_index = 0
 
     for obj in city_objects:
         for geom in obj.get("geometry", []) or []:
-            for ring, stype in _faces_with_types(geom):
-                pts = vertices[ring]
+            for rings, stype in _faces_with_types(geom):
                 label = stype or "unlabelled"
                 gap = np.full((1, 3), np.nan)
-                lines.setdefault(label, []).append(np.vstack([pts, pts[:1], gap]))
+                n_hole = len(rings) - 1
+                tag = (f"face {face_index} · {label} · {len(rings[0])} verts"
+                       + (f" · {n_hole} hole{'s' * (n_hole > 1)}" if n_hole else ""))
 
-                if shade and len(ring) >= 3:
-                    tris, base = mesh.setdefault(label, ([], []))[0], None
-                    verts_so_far = mesh[label][1]
-                    base = sum(len(p) for p in verts_so_far)
-                    verts_so_far.append(pts)
-                    tris.extend((base, base + k, base + k + 1)
-                                for k in range(1, len(ring) - 1))
+                # Every ring is outlined, interiors included -- a courtyard has
+                # a boundary and should look like one.
+                for ring in rings:
+                    pts = vertices[ring]
+                    lines.setdefault(label, []).append(np.vstack([pts, pts[:1], gap]))
+                    # The ring is drawn closed and then broken, so the point list
+                    # is ring + first point + NaN: text matches slot for slot.
+                    line_text.setdefault(label, []).extend(
+                        [f"{tag}<br>vertex {v}" for v in ring]
+                        + [f"{tag}<br>vertex {ring[0]}", ""])
+                face_index += 1
+
+                tri = triangulate_face(rings, vertices) if shade else []
+                if tri:
+                    # Triangulated whole, so the fill respects the holes. Local
+                    # copy of the vertices keeps the per-face hover text valid.
+                    used = sorted({i for t in tri for i in t})
+                    local = {g: k for k, g in enumerate(used)}
+                    store = mesh.setdefault(label, ([], []))
+                    base = sum(len(p) for p in store[1])
+                    store[1].append(vertices[used])
+                    store[0].extend(tuple(base + local[i] for i in t) for t in tri)
+                    mesh_text.setdefault(label, []).extend(
+                        f"{tag}<br>vertex {g}" for g in used)
 
                 if show_normals:
-                    n = _normal(pts)
+                    # The exterior ring carries the surface's orientation; the
+                    # loop above leaves `pts` on whichever ring came last.
+                    outer = vertices[rings[0]]
+                    n = _normal(outer)
                     if n is None:
                         continue
-                    centre = pts.mean(axis=0)
-                    span = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
+                    centre = outer.mean(axis=0)
+                    span = float(np.linalg.norm(outer.max(axis=0) - outer.min(axis=0)))
                     tip = centre + n * max(span * 0.3, 0.5)
                     normals.setdefault(label, []).append(
                         np.vstack([centre, tip, np.full((1, 3), np.nan)]))
@@ -116,7 +147,8 @@ def cityjson_figure(city_objects, vertices, title="", show_normals=False,
         fig.add_trace(go.Scatter3d(
             x=pts[:, 0], y=pts[:, 1], z=pts[:, 2], mode="lines",
             line=dict(color=SEMANTIC_COLORS.get(label, DEFAULT_COLOR), width=3),
-            name=label, legendgroup=label, hovertext=label, hoverinfo="text"))
+            name=label, legendgroup=label,
+            hovertext=line_text[label], hoverinfo="text"))
 
     for label, (tris, chunks) in mesh.items():
         pts = np.vstack(chunks)
@@ -125,7 +157,8 @@ def cityjson_figure(city_objects, vertices, title="", show_normals=False,
             x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
             i=tris[:, 0], j=tris[:, 1], k=tris[:, 2],
             color=SEMANTIC_COLORS.get(label, DEFAULT_COLOR), opacity=0.35,
-            name=label, legendgroup=label, showlegend=False, hoverinfo="skip"))
+            name=label, legendgroup=label, showlegend=False,
+            hovertext=mesh_text[label], hoverinfo="text"))
 
     for label, chunks in normals.items():
         pts = np.vstack(chunks)

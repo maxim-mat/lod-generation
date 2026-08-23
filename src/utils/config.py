@@ -283,6 +283,16 @@ class TrainingConfig:
     lr: float = 1e-3
     max_epochs: int = 100
     gradient_clip_val: Optional[float] = None
+    # Optimizer steps are taken every N batches, so the *effective* batch is
+    # batch_size * this. Lightning accumulates the gradient itself and clips
+    # after accumulating, so gradient_clip_val keeps its meaning. 1 = off.
+    #
+    # Two things it does not do on its own. `lr` is not rescaled -- a larger
+    # effective batch usually wants a larger or better-warmed lr, and that is a
+    # separate decision. And `trainer/global_step` counts optimizer steps, so
+    # steps-per-epoch drops by this factor; a step-interval scheduler would
+    # change meaning, though this project's schedulers are all epoch-interval.
+    accumulate_grad_batches: int = 1
     lr_scheduler: str = "none"  # "none", "cosine", "step"
     lr_decay_steps: int = 50
     lr_decay_rate: float = 0.5

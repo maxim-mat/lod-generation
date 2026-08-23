@@ -15,7 +15,7 @@ The VQ-VAE is a compression step, not a correctness one -- worth adding only
 once sequence length is the binding constraint.
 
 CityJSON parsing and fan triangulation are reused from the existing pipeline
-(`src.dataset.dataset._iter_faces`, `src.eval.building_features._triangulate`)
+(`src.dataset.dataset._iter_surfaces`, `src.geometry.geometry.triangulate_face`)
 rather than reimplemented.
 """
 import json
@@ -28,8 +28,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from src.dataset.dataset import _iter_faces
-from src.eval.building_features import _triangulate
+from src.dataset.dataset import _iter_surfaces
+from src.geometry.geometry import triangulate_face
 
 logger = logging.getLogger(__name__)
 
@@ -456,8 +456,11 @@ def write_obj(path, verts, faces):
 def parse_cityjson_file_to_meshes(filepath):
     """Parse a CityJSON file into ``{object_id: (verts [V, 3], faces [F, 3])}``.
 
-    Every surface's outer ring is fan-triangulated; inner rings (courtyards) are
-    dropped, exactly as `_iter_faces` already dropped them for the Levi graphs.
+    Every surface is triangulated whole -- exterior ring and interior rings
+    together -- so a courtyard stays a hole. It used to take the outer ring and
+    fan it from vertex 0, which was wrong twice over: the fan spills outside any
+    concave ring, and dropping the interiors paved over the light wells on ~10%
+    of objects while leaving their walls buried under the slab.
     Coordinates come out in metres, with the file's transform applied.
 
     Raises:
@@ -483,8 +486,8 @@ def parse_cityjson_file_to_meshes(filepath):
     for obj_id, city_obj in cj.get("CityObjects", {}).items():
         tris = []
         for geom in city_obj.get("geometry", []):
-            for ring, _ in _iter_faces(geom):
-                tris.extend(_triangulate(ring))
+            for rings, _ in _iter_surfaces(geom):
+                tris.extend(triangulate_face(rings, v_raw))
         if not tris:
             continue
 
