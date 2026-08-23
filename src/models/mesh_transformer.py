@@ -129,6 +129,26 @@ def invalid_logits_mask(tgt, vocab, num_bins, tokenization="coord", pad=None):
     return mask
 
 
+# AMT token roles, laid out exactly as MeshAnything V2's `OPTLoopEmbedding`
+# (arXiv:2408.02555; MeshAnything/models/shape_opt.py, a 10-row table):
+#
+#     0, 1, 2   the three specials, one row each
+#     3         the '&' break
+#     4, 5, 6   a vertex of a newly started face, split by x / y / z
+#     7, 8, 9   a vertex of an adjacent face,     split by x / y / z
+#
+# The axis split is the part that is easy to drop and should not be. On the
+# coordinate path the model can read "am I emitting x, y or z" off position
+# mod 9, but under AMT a break desynchronises that phase, so position stops
+# saying it. Rows 4-9 are what put it back.
+#
+# No '$' swap row: the released `OPTLoopEmbedding` handles a single
+# interruption token too, and `_amt_strip` deliberately does not emit swaps.
+ROLE_BOS, ROLE_EOS, ROLE_PAD, ROLE_BREAK = 0, 1, 2, 3
+FACE_START, ADJACENT = 4, 7          # + axis, where axis is 0/1/2 for x/y/z
+N_ROLES = 10
+
+
 class MeshEmbedding(nn.Module):
     """How a mesh sequence becomes vectors, independent of what consumes them.
 
@@ -149,8 +169,10 @@ class MeshEmbedding(nn.Module):
     """
 
     def __init__(self, vocab_size, d_model, cond_dim=None, codebook=None,
-                 tokens_per_face=None):
+                 tokens_per_face=None, tokenization="coord", num_bins=None):
         super().__init__()
+        self.tokenization = tokenization
+        self.num_bins = num_bins
         # Under the VQ-VAE tokenizer the condition arrives as continuous
         # per-face features rather than token ids, so it needs a projection
         # instead of a lookup. None keeps the coordinate path exactly as it was.
@@ -186,6 +208,16 @@ class MeshEmbedding(nn.Module):
         # has to infer the LOD1/LOD2 boundary from the BOS token alone.
         self.segment_embed = nn.Embedding(2, d_model)
 
+        # Only AMT has roles to distinguish. On the coordinate path every face
+        # is exactly 9 tokens, so position modulo 9 already says everything a
+        # role could, and an extra table would be a free parameter learning
+        # nothing.
+        self.role_embed = (nn.Embedding(N_ROLES, d_model)
+                           if tokenization == "amt" else None)
+        if tokenization == "amt" and num_bins is None:
+            raise ValueError("tokenization='amt' needs num_bins to tell a "
+                             "coordinate token from a special one.")
+
     def embed_cond(self, cond):
         """The LOD1 prefix: a projection of face features, or a token lookup.
 
@@ -195,15 +227,57 @@ class MeshEmbedding(nn.Module):
         """
         return self.cond_proj(cond) if cond.is_floating_point() else self.embed_tokens(cond)
 
+    def token_roles(self, ids):
+        """[B, L] AMT role ids, derived from the prefix alone.
+
+        Causal on purpose: a role is a function of the tokens already emitted,
+        so training and sampling compute the same thing. Counting coordinate
+        tokens since the last break gives it -- the first nine after a break
+        (or the start) are a face start's three vertices, everything after is
+        one adjacent vertex at a time.
+        """
+        coord = (ids >= 0) & (ids < self.num_bins)
+        brk = ids == break_token(self.num_bins)
+
+        seen = torch.cumsum(coord.long(), dim=1)
+        # `seen` frozen at the most recent reset, so the difference is the count
+        # since it. cummax rather than a scan: resets only move it forward.
+        #
+        # *Any* non-coordinate token resets, not just the break -- the reference
+        # zeroes `state`/`loop_state` in its `idx_in_extra` branch too. That
+        # branch is unreachable here (a target is [BOS, body, EOS] with only
+        # trailing PAD, `generate` stops on EOS, and the condition segment
+        # carries no specials), but a mesh packed after an EOS would otherwise
+        # inherit the previous one's axis phase.
+        at_reset = torch.cummax(torch.where(coord, torch.zeros_like(seen), seen),
+                                dim=1).values
+        since = (seen - at_reset - 1).clamp(min=0)
+
+        # First nine coordinates after a reset are the face start's three
+        # vertices -- the reference's `state` counting down from 9 -- and the
+        # low two bits of `since` pick the axis, its `loop_state % 3`.
+        base = torch.where(since < 9, torch.full_like(ids, FACE_START),
+                           torch.full_like(ids, ADJACENT))
+        roles = base + since % 3
+
+        # Specials keep one row each, addressed the way the reference does it:
+        # by the token's own offset past the coordinate range.
+        special = (ids - self.num_bins).clamp(min=0, max=ROLE_PAD)
+        roles = torch.where(coord, roles, special)
+        return torch.where(brk, torch.full_like(ids, ROLE_BREAK), roles)
+
     def embed_tokens(self, ids):
         """[B, L] ids to [B, L, d], where ``ids[:, 0]`` is the segment's first token.
 
         On the coordinate path this is a plain lookup. On the code path a code
         is `code_proj(codebook[id])`, the specials come from `extra_embed`, and
-        every token additionally carries its slot within the face.
+        every token additionally carries its slot within the face. Under AMT it
+        additionally carries its role in the tokenization.
         """
         if self.token_embed is not None:
-            return self.token_embed(ids)
+            out = self.token_embed(ids)
+            return out if self.role_embed is None else out + self.role_embed(
+                self.token_roles(ids))
 
         is_code = ids < self.codebook_size
         codes = self.code_proj(self.codebook[ids.clamp(max=self.codebook_size - 1)])
@@ -235,8 +309,10 @@ class MeshTransformer(MeshEmbedding):
 
     def __init__(self, vocab_size, d_model=256, n_head=8, num_layers=6,
                  dropout=0.1, max_seq_len=4096, cond_dim=None,
-                 codebook=None, tokens_per_face=None):
-        super().__init__(vocab_size, d_model, cond_dim, codebook, tokens_per_face)
+                 codebook=None, tokens_per_face=None,
+                 tokenization="coord", num_bins=None):
+        super().__init__(vocab_size, d_model, cond_dim, codebook, tokens_per_face,
+                         tokenization, num_bins)
         self.max_seq_len = max_seq_len
         self.pos_embed = nn.Embedding(max_seq_len, d_model)
         self.drop = nn.Dropout(dropout)
@@ -327,7 +403,8 @@ class MeshOPTTransformer(MeshEmbedding):
 
     def __init__(self, vocab_size, opt_name="facebook/opt-350m", pretrained=False,
                  cond_dim=None, codebook=None, tokens_per_face=None,
-                 dropout=None, opt_config=None):
+                 dropout=None, opt_config=None,
+                 tokenization="coord", num_bins=None):
         from transformers import AutoConfig, OPTConfig, OPTForCausalLM
 
         if opt_config is not None:
@@ -343,7 +420,7 @@ class MeshOPTTransformer(MeshEmbedding):
         # Embeddings are `word_embed_proj_dim` wide -- OPT projects that up to
         # hidden_size internally, which is why the two differ on 350m (512/1024).
         super().__init__(vocab_size, cfg.word_embed_proj_dim, cond_dim, codebook,
-                         tokens_per_face)
+                         tokens_per_face, tokenization, num_bins)
 
         # Drops OPT's 50k language vocabulary, which is dead weight here: input
         # comes from `inputs_embeds`, so the table survives only as the tied
@@ -464,6 +541,7 @@ class MeshTransformerModule(L.LightningModule):
                 vocab_size=vocab, d_model=d_model, n_head=n_head,
                 num_layers=num_layers, dropout=dropout, max_seq_len=max_seq_len,
                 cond_dim=cond_dim, codebook=codebook, tokens_per_face=per_face,
+                tokenization=tokenization, num_bins=num_bins,
             )
         elif backbone == "opt":
             # d_model / n_head / num_layers / max_seq_len come from the OPT
@@ -473,6 +551,7 @@ class MeshTransformerModule(L.LightningModule):
                 vocab_size=vocab, opt_name=opt_name, pretrained=opt_pretrained,
                 cond_dim=cond_dim, codebook=codebook, tokens_per_face=per_face,
                 dropout=dropout, opt_config=opt_config,
+                tokenization=tokenization, num_bins=num_bins,
             )
         else:
             raise ValueError(f"Unknown backbone: {backbone!r}. Expected "

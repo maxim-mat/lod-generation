@@ -166,10 +166,28 @@ def canonicalize(verts, faces):
     rank[order] = np.arange(len(uniq))
 
     faces = rank[inverse.reshape(-1)[faces]]
+
+    # Faces the merge just collapsed. A vertex pair a hair apart lands on one
+    # grid point, and any face that used both is now a zero-area triangle with a
+    # repeated index -- 1.37% of faces on this corpus, all of them tokenized and
+    # taught to the model. Both references drop them here: MeshAnythingV2's
+    # `mesh_sort` via `nondegenerate_faces()`, TreeMeshGPT's
+    # `quantize_remove_duplicates` via an explicit collapsed mask.
+    keep = (faces[:, 0] != faces[:, 1]) & (faces[:, 1] != faces[:, 2])         & (faces[:, 0] != faces[:, 2])
+    faces = faces[keep]
+
     roll = faces.argmin(axis=1)
     cols = (roll[:, None] + np.arange(3)[None, :]) % 3
     faces = np.take_along_axis(faces, cols, axis=1)
     faces = faces[np.lexsort((faces[:, 2], faces[:, 1], faces[:, 0]))]
+
+    # Exact duplicates, on the *sorted* triple so a flap wound both ways counts
+    # as one. Two faces on the same three vertices enclose no volume; in a solid
+    # they are a defect, never geometry. Rare (0.03%) but free to remove, and
+    # `unique_faces()` is the reference's next call after the degenerate drop.
+    if len(faces):
+        _, first = np.unique(np.sort(faces, axis=1), axis=0, return_index=True)
+        faces = faces[np.sort(first)]
 
     return uniq[order], faces
 
