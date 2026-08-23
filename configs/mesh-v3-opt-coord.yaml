@@ -1,0 +1,119 @@
+# OPT-125M backbone, coordinate tokenization
+# Usage: python main.py --train --config configs/mesh-v3-opt-coord.yaml
+#
+# One of four runs that vary *only* tokenization and backbone. Everything else
+# -- dataset, max_faces, effective batch, schedule, seed -- is identical, so a
+# difference between them is attributable. Launch them with:
+#   ./run_experiments.sh --smoke      (verify configs in minutes)
+#   nohup ./run_experiments.sh > experiments.out 2>&1 &
+#
+# Backbone A/B against mesh-v3-coord: same tokens, ~125M parameters instead
+# of ~20M, random init.
+#
+# lr 1e-4, an order below the scratch arms. mesh-6 ran an OPT-125m at 1e-3 and
+# diverged -- train and val loss rose together from epoch 1 and it finished
+# 6.6x WORSE than echoing its LOD1 input. That is the specific mistake this
+# value exists to avoid.
+#
+# batch 8 x accumulate 2 keeps the effective batch at 16, matching the scratch
+# arms, at a memory cost 125M parameters can actually afford.
+
+mode: train
+config_set: mesh
+seed: 42
+
+# Not read under config_set: mesh, but DataConfig.dataset_dir is MISSING and
+# OmegaConf resolves the whole schema, so it still needs a value.
+data:
+  dataset_dir: data/The Hague/mini_cleaner
+
+mesh_data:
+  dataset_dir: data/The Hague/mini_cleaner
+  # Real LOD1, not LOD1_synth: `cleaner` is built on the real pair and is
+  # Source B only, since Source A ships no lod-1 geometry.
+  lod_in: LOD1
+  lod_out: LOD2
+  num_bins: 128
+  margin_lo: [0.0, 0.0, 0.0]
+  margin_hi: [0.0, 0.0, 0.1]
+  # A *triangle* cap, applied to both LOD1 and LOD2 -- not a surface cap.
+  # Measured on mini_cleaner: 113 keeps 89.3% of pairs, and the coordinate
+  # path's longest cond+target is 2017 tokens against OPT's shared budget of
+  # 2048. Identical across all four runs so the datasets match exactly.
+  max_faces: 113
+  max_files: null
+  tokenization: coord
+  num_workers: 10
+  persistent_workers: false
+
+mesh_model:
+  backbone: opt
+  opt_name: facebook/opt-125m
+  # Architecture-only, as the released MeshAnything inference does
+  # (`from_config`, random weights). d_model / n_head / num_layers / max_seq_len
+  # are read from the OPT config on this path and ignored here.
+  opt_pretrained: false
+  dropout: 0.1
+  max_seq_len: null
+  tokenizer: coord          # no VQ-VAE on any of these
+  vqvae_ckpt: null
+  # Sampling-time only; never touches training, so it cannot confound the A/B.
+  mask_invalid: true
+
+training:
+  batch_size: 8
+  accumulate_grad_batches: 2   # effective batch 16 on every run
+  train_val_test_split: [0.8, 0.1, 0.1]
+  lr: 1e-4
+  max_epochs: 200
+  gradient_clip_val: 1.0
+  lr_scheduler: "cosine"
+  lr_decay_steps: 50
+  lr_decay_rate: 0.5
+  # val_loss/min, NOT val_token_acc. mesh-6 monitored val_token_acc with
+  # mode: min, which rewards falling accuracy -- it never fired and burned
+  # 72 h on a diverging run. The geometric metrics only exist every 10 epochs
+  # so they cannot be monitored either.
+  early_stopping:
+    enabled: true
+    monitor: val_loss
+    patience: 15
+    mode: min
+  checkpoint:
+    enabled: true
+    monitor: val_loss
+    mode: min
+    save_top_k: 3
+    filename: "{epoch:02d}-{val_loss:.4f}"
+
+trainer:
+  accelerator: auto
+  devices: 1
+  # 32 on every run: switching precision for the OPT arms alone would confound
+  # the backbone comparison. bf16-mixed is the first lever if one OOMs.
+  precision: "32"
+  log_every_n_steps: 50
+
+logging:
+  loggers:
+    - wandb
+  project_name: lod-generation
+  experiment_name: initial-runs
+  run_name: mesh-v3-opt-coord
+  save_dir: outputs
+  wandb_entity: maxim-lod
+  wandb_offline: false
+  log_model: false
+
+mesh_eval:
+  enabled: true
+  every_n_epochs: 10
+  n_val: 8
+  n_test: 32
+  batch_size: 8
+  n_points: 4096
+  taus: [0.25, 0.5]
+  voxel_m: 0.25
+  save_samples: 8
+
+resume_from: null

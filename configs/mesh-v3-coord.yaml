@@ -1,0 +1,115 @@
+# V2 baseline, re-run after the tokenization fixes
+# Usage: python main.py --train --config configs/mesh-v3-coord.yaml
+#
+# One of four runs that vary *only* tokenization and backbone. Everything else
+# -- dataset, max_faces, effective batch, schedule, seed -- is identical, so a
+# difference between them is attributable. Launch them with:
+#   ./run_experiments.sh --smoke      (verify configs in minutes)
+#   nohup ./run_experiments.sh > experiments.out 2>&1 &
+#
+# The reference point. Same design as mesh-v2-2 -- coordinate tokens, no
+# VQ-VAE, from-scratch backbone -- but on `mini_cleaner` and after three
+# tokenizer corrections: whole-surface triangulation (courtyards no longer
+# paved over), correct concave triangulation, and degenerate faces dropped.
+# Its numbers are therefore NOT comparable with mesh-v2/mesh-v2-2.
+#
+# lr 1e-3 is what mesh-2 converged with at this size. Do not carry it to the
+# OPT arms.
+
+mode: train
+config_set: mesh
+seed: 42
+
+# Not read under config_set: mesh, but DataConfig.dataset_dir is MISSING and
+# OmegaConf resolves the whole schema, so it still needs a value.
+data:
+  dataset_dir: data/The Hague/mini_cleaner
+
+mesh_data:
+  dataset_dir: data/The Hague/mini_cleaner
+  # Real LOD1, not LOD1_synth: `cleaner` is built on the real pair and is
+  # Source B only, since Source A ships no lod-1 geometry.
+  lod_in: LOD1
+  lod_out: LOD2
+  num_bins: 128
+  margin_lo: [0.0, 0.0, 0.0]
+  margin_hi: [0.0, 0.0, 0.1]
+  # A *triangle* cap, applied to both LOD1 and LOD2 -- not a surface cap.
+  # Measured on mini_cleaner: 113 keeps 89.3% of pairs, and the coordinate
+  # path's longest cond+target is 2017 tokens against OPT's shared budget of
+  # 2048. Identical across all four runs so the datasets match exactly.
+  max_faces: 113
+  max_files: null
+  tokenization: coord
+  num_workers: 10
+  persistent_workers: false
+
+mesh_model:
+  backbone: scratch
+  d_model: 512
+  n_head: 8
+  num_layers: 6
+  dropout: 0.1
+  max_seq_len: null
+  tokenizer: coord          # no VQ-VAE on any of these
+  vqvae_ckpt: null
+  # Sampling-time only; never touches training, so it cannot confound the A/B.
+  mask_invalid: true
+
+training:
+  batch_size: 16
+  accumulate_grad_batches: 1   # effective batch 16 on every run
+  train_val_test_split: [0.8, 0.1, 0.1]
+  lr: 1e-3
+  max_epochs: 200
+  gradient_clip_val: 1.0
+  lr_scheduler: "cosine"
+  lr_decay_steps: 50
+  lr_decay_rate: 0.5
+  # val_loss/min, NOT val_token_acc. mesh-6 monitored val_token_acc with
+  # mode: min, which rewards falling accuracy -- it never fired and burned
+  # 72 h on a diverging run. The geometric metrics only exist every 10 epochs
+  # so they cannot be monitored either.
+  early_stopping:
+    enabled: true
+    monitor: val_loss
+    patience: 15
+    mode: min
+  checkpoint:
+    enabled: true
+    monitor: val_loss
+    mode: min
+    save_top_k: 3
+    filename: "{epoch:02d}-{val_loss:.4f}"
+
+trainer:
+  accelerator: auto
+  devices: 1
+  # 32 on every run: switching precision for the OPT arms alone would confound
+  # the backbone comparison. bf16-mixed is the first lever if one OOMs.
+  precision: "32"
+  log_every_n_steps: 50
+
+logging:
+  loggers:
+    - wandb
+  project_name: lod-generation
+  experiment_name: initial-runs
+  run_name: mesh-v3-coord
+  save_dir: outputs
+  wandb_entity: maxim-lod
+  wandb_offline: false
+  log_model: false
+
+mesh_eval:
+  enabled: true
+  every_n_epochs: 10
+  n_val: 8
+  n_test: 32
+  batch_size: 8
+  n_points: 4096
+  taus: [0.25, 0.5]
+  voxel_m: 0.25
+  save_samples: 8
+
+resume_from: null
