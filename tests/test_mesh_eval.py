@@ -26,6 +26,8 @@ class _Cfg:
     taus = [0.25]
     voxel_m = 0.5
     save_samples = 0
+    beam_size = 1
+    length_penalty = 1.0
 
 
 class _Dataset:
@@ -130,3 +132,25 @@ def test_eval_restores_training_mode():
     model.train()
     run_mesh_eval(model, _Dataset(), np.array([0]), _Cfg(), max_new_tokens=20)
     assert model.training
+
+
+def test_beam_search_reaches_generate_from_the_eval_config():
+    """One line of wiring, but a silent one: a renamed field would just leave
+    every eval running greedy while the config claimed otherwise."""
+    class _Beam(_Cfg):
+        beam_size = 2
+        length_penalty = 1.0
+
+    seen = {}
+    model = _model()
+    real = model.generate
+
+    def spy(*a, **kw):
+        seen.update(kw)
+        return real(*a, **kw)
+
+    model.generate = spy
+    metrics = run_mesh_eval(model, _Dataset(), np.array([0]), _Beam(),
+                            max_new_tokens=20, seed=1)
+    assert seen.get("beam_size") == 2 and seen.get("length_penalty") == 1.0
+    assert metrics

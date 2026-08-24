@@ -1,9 +1,11 @@
 # V2 baseline, re-run after the tokenization fixes
 # Usage: python main.py --train --config configs/mesh-v3-coord.yaml
 #
-# One of four runs that vary *only* tokenization and backbone. Everything else
-# -- dataset, max_faces, effective batch, schedule, seed -- is identical, so a
-# difference between them is attributable. Launch them with:
+# One of four runs. Dataset, effective batch, schedule and seed are identical
+# across all four; `max_faces` is 200 on the scratch arms and 113 on the OPT
+# ones, because only OPT has a shared 2048-position budget. So coord-vs-AMT is
+# a clean A/B *within* each backbone pair, while scratch-vs-OPT also differs in
+# how much of the corpus it sees (97.8% vs 89.3%). Launch them with:
 #   ./run_experiments.sh --smoke      (verify configs in minutes)
 #   nohup ./run_experiments.sh > experiments.out 2>&1 &
 #
@@ -35,10 +37,15 @@ mesh_data:
   margin_lo: [0.0, 0.0, 0.0]
   margin_hi: [0.0, 0.0, 0.1]
   # A *triangle* cap, applied to both LOD1 and LOD2 -- not a surface cap.
-  # Measured on mini_cleaner: 113 keeps 89.3% of pairs, and the coordinate
-  # path's longest cond+target is 2017 tokens against OPT's shared budget of
-  # 2048. Identical across all four runs so the datasets match exactly.
-  max_faces: 113
+  # 200 on the scratch arms, 113 on the OPT ones, and that asymmetry is the
+  # point: the scratch backbone restarts positions per segment, so it is bounded
+  # only by what fits in memory, while OPT shares one 2048-position budget
+  # across cond + target and 113 is the largest cap whose worst case (2017
+  # tokens) still fits. Capping these arms at 113 too would throw away data for
+  # a constraint they do not have.
+  #
+  # Measured on mini_cleaner: 200 keeps 97.8% of pairs, 113 keeps 89.3%.
+  max_faces: 200
   max_files: null
   tokenization: coord
   num_workers: 10

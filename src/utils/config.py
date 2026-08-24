@@ -146,6 +146,16 @@ class MeshEvalConfig:
     taus: List[float] = field(default_factory=lambda: [0.25, 0.5])  # F-score, metres
     voxel_m: float = 0.25         # IoU grid resolution, metres
     save_samples: int = 8         # .obj + .city.json written per test run
+    # 1 is greedy argmax, the reference's setting (MeshAnything V2 passes
+    # `num_beams=1`). >1 searches for the best *sequence* rather than the best
+    # next token, at beam_size x the compute -- and generation has no KV cache,
+    # so that multiplies an already O(L^2) loop. Deterministic, so it forces
+    # temperature 0.
+    beam_size: int = 1
+    # Beam scores are divided by ``length ** penalty``. 0.0 is raw
+    # sum-of-log-probs, which prefers short sequences -- and short here means a
+    # mesh with fewer triangles, so the default normalises per token.
+    length_penalty: float = 1.0
 
 @dataclass
 class MeshModelConfig:
@@ -154,9 +164,30 @@ class MeshModelConfig:
     n_head: int = 8
     num_layers: int = 6
     dropout: float = 0.1
-    # Positional-embedding capacity. Positions restart per segment, so this
-    # covers max(len(cond), len(tgt) - 1). None = size it from the loaded
-    # dataset's longest segment, logged at startup.
+    # Model capacity in triangles -- how large a mesh the model has room for.
+    # Deliberately NOT `mesh_data.max_faces`, which decides which buildings
+    # are in the corpus. They were one knob until now, so capacity was a
+    # side effect of a data filter and the mesh-v3 arms had to run at 200
+    # (scratch) and 113 (OPT) -- which confounded scratch-vs-OPT with
+    # capacity. MeshAnything V2 keeps them apart (`data_process.py
+    # --max_face_num` filters, `n_max_triangles` sizes) and so does this.
+    #
+    # None = fall back to the loaded corpus's longest segment, which is the
+    # old coupled behaviour and stays the default so existing configs are
+    # unchanged. Set it to compare backbones at one capacity.
+    n_max_triangles: Optional[int] = None
+    # Capacity for the LOD1 *condition*, in triangles. Only OPT pays for this
+    # (its positions run through both halves); the scratch stack restarts per
+    # segment. Defaults to `n_max_triangles`, the worst case.
+    #
+    # Sizing it down is the lever that makes `opt_pretrained: true` reachable:
+    # LOD1 is a prism, and at cap 200 it drops zero buildings on its own, so
+    # budgeting it like a full LOD2 doubles the table for nothing. AMT at 200
+    # target faces needs 2523 shared positions at worst case but 1578 with a
+    # 50-triangle condition -- inside opt-350m's 2048 trained rows.
+    cond_max_triangles: Optional[int] = None
+    # Explicit override for the positional capacity, in *tokens*. Highest
+    # precedence; leave it None and let `n_max_triangles` do the arithmetic.
     max_seq_len: Optional[int] = None
     # "coord" -- 9 discretized coordinates per face, an exact inverse, the
     # measurement baseline and the default. "vqvae" -- codes from a trained
@@ -192,6 +223,23 @@ class MeshModelConfig:
     # `from_config` (random) and loads its own checkpoint, so a warm start from
     # the language model is the paper's text rather than its released code.
     opt_pretrained: bool = True
+    # How sequence position reaches the model, on *either* backbone.
+    #
+    # "learned" -- an embedding table, the default and what every run so far
+    # used. Its row count is a hard ceiling: `max_seq_len` on the scratch stack,
+    # and on OPT the `max_position_embeddings` that rides in from a hub config
+    # whose weights are not even loaded when opt_pretrained is false.
+    #
+    # "sinusoidal" -- fixed Fourier positions (Vaswani et al., arXiv:1706.03762
+    # section 3.5). No parameters, defined at every position, so the ceiling
+    # disappears rather than moving and long LOD2 roofs stop being a capacity
+    # question. Positions still restart per segment on the scratch backbone and
+    # still run straight through on OPT; only the lookup changes.
+    #
+    # RoPE and ALiBi are deliberately absent: both act inside attention, and
+    # `OPTAttention.forward` takes no position argument, so they would need a
+    # fork of every layer rather than a config switch.
+    pos_embed: str = "learned"
 
 @dataclass
 class MeshVQVAEConfig:

@@ -22,6 +22,7 @@ Conventions worth knowing before reading a number off a chart:
 numpy + scipy only, no torch and no lightning, so this stays importable and
 testable on its own -- same rule as `building_features.py`.
 """
+import importlib.util
 import logging
 
 import numpy as np
@@ -74,6 +75,18 @@ def sample_surface(verts, faces, n=4096, seed=0):
 
 def _closest_surface_distance(mesh, points):
     """Exact distance from each point to the mesh *surface*, not to a sample."""
+    # trimesh's only hard dependency is numpy; `rtree` -- which `closest_point`
+    # needs, because it walks `mesh.triangles_tree` -- is under its `easy`
+    # extra. So `pip install trimesh` yields a package that imports cleanly and
+    # then dies inside the first eval. Checked here so the message names the
+    # package instead of surfacing as an AttributeError from a library.
+    if importlib.util.find_spec("rtree") is None:
+        raise ImportError(
+            "rtree is not installed, so trimesh cannot build the spatial index "
+            "`closest_point` needs for point-to-surface distances. "
+            "`pip install rtree` (it is in requirements.txt). trimesh declares "
+            "it only as an extra (`trimesh[easy]`), so a plain install of "
+            "trimesh leaves it out.")
     v = np.asarray(mesh[0], dtype=float)
     f = np.asarray(mesh[1], dtype=np.int64).reshape(-1, 3)
     tm = trimesh.Trimesh(vertices=v, faces=f, process=False)

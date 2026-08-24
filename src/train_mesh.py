@@ -11,6 +11,7 @@ import lightning as L
 from omegaconf import OmegaConf
 
 from src.dataset.mesh_datamodule import MeshDataModule
+from src.dataset.mesh_dataset import position_budget
 from src.models.mesh_transformer import MeshTransformerModule
 from src.utils.config import Config
 from src.utils.setup_utils import create_callbacks, create_loggers
@@ -84,15 +85,42 @@ def train_mesh(cfg: Config):
 
     vqvae = _load_vqvae(cfg)
 
-    # Sized from the data unless pinned, so a longer building cannot silently
-    # index past the positional embedding mid-run.
-    max_seq_len = cfg.mesh_model.max_seq_len or datamodule.max_seq_len
-    if vqvae is not None and cfg.mesh_model.max_seq_len is None:
+    # Capacity, in three precedences. `max_seq_len` pins it outright;
+    # `n_max_triangles` derives it from the *task* (MeshAnything V2's way, see
+    # `position_budget`); neither set falls back to the loaded corpus, which is
+    # the old behaviour where a data filter decided model capacity.
+    opt_max_positions = None
+    if cfg.mesh_model.max_seq_len:
+        max_seq_len = cfg.mesh_model.max_seq_len
+    elif cfg.mesh_model.n_max_triangles:
+        max_seq_len, opt_max_positions = position_budget(
+            cfg.mesh_model.n_max_triangles,
+            cfg.mesh_model.cond_max_triangles,
+            cfg.mesh_data.tokenization)
+        logger.info("Capacity from the task: %d triangles (condition %s) -> "
+                    "%d positions per segment, %d shared for OPT",
+                    cfg.mesh_model.n_max_triangles,
+                    cfg.mesh_model.cond_max_triangles or "same",
+                    max_seq_len, opt_max_positions)
+    else:
+        max_seq_len = datamodule.max_seq_len
+    if vqvae is not None and not cfg.mesh_model.max_seq_len:
         # Codes, not coordinates: `3 * depth` per face, plus BOS. That equals 9
         # at the paper's depth, so the sequence is the same length as the
         # coordinate path -- the codebook buys a vocabulary, not compression.
-        faces = (datamodule.max_seq_len + 8) // 9
+        faces = (max_seq_len + 8) // 9
         max_seq_len = faces * vqvae.tokens_per_face + 1
+    # Capacity and corpus are independent knobs now, so they can disagree.
+    # `MeshTransformer.forward` would catch it, but only on the batch that
+    # happens to carry the longest building -- possibly an hour in.
+    if datamodule.max_seq_len > max_seq_len:
+        logger.warning(
+            "Corpus needs %d positions but capacity is %d: the longest %d "
+            "buildings will raise when they are sampled. Raise "
+            "mesh_model.n_max_triangles, or lower mesh_data.max_faces to "
+            "drop them from the corpus.",
+            datamodule.max_seq_len, max_seq_len,
+            cfg.mesh_data.max_faces or 0)
     logger.info("max_seq_len = %d (dataset longest segment: %d coordinate tokens)",
                 max_seq_len, datamodule.max_seq_len)
 
@@ -111,6 +139,8 @@ def train_mesh(cfg: Config):
         backbone=cfg.mesh_model.backbone,
         opt_name=cfg.mesh_model.opt_name,
         opt_pretrained=cfg.mesh_model.opt_pretrained,
+        opt_max_positions=opt_max_positions,
+        pos_embed=cfg.mesh_model.pos_embed,
         # Must match the datamodule's, or the model decodes with the wrong
         # inverse and the vocabulary is one id short.
         tokenization=cfg.mesh_data.tokenization,
@@ -118,10 +148,16 @@ def train_mesh(cfg: Config):
     )
     if cfg.mesh_model.backbone == "opt":
         params = sum(p.numel() for p in model.network.opt.parameters())
-        logger.info("Backbone: %s (%s), %.0fM parameters, positions %d shared "
-                    "between condition and target", cfg.mesh_model.opt_name,
+        # `max_seq_len` is a hard ceiling only while positions are a table; with
+        # sinusoidal positions it survives as the generation budget alone, and
+        # logging it as a limit would send someone hunting a cap that is gone.
+        budget = (f"positions {model.network.max_seq_len} shared between "
+                  "condition and target" if model.network.bounded_positions
+                  else "sinusoidal positions, no length ceiling")
+        logger.info("Backbone: %s (%s), %.0fM parameters, %s",
+                    cfg.mesh_model.opt_name,
                     "pretrained" if cfg.mesh_model.opt_pretrained else "random init",
-                    params / 1e6, model.network.max_seq_len)
+                    params / 1e6, budget)
 
     exp_loggers = create_loggers(cfg, save_dir)
     callbacks = create_callbacks(cfg, save_dir)
@@ -130,7 +166,8 @@ def train_mesh(cfg: Config):
     if cfg.mesh_eval.enabled:
         from src.eval.mesh_eval import MeshEvalCallback
         callbacks.append(MeshEvalCallback(cfg.mesh_eval, save_dir,
-                                          max_faces=cfg.mesh_data.max_faces or 200,
+                                          max_faces=cfg.mesh_model.n_max_triangles
+                                          or cfg.mesh_data.max_faces or 200,
                                           seed=cfg.seed))
 
     trainer = L.Trainer(

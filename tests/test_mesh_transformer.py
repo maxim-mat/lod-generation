@@ -238,3 +238,210 @@ def test_eval_step_logs_the_expected_metric_names():
             "val_eos_acc", "val_eos_fp_rate"} <= set(logged)
     # Free-running metrics belong to the callback, never to the step.
     assert not [k for k in logged if k.startswith("val_gen_")]
+
+
+# ----------------------------------------------------------------------
+# Sinusoidal positions (mesh_model.pos_embed)
+# ----------------------------------------------------------------------
+
+def _tiny_opt_cfg(max_position_embeddings=8):
+    """A local OPT config so the test never needs the hub."""
+    from transformers import OPTConfig
+    return OPTConfig(vocab_size=V, hidden_size=32, word_embed_proj_dim=16,
+                     num_hidden_layers=1, num_attention_heads=4, ffn_dim=64,
+                     max_position_embeddings=max_position_embeddings, dropout=0.0)
+
+
+def _opt_net(pos_embed="learned", max_position_embeddings=8):
+    from src.models.mesh_transformer import MeshOPTTransformer
+    return MeshOPTTransformer(
+        vocab_size=V, opt_config=_tiny_opt_cfg(max_position_embeddings),
+        dropout=0.0, pos_embed=pos_embed).eval()
+
+
+def test_sinusoidal_positions_are_fixed_not_learned():
+    """The point of the option is a closed-form position, so it must carry no
+    parameters -- otherwise it is just a learned table with extra steps."""
+    from src.models.embeddings import SinusoidalPositionEmbedding
+
+    emb = SinusoidalPositionEmbedding(16)
+    assert list(emb.parameters()) == []
+    out = emb(torch.arange(5))
+    assert out.shape == (5, 16)
+    # sin(0) = 0, cos(0) = 1 across the whole bank, as in Vaswani et al. §3.5.
+    assert torch.allclose(out[0, :8], torch.zeros(8), atol=1e-6)
+    assert torch.allclose(out[0, 8:], torch.ones(8), atol=1e-6)
+    # Same input, same output: nothing stateful in there.
+    assert torch.equal(out, emb(torch.arange(5)))
+
+
+def test_sinusoidal_scratch_accepts_sequences_past_max_seq_len():
+    """A learned table is capped by its row count; the sinusoidal one is not.
+    Removing the ceiling rather than raising it is the whole point."""
+    import pytest
+
+    args = {k: _batch()[k] for k in ("cond", "tgt", "cond_pad_mask", "tgt_pad_mask")}
+    with pytest.raises(ValueError, match="max_seq_len"):
+        _net(max_seq_len=8)(**args)
+
+    net = _net(max_seq_len=8, pos_embed="sinusoidal").eval()
+    with torch.no_grad():
+        logits = net(**args)
+    assert logits.shape == (B, LT - 1, V)
+    assert torch.isfinite(logits).all()
+
+
+def test_sinusoidal_scratch_target_positions_do_not_move_with_condition_padding():
+    """Same invariant as the learned path: widening the condition with padding
+    must not shift the target's positions."""
+    net = _net(max_seq_len=8, pos_embed="sinusoidal").eval()
+    args = {k: _batch()[k] for k in ("cond", "tgt", "cond_pad_mask", "tgt_pad_mask")}
+
+    wider = {**args}
+    wider["cond"] = torch.cat([args["cond"], torch.full((B, 7), PAD)], dim=1)
+    wider["cond_pad_mask"] = torch.cat(
+        [args["cond_pad_mask"], torch.ones(B, 7, dtype=torch.bool)], dim=1)
+
+    with torch.no_grad():
+        assert torch.allclose(net(**args), net(**wider), atol=1e-5)
+
+
+def test_opt_sinusoidal_accepts_sequences_past_max_position_embeddings():
+    """OPT's ceiling lives entirely in `decoder.embed_positions`; swapping that
+    module out removes it, so the shared-budget guard must stop firing too."""
+    import pytest
+
+    args = {k: _batch()[k] for k in ("cond", "tgt", "cond_pad_mask", "tgt_pad_mask")}
+    with pytest.raises(ValueError, match="max_position_embeddings"):
+        _opt_net()(**args)
+
+    net = _opt_net(pos_embed="sinusoidal")
+    with torch.no_grad():
+        logits = net(**args)
+    assert logits.shape == (B, LT - 1, V)
+    assert torch.isfinite(logits).all()
+
+
+def test_opt_sinusoidal_keeps_the_mask_derived_positions():
+    """OPT derives position ids by cumsum over the attention mask, so padding
+    never shifts a real token. A naive `arange` replacement would silently break
+    that -- this is the regression it would cause.
+    """
+    net = _opt_net(pos_embed="sinusoidal", max_position_embeddings=128)
+    args = {k: _batch()[k] for k in ("cond", "tgt", "cond_pad_mask", "tgt_pad_mask")}
+
+    wider = {**args}
+    wider["cond"] = torch.cat([args["cond"], torch.full((B, 7), PAD)], dim=1)
+    wider["cond_pad_mask"] = torch.cat(
+        [args["cond_pad_mask"], torch.ones(B, 7, dtype=torch.bool)], dim=1)
+
+    with torch.no_grad():
+        assert torch.allclose(net(**args), net(**wider), atol=1e-5)
+
+
+def test_opt_sinusoidal_replaces_opts_own_table():
+    """Belt and braces: the learned table must actually be gone, not merely
+    unused, or the ceiling would still be there on the next `from_config`."""
+    from transformers.models.opt.modeling_opt import OPTLearnedPositionalEmbedding
+
+    learned = _opt_net().opt.model.decoder.embed_positions
+    assert isinstance(learned, OPTLearnedPositionalEmbedding)
+
+    swapped = _opt_net(pos_embed="sinusoidal").opt.model.decoder.embed_positions
+    assert not isinstance(swapped, OPTLearnedPositionalEmbedding)
+    assert list(swapped.parameters()) == []
+
+
+def test_unknown_pos_embed_is_rejected():
+    """A typo must not silently fall back to the learned table."""
+    import pytest
+    with pytest.raises(ValueError, match="pos_embed"):
+        MeshTransformerModule(num_bins=NUM_BINS, d_model=16, n_head=2,
+                              num_layers=1, max_seq_len=64, pos_embed="rope")
+
+
+def test_module_threads_pos_embed_to_both_backbones():
+    """The config knob has to reach the network, not just be stored."""
+    scratch = MeshTransformerModule(num_bins=NUM_BINS, d_model=16, n_head=2,
+                                    num_layers=1, dropout=0.0, max_seq_len=8,
+                                    pos_embed="sinusoidal")
+    args = {k: _batch()[k] for k in ("cond", "tgt", "cond_pad_mask", "tgt_pad_mask")}
+    with torch.no_grad():
+        assert torch.isfinite(scratch.network(**args)).all()
+
+    opt = MeshTransformerModule(num_bins=NUM_BINS, dropout=0.0, backbone="opt",
+                                opt_config=_tiny_opt_cfg(), pos_embed="sinusoidal")
+    with torch.no_grad():
+        assert torch.isfinite(opt.network(**args)).all()
+
+
+# ----------------------------------------------------------------------
+# Generation budget: what the position scheme lets autoregression reach
+# ----------------------------------------------------------------------
+
+def test_scratch_generation_budget_ignores_the_condition():
+    """Positions restart per segment on this backbone, so a longer condition
+    costs the target nothing."""
+    net = _net(max_seq_len=64)
+    assert net.generation_budget(0) == 63
+    assert net.generation_budget(50) == 63
+
+
+def test_opt_generation_budget_leaves_room_for_the_condition():
+    """OPT's positions run through both halves, so the condition eats into the
+    budget. Defaulting to `max_seq_len - 1` overruns it and raises partway
+    through sampling -- silently truncating the mesh at whatever token the
+    exception landed on.
+    """
+    net = _opt_net(max_position_embeddings=32)
+    assert net.generation_budget(18) == 32 - 18
+
+    module = MeshTransformerModule(num_bins=NUM_BINS, dropout=0.0, backbone="opt",
+                                   opt_config=_tiny_opt_cfg(32)).eval()
+    cond = torch.randint(0, NUM_BINS, (1, 18))
+    with torch.no_grad():
+        out = module.generate(cond, max_new_tokens=None, temperature=0.0)
+    assert out.shape[1] <= 32 - 18 + 1        # +1 for the BOS the loop starts from
+
+
+def test_sinusoidal_generation_budget_is_not_capped_by_the_dead_table():
+    """The whole point: lifting the ceiling has to reach autoregression too.
+    With sinusoidal positions OPT's `max_position_embeddings` is inert, so the
+    budget must come from the data-derived `max_seq_len` instead."""
+    from src.models.mesh_transformer import MeshOPTTransformer
+
+    net = MeshOPTTransformer(vocab_size=V, opt_config=_tiny_opt_cfg(8),
+                             dropout=0.0, pos_embed="sinusoidal",
+                             max_seq_len=48).eval()
+    assert net.generation_budget(18) == 47, "budget still tied to the dead table"
+
+    cond = torch.randint(0, NUM_BINS, (1, 18))
+    module = MeshTransformerModule(num_bins=NUM_BINS, dropout=0.0, backbone="opt",
+                                   opt_config=_tiny_opt_cfg(8), max_seq_len=48,
+                                   pos_embed="sinusoidal").eval()
+    with torch.no_grad():
+        out = module.generate(cond, max_new_tokens=20, temperature=0.0)
+    # 20 new tokens past an 18-token condition is 38 positions -- more than the
+    # learned table would have held, and it must not be clamped down to it.
+    assert out.shape[1] > 8
+
+
+def test_generate_clamps_a_request_past_the_budget():
+    """`mesh_eval` asks for `9 * max_faces + 1`, which may exceed what the
+    positions hold. One clamp, in the one place that knows both numbers."""
+    module = MeshTransformerModule(num_bins=NUM_BINS, dropout=0.0, backbone="opt",
+                                   opt_config=_tiny_opt_cfg(32)).eval()
+    cond = torch.randint(0, NUM_BINS, (1, 18))
+    with torch.no_grad():
+        out = module.generate(cond, max_new_tokens=9999, temperature=0.0)
+    assert out.shape[1] <= 32 - 18 + 1
+
+
+def test_condition_that_fills_the_budget_is_rejected_not_silently_empty():
+    """A condition at or past the ceiling leaves no room to generate. Returning
+    a bare BOS would look like a model that stopped immediately."""
+    import pytest
+    module = MeshTransformerModule(num_bins=NUM_BINS, dropout=0.0, backbone="opt",
+                                   opt_config=_tiny_opt_cfg(8)).eval()
+    with torch.no_grad(), pytest.raises(ValueError, match="no room"):
+        module.generate(torch.randint(0, NUM_BINS, (1, 18)), temperature=0.0)

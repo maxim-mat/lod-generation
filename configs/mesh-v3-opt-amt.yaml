@@ -1,9 +1,11 @@
 # OPT-125M backbone + Adjacent Mesh Tokenization
 # Usage: python main.py --train --config configs/mesh-v3-opt-amt.yaml
 #
-# One of four runs that vary *only* tokenization and backbone. Everything else
-# -- dataset, max_faces, effective batch, schedule, seed -- is identical, so a
-# difference between them is attributable. Launch them with:
+# One of four runs. Dataset, effective batch, schedule and seed are identical
+# across all four; `max_faces` is 200 on the scratch arms and 113 on the OPT
+# ones, because only OPT has a shared 2048-position budget. So coord-vs-AMT is
+# a clean A/B *within* each backbone pair, while scratch-vs-OPT also differs in
+# how much of the corpus it sees (97.8% vs 89.3%). Launch them with:
 #   ./run_experiments.sh --smoke      (verify configs in minutes)
 #   nohup ./run_experiments.sh > experiments.out 2>&1 &
 #
@@ -33,9 +35,10 @@ mesh_data:
   margin_lo: [0.0, 0.0, 0.0]
   margin_hi: [0.0, 0.0, 0.1]
   # A *triangle* cap, applied to both LOD1 and LOD2 -- not a surface cap.
-  # Measured on mini_cleaner: 113 keeps 89.3% of pairs, and the coordinate
-  # path's longest cond+target is 2017 tokens against OPT's shared budget of
-  # 2048. Identical across all four runs so the datasets match exactly.
+  # 113, not the scratch arms' 200, because OPT shares one budget of
+  # max_position_embeddings=2048 across cond + target. Measured on
+  # mini_cleaner, 113 keeps 89.3% of pairs with a worst case of 2017 tokens;
+  # 200 would put 3.7% of pairs over the budget and raise in forward().
   max_faces: 113
   max_files: null
   tokenization: amt

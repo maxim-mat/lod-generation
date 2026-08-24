@@ -43,8 +43,80 @@ from src.dataset.mesh_dataset import (
     vocab_size,
 )
 from src.eval.mesh_metrics import chamfer_distance, surface_distances
+from src.models.embeddings import SinusoidalPositionEmbedding
 
 logger = logging.getLogger(__name__)
+
+POS_EMBEDS = ("learned", "sinusoidal")
+
+
+def _check_pos_embed(pos_embed):
+    """Reject a typo instead of silently falling back to the learned table."""
+    if pos_embed not in POS_EMBEDS:
+        raise ValueError(f"Unknown pos_embed: {pos_embed!r}. Expected one of "
+                         f"{' or '.join(repr(p) for p in POS_EMBEDS)}. Note RoPE "
+                         "is not available on the OPT backbone: OPTAttention."
+                         "forward takes no position argument, so rotary "
+                         "positions would need a fork of every layer.")
+    return pos_embed
+
+
+def _pretrained_position_check(have, want, opt_name):
+    """Refuse a task that needs more position rows than a checkpoint carries.
+
+    Growing the table is free with random weights, which is why MeshAnything V2
+    can size it to 10,340 -- it builds with `from_config`. It is *not* free on a
+    loaded checkpoint: the extra rows would be untrained noise inside a trained
+    model, and OPT has no length extrapolation (positions are absolute and added
+    at the input). So this fails loudly rather than quietly degrading.
+    """
+    if want is None or want <= have:
+        return
+    raise ValueError(
+        f"The task needs {want} positions but {opt_name} ships {have} trained "
+        f"rows, and untrained position rows inside a pretrained model is not a "
+        f"thing OPT recovers from. Either lower mesh_model.n_max_triangles, "
+        f"lower mesh_model.cond_max_triangles (LOD1 is a prism and rarely needs "
+        f"the target's budget), switch mesh_data.tokenization to amt, set "
+        f"mesh_model.pos_embed=sinusoidal, which has no table at all, or run "
+        f"with opt_pretrained=false, where the table is sized to the task.")
+
+
+class OPTSinusoidalPositions(nn.Module):
+    """Drop-in for `OPTLearnedPositionalEmbedding`, minus the row count.
+
+    OPT adds absolute positions at the decoder input and nowhere else --
+    `OPTAttention.forward` never sees a position -- so `embed_positions` is the
+    *only* thing that makes `max_position_embeddings` binding. Replacing this
+    one module therefore removes the ceiling outright, which a taller table
+    would only move (at ~1.6M params per 2048 rows on hidden 768).
+
+    The call signature and the position arithmetic are copied from
+    `OPTLearnedPositionalEmbedding` on transformers 5.10.2 deliberately. Ids
+    come from a cumsum over the attention mask, not from `arange`, so a padded
+    condition does not shift the real tokens behind it -- with right padding and
+    a variable-length condition that invariance is the difference between the
+    same building landing on the same positions at sampling time and not.
+    OPT's ``+ self.offset`` is dropped: it exists to skip an `nn.Embedding`'s
+    padding rows, and there are no rows here.
+
+    Args:
+        dim (int): OPT's ``hidden_size``. Note positions are added *after*
+            ``project_in``, so this is not ``word_embed_proj_dim``.
+    """
+
+    def __init__(self, dim):
+        super().__init__()
+        self.embed = SinusoidalPositionEmbedding(dim)
+
+    def forward(self, attention_mask, past_key_values_length=0, position_ids=None):
+        if position_ids is None:
+            position_ids = torch.cumsum(attention_mask, dim=1)
+            position_ids = (position_ids * attention_mask - 1).long()
+            position_ids = position_ids[:, past_key_values_length:]
+        # Padded slots come out of that as -1. They are masked out of attention
+        # anyway; clamping just keeps the position well-defined.
+        return self.embed(position_ids.clamp(min=0))
 
 
 def invalid_logits_mask(tgt, vocab, num_bins, tokenization="coord", pad=None):
@@ -304,17 +376,25 @@ class MeshTransformer(MeshEmbedding):
         max_seq_len (int): capacity of the learned positional embedding.
             Positions restart per segment, so it must cover the longer of
             ``len(cond)`` and ``len(tgt) - 1``, not their sum;
-            `MeshDataset.max_seq_len` reports what the data needs.
+            `MeshDataset.max_seq_len` reports what the data needs. Under
+            ``pos_embed="sinusoidal"`` nothing is capped and this is only the
+            default generation budget.
+        pos_embed (str): ``"learned"`` -- an `nn.Embedding` table, the default
+            and what every run so far used. ``"sinusoidal"`` -- fixed Fourier
+            positions, no parameters and no length ceiling.
     """
 
     def __init__(self, vocab_size, d_model=256, n_head=8, num_layers=6,
                  dropout=0.1, max_seq_len=4096, cond_dim=None,
                  codebook=None, tokens_per_face=None,
-                 tokenization="coord", num_bins=None):
+                 tokenization="coord", num_bins=None, pos_embed="learned"):
         super().__init__(vocab_size, d_model, cond_dim, codebook, tokens_per_face,
                          tokenization, num_bins)
         self.max_seq_len = max_seq_len
-        self.pos_embed = nn.Embedding(max_seq_len, d_model)
+        self.bounded_positions = _check_pos_embed(pos_embed) == "learned"
+        self.pos_embed = (nn.Embedding(max_seq_len, d_model)
+                          if self.bounded_positions
+                          else SinusoidalPositionEmbedding(d_model))
         self.drop = nn.Dropout(dropout)
 
         layer = nn.TransformerEncoderLayer(
@@ -324,6 +404,101 @@ class MeshTransformer(MeshEmbedding):
         self.blocks = nn.TransformerEncoder(layer, num_layers=num_layers)
         self.norm = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size)
+
+    def generation_budget(self, n_cond):
+        """Most new target tokens sampleable after a condition of `n_cond`.
+
+        Positions restart per segment here, so the condition costs the target
+        nothing and `n_cond` is accepted only to match `MeshOPTTransformer`,
+        where it does. Under sinusoidal positions `max_seq_len` is no longer a
+        ceiling, just the budget sized from the corpus.
+        """
+        return self.max_seq_len - 1
+
+    def _layer(self, layer, x, h, kv, key_padding_mask, attn_mask=None):
+        """One `norm_first` encoder layer with the keys/values supplied.
+
+        `x` is the residual stream and `h` is `norm1(x)` -- the *query*. Both
+        are passed because the query is normed while the residual it adds back
+        into is not, and conflating them is a quiet ~0.06-logit error rather
+        than a crash.
+
+        `nn.TransformerEncoderLayer._sa_block` hard-wires q = k = v, which is
+        exactly what incremental decoding cannot do -- the query is one token
+        and the keys are the whole prefix. So the residual order is spelled out
+        here, reusing the layer's own submodules and weights: no new parameters,
+        no state-dict change, and an existing checkpoint decodes either way.
+
+        The order mirrors `norm_first=True`:
+            x = x + sa(norm1(x)) ; x = x + ff(norm2(x))
+        `tests/test_kv_cache.py` pins it against the uncached path, which is the
+        only thing standing between this and a silent drift if torch ever
+        reorders that block.
+        """
+        a = layer.self_attn(h, kv, kv, attn_mask=attn_mask,
+                            key_padding_mask=key_padding_mask,
+                            need_weights=False)[0]
+        x = x + layer.dropout1(a)
+        return x + layer._ff_block(layer.norm2(x))
+
+    def new_cache(self, cond, cond_pad_mask=None):
+        """Encode the condition once and keep what the target will attend to.
+
+        Stores each layer's *attention input* (`norm1(x)`) rather than projected
+        K/V, because `nn.MultiheadAttention` owns those projections and applies
+        them internally. Same asymptotics -- O(layers x L x d) either way -- and
+        it keeps the weights untouched.
+
+        The condition attends causally within itself, matching the uncached
+        path, whose causal mask spans the whole sequence rather than starting at
+        the target.
+        """
+        n_cond = cond.shape[1]
+        device = cond.device
+        pos = torch.arange(n_cond, device=device)
+        x = self.embed_cond(cond) + self.pos_embed(pos) + self.segment_embed(
+            torch.zeros(n_cond, dtype=torch.long, device=device))
+        x = self.drop(x)
+        causal = torch.ones(n_cond, n_cond, dtype=torch.bool,
+                            device=device).triu(1)
+        states = []
+        for layer in self.blocks.layers:
+            h = layer.norm1(x)
+            states.append(h)
+            x = self._layer(layer, x, h, h, cond_pad_mask, attn_mask=causal)
+        pad = (torch.zeros(cond.shape[0], n_cond, dtype=torch.bool, device=device)
+               if cond_pad_mask is None else cond_pad_mask)
+        return {"states": states, "pad": pad, "n_tgt": 0}
+
+    def cached_logits(self, cache, tgt):
+        """Next-token logits after appending whatever of `tgt` is not cached yet."""
+        device = tgt.device
+        # Embedded from the *whole* prefix, not the newest token alone: AMT roles
+        # are derived causally from everything before them, and the VQ-VAE face
+        # slot is keyed off absolute index. Both would be wrong from one token.
+        # O(L) lookups against the stack's O(L x d^2) -- not the hot path.
+        embedded = self.embed_tokens(tgt)
+        one = torch.ones(1, dtype=torch.long, device=device)
+        for j in range(cache["n_tgt"], tgt.shape[1]):
+            x = (embedded[:, j:j + 1]
+                 + self.pos_embed(torch.tensor([j], device=device))
+                 + self.segment_embed(one))
+            x = self.drop(x)
+            cache["pad"] = torch.cat(
+                [cache["pad"], torch.zeros(tgt.shape[0], 1, dtype=torch.bool,
+                                           device=device)], dim=1)
+            for i, layer in enumerate(self.blocks.layers):
+                h = layer.norm1(x)
+                cache["states"][i] = torch.cat([cache["states"][i], h], dim=1)
+                x = self._layer(layer, x, h, cache["states"][i], cache["pad"])
+            cache["n_tgt"] = j + 1
+        return self.head(self.norm(x))[:, -1]
+
+    @staticmethod
+    def reorder_cache(cache, order):
+        """Beam search reshuffles rows every step; the history must follow."""
+        return {"states": [c[order] for c in cache["states"]],
+                "pad": cache["pad"][order], "n_tgt": cache["n_tgt"]}
 
     def forward(self, cond, tgt, cond_pad_mask=None, tgt_pad_mask=None):
         """Next-token logits for the target sequence.
@@ -339,11 +514,12 @@ class MeshTransformer(MeshEmbedding):
         """
         n_cond, n_tgt = cond.shape[1], tgt.shape[1]
         length = n_cond + n_tgt - 1
-        if max(n_cond, n_tgt - 1) > self.max_seq_len:
+        if self.bounded_positions and max(n_cond, n_tgt - 1) > self.max_seq_len:
             raise ValueError(
                 f"Segment of {max(n_cond, n_tgt - 1)} exceeds "
-                f"max_seq_len={self.max_seq_len}. "
-                "Raise model.max_seq_len or lower data.max_faces."
+                f"max_seq_len={self.max_seq_len}. Raise model.max_seq_len, "
+                "lower data.max_faces, or set mesh_model.pos_embed=sinusoidal, "
+                "which has no ceiling."
             )
 
         # Positions restart at 0 in the target segment. Counting straight through
@@ -399,20 +575,42 @@ class MeshOPTTransformer(MeshEmbedding):
         pretrained (bool): load OPT's weights, or only its architecture.
         opt_config (OPTConfig, optional): bypass the hub entirely. Tests pass a
             tiny config here; nothing else should need it.
+        pos_embed (str): ``"learned"`` keeps OPT's own table and its
+            `max_position_embeddings` ceiling. ``"sinusoidal"`` swaps
+            `decoder.embed_positions` for `OPTSinusoidalPositions` and removes
+            the ceiling. Safe with ``pretrained=False`` (there are no trained
+            position rows to discard); with ``pretrained=True`` it *does*
+            discard them, which is a real change to a pretrained model and is
+            warned about rather than forbidden.
     """
 
     def __init__(self, vocab_size, opt_name="facebook/opt-350m", pretrained=False,
                  cond_dim=None, codebook=None, tokens_per_face=None,
                  dropout=None, opt_config=None,
-                 tokenization="coord", num_bins=None):
+                 tokenization="coord", num_bins=None, pos_embed="learned",
+                 max_seq_len=None, opt_max_positions=None):
+        import copy
+
         from transformers import AutoConfig, OPTConfig, OPTForCausalLM
 
-        if opt_config is not None:
-            opt = OPTForCausalLM(opt_config)
-        elif pretrained:
+        if pretrained and opt_config is None:
+            # The one path with trained position rows, so the one path that
+            # cannot be resized to fit the task -- it checks instead.
             opt = OPTForCausalLM.from_pretrained(opt_name)
+            _pretrained_position_check(opt.config.max_position_embeddings,
+                                       opt_max_positions, opt_name)
         else:
-            opt = OPTForCausalLM(AutoConfig.from_pretrained(opt_name))
+            # Random weights, so the table costs only parameters and can be
+            # sized to the task exactly as MeshAnything V2 does
+            # (`meshanything_v2.py`: ShapeOPTConfig.from_pretrained(...,
+            # max_position_embeddings=max_length)). Deep-copied because a
+            # config handed in by a caller is theirs, not ours to resize.
+            base = (opt_config if opt_config is not None
+                    else AutoConfig.from_pretrained(opt_name))
+            if opt_max_positions:
+                base = copy.deepcopy(base)
+                base.max_position_embeddings = opt_max_positions
+            opt = OPTForCausalLM(base)
         cfg = opt.config
         if dropout is not None:
             cfg.dropout = dropout
@@ -429,20 +627,116 @@ class MeshOPTTransformer(MeshEmbedding):
         opt.resize_token_embeddings(vocab_size)
         self.opt = opt
         # The combined budget, not a per-segment one: OPT's positions run
-        # through both halves. `forward` checks against it.
-        self.max_seq_len = cfg.max_position_embeddings
+        # through both halves. `forward` checks against it -- unless positions
+        # are sinusoidal, in which case there is nothing to check against.
+        #
+        # ponytail: with pos_embed="learned" this still inherits opt-125m's 2048
+        # from the hub config, a default rather than a constraint. MeshAnything
+        # V2 sizes the table to the task instead (`meshanything_v2.py`:
+        # max_position_embeddings = n_max_triangles * face_per_token * 0.70 + 3
+        # + cond_length = 10340), at ~1.6M params per 2048 extra rows. Upgrade
+        # path: either pass `opt_config=` with `max_position_embeddings` derived
+        # from mesh_data.max_faces (the hook exists here; train_mesh.py does not
+        # use it), or set pos_embed=sinusoidal, which removes the ceiling
+        # instead of moving it.
+        self.bounded_positions = _check_pos_embed(pos_embed) == "learned"
+        # Learned positions: the table *is* the ceiling, so it is the budget and
+        # `max_seq_len` from the config cannot raise it. Sinusoidal: the table is
+        # gone, so the corpus-derived length is the only meaningful number and
+        # the hub default survives only as a fallback for callers that pass none.
+        self.max_seq_len = (cfg.max_position_embeddings if self.bounded_positions
+                            else (max_seq_len or cfg.max_position_embeddings))
+        if not self.bounded_positions:
+            if pretrained and opt_config is None:
+                logger.warning(
+                    "pos_embed='sinusoidal' with opt_pretrained=true discards "
+                    "%s's trained position rows. The rest of the weights are "
+                    "kept, but they were trained against those positions.",
+                    opt_name)
+            decoder = self.opt.model.decoder
+            decoder.embed_positions = OPTSinusoidalPositions(cfg.hidden_size)
+
+    def generation_budget(self, n_cond):
+        """Most new target tokens sampleable after a condition of `n_cond`.
+
+        With a learned table the budget is *shared*: OPT counts positions
+        straight through, so a 500-token condition leaves 500 fewer for the
+        mesh. Ignoring that is not a truncation but a mid-sample `ValueError`,
+        because `forward` is what catches the overrun.
+
+        With sinusoidal positions nothing is shared -- there is no table to run
+        off the end of -- so this is the plain corpus-derived budget, the same
+        number the scratch backbone reports.
+        """
+        if not self.bounded_positions:
+            return self.max_seq_len - 1
+        return self.max_seq_len - n_cond
+
+    def new_cache(self, cond, cond_pad_mask=None):
+        """Prime OPT's own `DynamicCache` with the condition.
+
+        Nothing hand-rolled here: `use_cache=True` is the path the library
+        already maintains. The attention mask is carried along and grown by one
+        each step, because OPT derives its position ids from a cumsum over it --
+        so the mask is what keeps a padded condition from shifting the target,
+        exactly as in the uncached path.
+        """
+        from transformers import DynamicCache
+
+        attn = (torch.ones(cond.shape[:2], dtype=torch.long, device=cond.device)
+                if cond_pad_mask is None else (~cond_pad_mask).long())
+        return {"past": DynamicCache(), "attn": attn, "n_cond": cond.shape[1],
+                "n_tgt": 0, "cond": cond}
+
+    def cached_logits(self, cache, tgt):
+        """Next-token logits after appending whatever of `tgt` is not cached yet."""
+        device = tgt.device
+        # See `MeshTransformer.cached_logits`: the whole prefix is embedded so
+        # AMT roles and VQ-VAE face slots stay right, then only the new rows are
+        # pushed through the stack.
+        embedded = self.embed_tokens(tgt)
+        new = embedded[:, cache["n_tgt"]:]
+        if cache["n_tgt"] == 0:
+            # First call also carries the condition, which has segment 0.
+            new = torch.cat([self.embed_cond(cache["cond"]), new], dim=1)
+            seg = torch.cat([torch.zeros(cache["n_cond"], dtype=torch.long,
+                                         device=device),
+                             torch.ones(tgt.shape[1], dtype=torch.long,
+                                        device=device)])
+        else:
+            seg = torch.ones(new.shape[1], dtype=torch.long, device=device)
+            cache["attn"] = torch.cat(
+                [cache["attn"], torch.ones(tgt.shape[0], new.shape[1],
+                                           dtype=torch.long, device=device)], dim=1)
+        if cache["n_tgt"] == 0:
+            cache["attn"] = torch.cat(
+                [cache["attn"], torch.ones(tgt.shape[0], tgt.shape[1],
+                                           dtype=torch.long, device=device)], dim=1)
+        x = new + self.segment_embed(seg)
+        out = self.opt(inputs_embeds=x, attention_mask=cache["attn"],
+                       past_key_values=cache["past"], use_cache=True)
+        cache["past"] = out.past_key_values
+        cache["n_tgt"] = tgt.shape[1]
+        return out.logits[:, -1]
+
+    @staticmethod
+    def reorder_cache(cache, order):
+        cache["past"].batch_select_indices(order)
+        return {**cache, "attn": cache["attn"][order],
+                "cond": cache["cond"][order]}
 
     def forward(self, cond, tgt, cond_pad_mask=None, tgt_pad_mask=None):
         """Next-token logits for the target sequence. Same contract as
         `MeshTransformer.forward`, so nothing downstream can tell them apart."""
         n_cond, n_tgt = cond.shape[1], tgt.shape[1]
         length = n_cond + n_tgt - 1
-        if length > self.max_seq_len:
+        if self.bounded_positions and length > self.max_seq_len:
             raise ValueError(
                 f"Condition ({n_cond}) plus target ({n_tgt - 1}) is {length}, past "
                 f"OPT's max_position_embeddings={self.max_seq_len}. Unlike the "
                 "from-scratch backbone this budget is shared, because positions "
-                "run through both halves. Lower mesh_data.max_faces."
+                "run through both halves. Lower mesh_data.max_faces, or set "
+                "mesh_model.pos_embed=sinusoidal, which has no ceiling."
             )
 
         x = torch.cat([self.embed_cond(cond), self.embed_tokens(tgt[:, :-1])], dim=1)
@@ -468,7 +762,8 @@ class MeshTransformerModule(L.LightningModule):
                  lr_scheduler="none", lr_decay_steps=50, lr_decay_rate=0.5,
                  vqvae=None, backbone="scratch", opt_name="facebook/opt-350m",
                  opt_pretrained=True, opt_config=None,
-                 tokenization="coord", mask_invalid=False):
+                 tokenization="coord", mask_invalid=False, pos_embed="learned",
+                 opt_max_positions=None):
         """
         Args:
             num_bins (int): coordinate discretization used by the tokenizer.
@@ -476,6 +771,11 @@ class MeshTransformerModule(L.LightningModule):
                 saved as a hyperparameter so inference restores it.
             lr_scheduler (str): 'none' | 'cosine' | 'step', as in
                 `CityJSONDiffusionModule`.
+            opt_max_positions (int, optional): OPT position-table size, from
+                `mesh_dataset.position_budget`. None keeps the hub default.
+            pos_embed (str): 'learned' | 'sinusoidal'. Applies to both
+                backbones; 'sinusoidal' removes the sequence-length ceiling
+                (each backbone's docstring says how).
             vqvae (MeshVQVAE, optional): a trained stage-1 tokenizer. Given one,
                 the model predicts *codes* rather than coordinates and the LOD1
                 condition is encoded (never quantized -- see the design spec).
@@ -511,6 +811,7 @@ class MeshTransformerModule(L.LightningModule):
             )
         self.tokenization = tokenization
         self.mask_invalid = mask_invalid
+        _check_pos_embed(pos_embed)
 
         self.vqvae = vqvae
         if vqvae is None:
@@ -541,7 +842,7 @@ class MeshTransformerModule(L.LightningModule):
                 vocab_size=vocab, d_model=d_model, n_head=n_head,
                 num_layers=num_layers, dropout=dropout, max_seq_len=max_seq_len,
                 cond_dim=cond_dim, codebook=codebook, tokens_per_face=per_face,
-                tokenization=tokenization, num_bins=num_bins,
+                tokenization=tokenization, num_bins=num_bins, pos_embed=pos_embed,
             )
         elif backbone == "opt":
             # d_model / n_head / num_layers / max_seq_len come from the OPT
@@ -551,7 +852,14 @@ class MeshTransformerModule(L.LightningModule):
                 vocab_size=vocab, opt_name=opt_name, pretrained=opt_pretrained,
                 cond_dim=cond_dim, codebook=codebook, tokens_per_face=per_face,
                 dropout=dropout, opt_config=opt_config,
-                tokenization=tokenization, num_bins=num_bins,
+                tokenization=tokenization, num_bins=num_bins, pos_embed=pos_embed,
+                # Only used when positions are sinusoidal: with a learned table
+                # OPT's own row count is the ceiling and this cannot lift it.
+                max_seq_len=max_seq_len,
+                # Sizes that table from the task instead of inheriting the hub
+                # default. Ignored on the pretrained path, which checks against
+                # its trained rows rather than resizing them.
+                opt_max_positions=opt_max_positions,
             )
         else:
             raise ValueError(f"Unknown backbone: {backbone!r}. Expected "
@@ -905,13 +1213,126 @@ class MeshTransformerModule(L.LightningModule):
             },
         }
 
+    def _step_logits(self, cond, tgt, cond_pad_mask, cache=None):
+        """Next-token logits for each row of `tgt`, with invalid ones masked.
+
+        Shared by greedy and beam search so the two cannot drift apart on the
+        rule that matters most: Masking Invalid Predictions (MeshAnything V2
+        section 3.2, after PolyGen) has to apply per *candidate*, or beam search
+        happily reintroduces the structurally impossible sequences it forbids.
+        """
+        if cache is not None:
+            logits = self.network.cached_logits(cache, tgt)
+        else:
+            # The trailing PAD only satisfies `forward`'s `tgt[:, :-1]`
+            # convention -- it embeds `tgt` entire, and [:, -1] is then the
+            # prediction after its last real token.
+            step = torch.cat([tgt, torch.full_like(tgt[:, :1], self.pad)], dim=1)
+            logits = self.network(cond, step, cond_pad_mask,
+                                  torch.zeros_like(step, dtype=torch.bool))[:, -1]
+        if self.mask_invalid and self.vqvae is None:
+            bad = invalid_logits_mask(tgt, logits.shape[-1], self.num_bins,
+                                      tokenization=self.tokenization,
+                                      pad=self.pad)
+            logits = logits.masked_fill(bad, float("-inf"))
+        return logits
+
     @torch.no_grad()
-    def generate(self, cond, cond_pad_mask=None, max_new_tokens=None, temperature=1.0):
-        """Greedy/temperature sampling of an LOD2 token sequence from LOD1 tokens.
+    def _beam_search(self, cond, cond_pad_mask, max_new_tokens, beam_size,
+                     length_penalty, use_cache=True):
+        """Deterministic search for the highest-scoring sequence, not the
+        highest-scoring next token.
+
+        Standard log-prob beam search. Two details are specific to meshes:
+
+        * `length_penalty` is not cosmetic here. Raw sum-of-log-probs is biased
+          toward short sequences, and a short sequence *is* a mesh with fewer
+          triangles -- so an unnormalised beam search would systematically
+          return degenerate buildings that greedy would not.
+        * A finished beam is pinned to PAD at zero cost rather than dropped, so
+          it keeps competing on score while the others run on. Dropping it would
+          let a worse but still-running beam win by default.
+
+        Returns the same ``[B, L]`` contract as the greedy loop: BOS-led,
+          EOS-terminated, PAD after.
+        """
+        bos, eos, pad = self.bos, self.eos, self.pad
+        n, device = cond.shape[0], cond.device
+
+        cond = cond.repeat_interleave(beam_size, dim=0)
+        if cond_pad_mask is not None:
+            cond_pad_mask = cond_pad_mask.repeat_interleave(beam_size, dim=0)
+
+        tgt = torch.full((n * beam_size, 1), bos, dtype=torch.long, device=device)
+        # Only beam 0 starts alive. All `beam_size` rows hold the same BOS, so
+        # without this the first expansion would pick the same top token
+        # `beam_size` times over and the search would never branch.
+        scores = torch.full((n, beam_size), float("-inf"), device=device)
+        scores[:, 0] = 0.0
+        scores = scores.view(-1)
+        done = torch.zeros(n * beam_size, dtype=torch.bool, device=device)
+        cache = self.network.new_cache(cond, cond_pad_mask) if use_cache else None
+
+        for _ in range(max_new_tokens):
+            logits = self._step_logits(cond, tgt, cond_pad_mask, cache)
+            vocab = logits.shape[-1]
+            logp = torch.log_softmax(logits.float(), dim=-1)
+
+            # Finished beams may only extend with PAD, and that costs nothing --
+            # so their score is frozen at whatever they earned.
+            logp = torch.where(done[:, None], torch.full_like(logp, float("-inf")),
+                               logp)
+            logp[done, pad] = 0.0
+
+            cand = (scores[:, None] + logp).view(n, beam_size * vocab)
+            top, flat_idx = cand.topk(beam_size, dim=-1)
+            src = torch.div(flat_idx, vocab, rounding_mode="floor")
+            token = flat_idx % vocab
+
+            # topk indexes within a row, so lift it back to a row of `tgt`.
+            order = (torch.arange(n, device=device)[:, None] * beam_size
+                     + src).view(-1)
+            tgt = torch.cat([tgt[order], token.view(-1, 1)], dim=1)
+            if cache is not None:
+                cache = self.network.reorder_cache(cache, order)
+            done = done[order] | (token.view(-1) == eos)
+            scores = top.reshape(-1)
+            if bool(done.all()):
+                break
+
+        # PAD is filler, not content, so it must not earn a beam any length
+        # credit -- otherwise the penalty rewards finishing early and padding.
+        lengths = (tgt != pad).sum(dim=1).clamp(min=1).float()
+        best = (scores / lengths.pow(length_penalty)).view(n, beam_size).argmax(-1)
+        return tgt.view(n, beam_size, -1)[torch.arange(n, device=device), best]
+
+    @torch.no_grad()
+    def generate(self, cond, cond_pad_mask=None, max_new_tokens=None,
+                 temperature=1.0, beam_size=1, length_penalty=1.0,
+                 use_cache=True):
+        """Decode an LOD2 token sequence from LOD1 tokens.
 
         Args:
-            max_new_tokens: defaults to what the positional embedding can hold.
-                Asking for more raises in `forward` rather than sampling.
+            max_new_tokens: defaults to `network.generation_budget(len(cond))`,
+                and is clamped to it. Callers size this from the task
+                (`mesh_eval` asks for ``9 * max_faces + 1``) and cannot know
+                what the position scheme allows, so the clamp lives here --
+                the one place that has both numbers.
+            temperature: <= 0 is greedy argmax, > 0 samples.
+            beam_size: 1 keeps the greedy/sampling loop. > 1 runs beam
+                search, which is deterministic and therefore rejects a
+                sampling temperature. Note the reference does *not* do this:
+                MeshAnything V2 passes `num_beams=1` and offers top-k/top-p
+                as its only alternative to greedy.
+            use_cache: incremental decoding. A pure speedup -- pinned
+                token-identical to the uncached path by
+                `tests/test_kv_cache.py` -- so False is an escape hatch,
+                not a mode.
+            length_penalty: beam scores are divided by ``length ** penalty``,
+                as in HF `generate`. 0.0 is raw sum-of-log-probs, which is
+                biased toward short sequences -- and short here means a mesh
+                with fewer triangles, so the default is 1.0 (mean log-prob
+                per token) rather than the usual 0.
 
         Returns:
             Tensor: [B, L] generated tokens, BOS-led, EOS-terminated where the
@@ -919,28 +1340,37 @@ class MeshTransformerModule(L.LightningModule):
             `src.dataset.mesh_dataset.detokenize`.
         """
         bos, eos = self.bos, self.eos
+        if beam_size < 1:
+            raise ValueError(f"beam_size must be >= 1, got {beam_size}.")
+        if beam_size > 1 and temperature > 0:
+            raise ValueError(
+                f"beam_size={beam_size} with temperature={temperature} asks for a "
+                "deterministic argmax over sequences and a random draw at the "
+                "same time. Use temperature<=0 with beams, or beam_size=1 to "
+                "sample.")
+        budget = self.network.generation_budget(cond.shape[1])
+        if budget < 1:
+            raise ValueError(
+                f"A condition of {cond.shape[1]} tokens leaves no room to "
+                f"generate against a budget of {self.network.max_seq_len}. "
+                "Lower mesh_data.max_faces, or set "
+                "mesh_model.pos_embed=sinusoidal, which has no ceiling.")
         if max_new_tokens is None:
-            max_new_tokens = self.network.max_seq_len - 1
+            max_new_tokens = budget
+        elif max_new_tokens > budget:
+            logger.info("Generation budget %d -> %d (position limit, "
+                        "condition is %d tokens)",
+                        max_new_tokens, budget, cond.shape[1])
+            max_new_tokens = budget
+        if beam_size > 1:
+            return self._beam_search(cond, cond_pad_mask, max_new_tokens,
+                                     beam_size, length_penalty, use_cache)
         tgt = torch.full((cond.shape[0], 1), bos, dtype=torch.long, device=cond.device)
         done = torch.zeros(cond.shape[0], dtype=torch.bool, device=cond.device)
+        cache = self.network.new_cache(cond, cond_pad_mask) if use_cache else None
 
         for _ in range(max_new_tokens):
-            # ponytail: no KV cache, so this is O(L^2) per step. Add one when
-            # sampling time actually hurts -- correctness first.
-            step = torch.cat([tgt, torch.full_like(tgt[:, :1], self.pad)], dim=1)
-            logits = self.network(cond, step, cond_pad_mask,
-                                  torch.zeros_like(step, dtype=torch.bool))[:, -1]
-
-            # Masking Invalid Predictions (MeshAnything V2 section 3.2, after
-            # PolyGen): make structurally impossible tokens unreachable rather
-            # than merely unlikely. -inf, not a small penalty, so it survives
-            # any temperature. Coordinates are never masked, so this cannot
-            # starve the softmax.
-            if self.mask_invalid and self.vqvae is None:
-                bad = invalid_logits_mask(tgt, logits.shape[-1], self.num_bins,
-                                          tokenization=self.tokenization,
-                                          pad=self.pad)
-                logits = logits.masked_fill(bad, float("-inf"))
+            logits = self._step_logits(cond, tgt, cond_pad_mask, cache)
 
             if temperature <= 0:
                 nxt = logits.argmax(dim=-1)

@@ -28,6 +28,13 @@ mapbox-earcut>=1.0.2
 # at n=4096, which was 126% of the real LOD1->LOD2 chamfer. Install `embreex`
 # alongside if the proximity query becomes a bottleneck; it is a drop-in speedup.
 trimesh>=4.0
+# trimesh's ONLY hard dependency is numpy; everything else sits under extras, so
+# `pip install trimesh` gives you a package that imports fine and then fails at
+# the first proximity query. `closest_point` walks `mesh.triangles_tree`, which
+# is an R-tree, so rtree is not optional for us even though it is for trimesh.
+# Pinned explicitly rather than as `trimesh[easy]`, which would also drag in
+# manifold3d and friends we do not use.
+rtree>=1.0
 
 # Experiment tracking
 tensorboard>=2.12.0
@@ -35,6 +42,7 @@ wandb>=0.15.0
 
 # Visualization
 plotly>=5.14.0
+matplotlib>=3.7   # the QQ plot in src/select_cityjson.py; plotly does not do one
 rich>=13.0.0  # Optional, but nice for progress bars
 streamlit>=1.30.0  # src/outlier_explorer.py
 pyproj>=3.6.0      # EPSG:28992 -> WGS84 for the explorer's map links

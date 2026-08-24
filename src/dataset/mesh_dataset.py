@@ -43,6 +43,76 @@ BOS, EOS, PAD = NUM_BINS, NUM_BINS + 1, NUM_BINS + 2
 # checkpoint trained before AMT still has the right number of output rows.
 BREAK = NUM_BINS + 3
 
+# Tokens a face costs the coordinate tokenizer: 3 vertices x 3 axes, exact.
+# MeshAnything V2 calls this `face_per_token` (`MeshAnything/models/
+# meshanything_v2.py`), which is the same 9.
+TOKENS_PER_FACE = 9
+# V2's `max_seq_ratio`. AMT's length depends on face *adjacency*, so it can
+# only be bounded, never derived from a face count. 0.70 is well above the
+# 0.49 the paper reports and the 0.533 measured on this corpus -- deliberately,
+# because the table has to hold the worst-connected mesh, not the mean one.
+AMT_SEQ_RATIO = 0.70
+
+
+def face_tokens(n_faces, tokenization="coord"):
+    """Worst-case token count for a mesh of `n_faces` triangles."""
+    if tokenization == "coord":
+        return n_faces * TOKENS_PER_FACE
+    if tokenization == "amt":
+        return int(n_faces * TOKENS_PER_FACE * AMT_SEQ_RATIO)
+    raise ValueError(f"Unknown tokenization: {tokenization!r}. "
+                     "Expected 'coord' or 'amt'.")
+
+
+def position_budget(n_max_triangles, cond_max_triangles=None,
+                    tokenization="coord"):
+    """How many positions a model needs for a task of this size.
+
+    This is the number that used to fall out of whatever survived
+    `max_faces`, which made model capacity a consequence of a *data* filter.
+    MeshAnything V2 keeps the two apart -- `data_process.py --max_face_num`
+    filters the corpus offline while `n_max_triangles` sizes the model -- and
+    this is that sizing, from `MeshAnything/models/meshanything_v2.py`:
+
+        max_length = int(n_max_triangles * face_per_token * max_seq_ratio
+                         + 3 + cond_length)
+
+    Adapted in two places. Their `cond_length` is a fixed 257-token point-cloud
+    encoding; ours is a variable-length LOD1 mesh through the *same* tokenizer,
+    so it is given in triangles and converted. And this project has two
+    backbones with different position semantics, so both numbers are returned
+    rather than V2's single one.
+
+    Args:
+        n_max_triangles (int): target-mesh capacity, in triangles. Independent
+            of `mesh_data.max_faces`, which only decides corpus membership.
+        cond_max_triangles (int, optional): LOD1 condition capacity. Defaults
+            to `n_max_triangles`, the worst case. Sizing it down is the lever
+            that makes an `opt_pretrained: true` run fit inside opt-350m's 2048
+            trained rows -- LOD1 is a prism and never binds on this corpus
+            (measured: at cap 200, LOD1 alone drops *zero* buildings).
+        tokenization (str): ``"coord"`` or ``"amt"``.
+
+    Returns:
+        tuple: ``(per_segment, shared)``.
+          `per_segment` sizes `MeshTransformer`, whose positions restart in the
+          target segment -- the larger half, plus BOS. It is a max and not a
+          sum precisely so a batch pairing the longest condition with the
+          longest target cannot exceed it.
+          `shared` sizes `MeshOPTTransformer` and the OPT config's
+          `max_position_embeddings`, where positions run straight through both
+          halves -- the sum, plus V2's 3 specials.
+    """
+    if n_max_triangles is None or n_max_triangles < 1:
+        raise ValueError(f"n_max_triangles must be >= 1, got {n_max_triangles!r}.")
+    if cond_max_triangles is None:
+        cond_max_triangles = n_max_triangles
+    cond = face_tokens(cond_max_triangles, tokenization)
+    tgt = face_tokens(n_max_triangles, tokenization)
+    # +1 is BOS: the target segment is fed BOS-led and the trailing EOS is
+    # never fed back in, which is the same arithmetic `MeshDataset` measured.
+    return max(cond, tgt + 1), cond + tgt + 3
+
 
 def vocab_size(num_bins=NUM_BINS, tokenization="coord"):
     """Coordinate bins plus BOS / EOS / PAD, and BREAK under AMT.
@@ -593,6 +663,13 @@ class MeshDataset(Dataset):
         meshes_out = _scan_lod_dir(self.dataset_dir, lod_out, max_files)
 
         ids = sorted(set(meshes_in) & set(meshes_out))
+        # Purely a corpus decision: which buildings belong in the dataset.
+        # Model capacity is `mesh_model.n_max_triangles` and is computed by
+        # `position_budget` above, so the two can be tuned apart -- V2 splits
+        # them the same way (`data_process.py --max_face_num` filters offline,
+        # `n_max_triangles` sizes the model). `max_seq_len` below is still
+        # measured, but it is now a *report* on the corpus rather than the
+        # capacity itself: train_mesh warns when the two disagree.
         if max_faces is not None:
             kept = [i for i in ids
                     if len(meshes_out[i][1]) <= max_faces and len(meshes_in[i][1]) <= max_faces]

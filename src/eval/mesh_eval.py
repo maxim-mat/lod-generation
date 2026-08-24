@@ -87,15 +87,11 @@ def run_mesh_eval(model, dataset, indices, cfg, max_new_tokens, seed=1234,
     if len(indices) == 0:
         return {}
 
-    # `max_seq_len` is sized from the longest sequence actually in the corpus,
-    # which is usually shorter than `max_faces` allows -- no building hits the
-    # cap. Asking for more tokens than the positional embedding holds raises in
-    # forward(), so the budget is whichever is smaller.
-    budget = model.network.max_seq_len - 1
-    if max_new_tokens > budget:
-        logger.info("[mesh-eval] generation budget %d -> %d (positional limit)",
-                    max_new_tokens, budget)
-        max_new_tokens = budget
+    # No clamp here on purpose. What the positions allow depends on the length
+    # of *this* condition on the OPT backbone, which is not known until each
+    # batch is collated, so `generate` owns the arithmetic and logs when it
+    # binds. Clamping here as well used `max_seq_len - 1` for both backbones,
+    # which is the shared cond+tgt budget on OPT and so overran it.
 
     eos = model.eos
     was_training = model.training
@@ -118,8 +114,11 @@ def run_mesh_eval(model, dataset, indices, cfg, max_new_tokens, seed=1234,
             cond, tgt, cond_pad, _ = model._prepare(batch)
             # temperature 0 -> argmax. A sampled generation would make the
             # metric a random variable and the epoch-to-epoch curve unreadable.
+            # Beam search is deterministic too, so the two compose.
             out = model.generate(cond, cond_pad,
-                                 max_new_tokens=max_new_tokens, temperature=0.0)
+                                 max_new_tokens=max_new_tokens, temperature=0.0,
+                                 beam_size=cfg.beam_size,
+                                 length_penalty=cfg.length_penalty)
 
         for k, i in enumerate(chunk):
             centre = batch["center"][k].cpu().numpy()
