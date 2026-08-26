@@ -58,11 +58,13 @@ class MeshSetTransformer(nn.Module):
         time_dim: timestep embedding width.
         out_bins: when set, emits ``[B,9,K,F]`` bin logits and ``[B,F]``
             presence logits for the D3PM arm instead of ``[B,10,F]``.
+        cond_ch: channels of the LOD1 condition. Always 10, and deliberately
+            *not* tied to `in_ch` -- see `ConditionalMeshUNet`.
     """
 
     def __init__(self, in_ch=10, out_ch=10, d_model=256, n_head=8,
                  num_layers=8, dropout=0.1, pos_embed="sinusoidal",
-                 time_dim=128, out_bins=None):
+                 time_dim=128, out_bins=None, cond_ch=10):
         super().__init__()
         if pos_embed not in ("sinusoidal", "none"):
             raise ValueError(
@@ -72,7 +74,7 @@ class MeshSetTransformer(nn.Module):
         self.pos = SinusoidalFacePositions(d_model) if pos_embed == "sinusoidal" else None
 
         self.inp = nn.Conv1d(in_ch, d_model, 1)
-        self.cond_encoder = FaceEncoder(in_ch, d_model)
+        self.cond_encoder = FaceEncoder(cond_ch, d_model)
         self.blocks = nn.ModuleList(
             [_Block(d_model, n_head, time_dim, dropout) for _ in range(num_layers)])
         self.norm = nn.LayerNorm(d_model)

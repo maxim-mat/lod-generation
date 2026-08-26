@@ -53,6 +53,13 @@ def create_denoiser(cfg, in_ch=10, out_bins=None):
     raise ValueError(f"Unknown denoiser: {d.denoiser!r}.")
 
 
+def _guide(cond_out, uncond_out, weight):
+    """Classifier-free guidance, for a tensor prediction or a logits tuple."""
+    if torch.is_tensor(cond_out):
+        return uncond_out + weight * (cond_out - uncond_out)
+    return tuple(u + weight * (c - u) for c, u in zip(cond_out, uncond_out))
+
+
 class MeshDiffusionModule(L.LightningModule):
     """Conditional face-set diffusion: LOD1 in, LOD2 out, one trajectory.
 
@@ -89,6 +96,74 @@ class MeshDiffusionModule(L.LightningModule):
             cfg, in_ch=in_ch, out_bins=self.num_bins if self.categorical else None)
         self.process = create_process(cfg)
 
+    # -- state routing (plan D10) -----------------------------------------
+
+    def _to_state(self, batch):
+        """The tensor the *process* corrupts, for this arm's state.
+
+        `continuous` and `quantized` corrupt the [B,10,F] float layout directly
+        -- they differ only in whether the target was snapped, which happened in
+        the dataset. `onehot` expands the bins here rather than in the
+        dataloader; see `_pack`'s docstring for why.
+        """
+        if self.state in ("continuous", "quantized"):
+            return batch["x"]
+        if self.state == "bins":
+            return batch["x_bins"]
+        b, _, f = batch["x"].shape
+        oh = torch.zeros(b, 9, self.num_bins, f, device=batch["x"].device)
+        oh.scatter_(2, batch["x_bins"].unsqueeze(2), 1.0)
+        # Centred to +-0.5, matching the coordinate and presence channels, so
+        # one Gaussian noise level is correctly scaled for every channel.
+        oh = oh - 0.5
+        return torch.cat([oh.reshape(b, 9 * self.num_bins, f),
+                          batch["x"][:, 9:10]], dim=1)
+
+    def _clamp_x0(self, logits):
+        """Predicted bin logits back to a state the next reverse step can take.
+
+        Hard clamping (`argmax` to a one-hot) is Diffusion-LM's trick
+        (arXiv:2205.14217 section 4.2) and is what keeps a *continuous* process
+        over a *discrete* alphabet landing on grid points instead of drifting
+        between them. `soft` keeps the softmax and is the ablation that shows
+        whether the trick is load-bearing here.
+
+        Returns:
+            tuple: ``(state_x0, bins)``. For `onehot` the state is the
+            (clamped) distribution itself, centred; for `quantized` it is the
+            single coordinate that distribution collapses to.
+        """
+        probs = torch.softmax(logits, dim=2)              # [B,9,K,F]
+        if self.x0_clamp == "hard":
+            idx = probs.argmax(dim=2, keepdim=True)
+            probs = torch.zeros_like(probs).scatter_(2, idx, 1.0)
+        if self.state == "onehot":
+            return probs - 0.5, probs.argmax(dim=2)
+        # `quantized`: collapse the distribution to a single coordinate. Under
+        # hard clamping this is the bin centre; under soft it is the posterior
+        # mean, which is what makes the two visibly different at sample time.
+        centres = torch.linspace(-0.5, 0.5, self.num_bins,
+                                 device=probs.device).view(1, 1, -1, 1)
+        return (probs * centres).sum(dim=2), probs.argmax(dim=2)
+
+    def _from_state(self, coords, bins, presence_logits):
+        """A categorical readout back to the ``[B,10,F]`` eval layout.
+
+        `coords` wins when it is given -- under `x0_clamp: soft` the posterior
+        mean is deliberately *not* a grid point, and rebuilding from `bins`
+        would quietly undo the ablation being measured.
+        """
+        if coords is None:
+            from src.dataset.mesh_dataset import dequantize
+            coords = torch.from_numpy(
+                dequantize(bins.detach().cpu().numpy(), self.num_bins)
+            ).float().to(presence_logits.device)
+        b, f = presence_logits.shape
+        out = torch.zeros(b, 10, f, device=presence_logits.device)
+        out[:, :9] = coords
+        out[:, 9] = torch.where(presence_logits > 0, 0.5, -0.5)
+        return out
+
     # -- plumbing ---------------------------------------------------------
 
     def _denoise(self, x, t, cond, mask, cond_mask):
@@ -109,7 +184,7 @@ class MeshDiffusionModule(L.LightningModule):
         raise ValueError(f"Unknown loss: {self.loss_name!r}.")
 
     def _shared_step(self, batch, stage):
-        x0 = batch["x"]
+        x0 = self._to_state(batch)
         cond = batch["cond"]
         cond_mask = batch["cond_mask"]
         # Classifier-free guidance needs an unconditional branch to exist, and
@@ -122,8 +197,13 @@ class MeshDiffusionModule(L.LightningModule):
         t = self.process.sample_t(x0.shape[0], x0.device)
         x_t, aux = self.process.corrupt(x0, t)
         pred = self._denoise(x_t, t, cond, batch["x_mask"], cond_mask)
-        target = self.process.target_for(x0, x_t, t, aux)
-        loss = self._loss(pred, target, batch, x0=x0)
+        if self.categorical:
+            # The CE label is `x_bins`, which the loss reads off the batch --
+            # there is no regression target to build here.
+            loss = self._loss(pred, None, batch)
+        else:
+            loss = self._loss(pred, self.process.target_for(x0, x_t, t, aux),
+                              batch, x0=x0)
 
         self.log(f"{stage}_loss", loss, on_step=(stage == "train"),
                  on_epoch=True, prog_bar=True, batch_size=x0.shape[0])
@@ -200,15 +280,34 @@ class MeshDiffusionModule(L.LightningModule):
 
         def denoiser_fn(x_t, t):
             out = self._denoise(x_t, t, cond, mask, cond_mask)
-            if self.guidance == 1.0:
+            if self.guidance != 1.0:
+                # Classifier-free guidance (Ho & Salimans, arXiv:2207.12598):
+                # push away from the unconditional prediction. Two forward
+                # passes per step, so it doubles the eval cost -- which is why
+                # it defaults to 1.0 and is a per-experiment choice.
+                uncond = self._denoise(x_t, t, None, mask, None)
+                out = _guide(out, uncond, self.guidance)
+            if not self.categorical or self.state == "bins":
                 return out
-            # Classifier-free guidance (Ho & Salimans, arXiv:2207.12598):
-            # push away from the unconditional prediction. Two forward passes
-            # per step, so it doubles the eval cost -- which is why it defaults
-            # to 1.0 and is a per-experiment choice.
-            uncond = self._denoise(x_t, t, None, mask, None)
-            return uncond + self.guidance * (out - uncond)
+            # Categorical readout over a Gaussian process: the process expects
+            # an x0-shaped tensor, so project the logits back to the state.
+            logits, presence_logits = out
+            state_x0, self._last_bins = self._clamp_x0(logits)
+            self._last_presence = presence_logits
+            self._last_coords = state_x0 if self.state == "quantized" else None
+            if self.state == "onehot":
+                b, _, f = x_t.shape
+                state_x0 = state_x0.reshape(b, 9 * self.num_bins, f)
+            return torch.cat([state_x0, presence_logits.unsqueeze(1)], dim=1)
 
-        return self.process.sample(denoiser_fn, shape, batch["x"].device,
-                                   n_steps=n_steps or self.eval_steps,
-                                   callback=scaffold)
+        out = self.process.sample(denoiser_fn, shape, batch["x"].device,
+                                  n_steps=n_steps or self.eval_steps,
+                                  callback=scaffold)
+        if not self.categorical:
+            return out
+        # The trajectory's last x0 *prediction* is the answer, not the process's
+        # own final state: that state is the same x0 re-noised by one schedule
+        # rung, which would drift it straight back off the grid the clamp just
+        # put it on -- the entire point of these arms.
+        return self._from_state(self._last_coords, self._last_bins,
+                                self._last_presence)

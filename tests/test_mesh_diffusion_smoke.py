@@ -158,3 +158,66 @@ def test_flow_arm_trains_and_samples():
     assert torch.isfinite(m.training_step(_batch(), 0))
     m.eval()
     assert m.generate(_batch(), n_steps=4).shape == (2, 10, 16)
+
+
+def _batch_with_bins(b=2, f=16, num_bins=128):
+    batch = _batch(b=b, f=f)
+    batch["x_bins"] = torch.randint(0, num_bins, (b, 9, f))
+    return batch
+
+
+def test_quantized_ce_arm_trains_and_lands_on_the_grid():
+    """state: quantized, Gaussian noise, categorical readout -- the reference's
+    scheme on coordinate channels."""
+    from src.dataset.mesh_dataset import quantize
+
+    m = MeshDiffusionModule(_cfg(state="quantized", loss="ce",
+                                 process="ddpm", target="original"))
+    assert torch.isfinite(m.training_step(_batch_with_bins(), 0))
+    m.eval()
+    out = m.generate(_batch_with_bins(), n_steps=4)
+    assert out.shape == (2, 10, 16)
+    coords = out[:, :9].detach().numpy()
+    # Hard clamping must leave every coordinate on a grid point.
+    import numpy as np
+    from src.dataset.mesh_dataset import dequantize
+    assert np.allclose(coords, dequantize(quantize(coords, 128), 128), atol=1e-6)
+
+
+def test_onehot_ce_arm_trains():
+    """state: onehot -- 9 x 128 indicator channels, exactly what the reference
+    diffuses."""
+    m = MeshDiffusionModule(_cfg(state="onehot", loss="ce",
+                                 process="ddpm", target="original"))
+    assert torch.isfinite(m.training_step(_batch_with_bins(), 0))
+
+
+def test_onehot_denoiser_input_width_is_nine_times_bins_plus_one():
+    m = MeshDiffusionModule(_cfg(state="onehot", loss="ce",
+                                 process="ddpm", target="original"))
+    x = m._to_state(_batch_with_bins())
+    assert x.shape == (2, 9 * 128 + 1, 16)
+
+
+def test_soft_clamp_leaves_the_grid():
+    import numpy as np
+    from src.dataset.mesh_dataset import dequantize, quantize
+
+    m = MeshDiffusionModule(_cfg(state="quantized", loss="ce", process="ddpm",
+                                 target="original", x0_clamp="soft")).eval()
+    coords = m.generate(_batch_with_bins(), n_steps=4)[:, :9].detach().numpy()
+    assert not np.allclose(coords, dequantize(quantize(coords, 128), 128), atol=1e-6)
+
+
+def test_ce_with_noise_target_is_rejected():
+    with pytest.raises(ValueError, match="signal-free"):
+        MeshDiffusionModule(_cfg(state="quantized", loss="ce",
+                                 process="ddpm", target="noise"))
+
+
+def test_module_construction_rejects_flow_with_ce():
+    """Same rule as the compat suite's `test_flow_with_ce_is_rejected`, checked
+    through the constructor -- the path a training run actually takes."""
+    with pytest.raises(ValueError, match="incompatible"):
+        MeshDiffusionModule(_cfg(state="quantized", loss="ce",
+                                 process="flow", target="velocity"))

@@ -34,14 +34,19 @@ class ConditionalMeshUNet(nn.Module):
         out_bins: when set, the head emits ``[B, 9, out_bins, F]`` bin logits
             plus ``[B, F]`` presence logits instead of ``[B, 10, F]`` -- the
             D3PM arm. ``None`` for every continuous process.
+        cond_ch: channels of the LOD1 condition. Always 10, and deliberately
+            *not* tied to `in_ch`: the ``onehot`` state widens the noised input
+            to 9 * num_bins + 1, but the condition it cross-attends to is the
+            same plain face set every other arm sees.
     """
 
     def __init__(self, in_ch=10, out_ch=10, base=64, cond_dim=256,
-                 time_dim=128, n_head=8, dropout=0.1, out_bins=None):
+                 time_dim=128, n_head=8, dropout=0.1, out_bins=None,
+                 cond_ch=10):
         super().__init__()
         self.time_dim = time_dim
         self.out_bins = out_bins
-        self.cond_encoder = FaceEncoder(in_ch, cond_dim)
+        self.cond_encoder = FaceEncoder(cond_ch, cond_dim)
 
         c1, c2, c3 = base, base * 2, base * 4
         self.inc = DoubleConv(in_ch, c1)
