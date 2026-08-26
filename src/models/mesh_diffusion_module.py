@@ -9,6 +9,7 @@ every batch. Geometry is measured by `MeshSetEvalCallback`, which runs the full
 reverse trajectory and is therefore gated to every N epochs -- the same split
 `MeshEvalCallback` uses on the autoregressive branch, and for the same reason.
 """
+import contextlib
 import logging
 
 import torch
@@ -68,6 +69,7 @@ def _ramped_ema(decay):
     (1+n)/(10+n))` tracks the live weights closely at first and tightens toward
     `decay` as the average earns its length.
     """
+    @torch.no_grad()
     def ema_update(ema_params, current_params, num_averaged):
         n = float(num_averaged)
         d = min(decay, (1.0 + n) / (10.0 + n))
@@ -126,6 +128,7 @@ class MeshDiffusionModule(L.LightningModule):
         # metric computed WITH them -- and so no callback ordering decides
         # whether eval sees them.
         self.ema_start_step = d.ema_start_step
+        self.eval_weights = "ema"
         self.ema = None
         if d.ema_decay is not None:
             self.ema = AveragedModel(self.denoiser,
@@ -233,9 +236,30 @@ class MeshDiffusionModule(L.LightningModule):
         actually accumulated something. `n_averaged == 0` means it is still the
         initialisation, which would make every sampled metric meaningless."""
         if (self.ema is not None and not self.training
-                and int(self.ema.n_averaged) > 0):
+                and self.eval_weights == "ema" and int(self.ema.n_averaged) > 0):
             return self.ema.module
         return self.denoiser
+
+    @contextlib.contextmanager
+    def using_weights(self, which):
+        """Temporarily sample from "ema" or "live" weights.
+
+        EMA does not touch the gradients, so the live-weight metric from an
+        EMA run IS the no-EMA result -- the training trajectories are
+        identical. That makes the EMA/no-EMA comparison free inside every run,
+        and leaves only the DECAY LENGTH needing separate runs.
+        """
+        prev = self.eval_weights
+        self.eval_weights = which
+        try:
+            yield
+        finally:
+            self.eval_weights = prev
+
+    @property
+    def ema_active(self):
+        """True once the EMA holds something other than the initialisation."""
+        return self.ema is not None and int(self.ema.n_averaged) > 0
 
     def _loss(self, pred, target, batch, x0=None):
         mask = batch["x_mask"]
@@ -343,7 +367,11 @@ class MeshDiffusionModule(L.LightningModule):
         """
         import torch.optim.lr_scheduler as S
 
-        opt = torch.optim.AdamW(self.parameters(), lr=self.lr)
+        # `self.denoiser`, not `self.parameters()`: the latter also yields the
+        # EMA copy, which is exactly as large. Their grads stay None so AdamW
+        # skips them today, but handing an optimizer parameters it must never
+        # update is the kind of thing a later change quietly turns into a bug.
+        opt = torch.optim.AdamW(self.denoiser.parameters(), lr=self.lr)
         warmup = int(self.warmup_steps)
 
         if self.lr_scheduler not in ("none", "cosine", "step"):

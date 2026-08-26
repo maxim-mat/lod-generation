@@ -1,0 +1,13 @@
+# Stage 3, arm 5: a LONGER EMA than the base 0.999.
+#
+# 0.9999 is what SR3's lineage uses -- Palette (arXiv:2111.05826) states
+# "We use 0.9999 EMA for all our experiments" across four paired
+# ground-truth tasks. It is ~10,000 updates of memory, which at 127 steps per
+# epoch is ~79 epochs; against c4's ~1 epoch that is the widest bracket worth
+# testing on this corpus.
+#
+# Read c4 / base / c5 as a three-point sweep, with each run's own
+# `val_gen_*_live` curve as the zero-length end of the same axis.
+mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: mse, denoiser: unet,
+                 state: continuous, process: ddpm, target: noise, ema_decay: 0.9999}
+logging: {run_name: mesh-diff-c5-ema-long}

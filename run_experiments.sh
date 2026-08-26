@@ -55,6 +55,8 @@ DIFF_STAGE3=(
   configs/mesh-diff-c1-scaffold.yaml
   configs/mesh-diff-c2-guidance.yaml
   configs/mesh-diff-c3-clamp-soft.yaml
+  configs/mesh-diff-c4-ema-short.yaml
+  configs/mesh-diff-c5-ema-long.yaml
 )
 # The revisit pass. The grid is greedy -- stage 1 ranks denoiser and loss under
 # ONE objective and stage 2 assumes that ranking transfers to six others -- and

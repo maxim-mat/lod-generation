@@ -505,3 +505,46 @@ def test_ema_decay_ramps_in():
     for n in range(200):
         fn(ema, [torch.ones(1)], n)
     assert ema[0].item() > 0.95        # a constant-0.999 EMA would be ~0.18 here
+
+
+def test_monitor_scores_ema_and_live_weights_differently():
+    """Dual logging: the same trajectory scored from both weight sets.
+
+    EMA leaves the gradients untouched, so the live-weight reading of an EMA
+    run IS the no-EMA result -- which is why EMA on/off costs no arm and only
+    the decay LENGTH needs separate runs.
+    """
+    from src.eval.mesh_set_eval import run_generative_monitor
+
+    cfg = _cfg()
+    cfg.mesh_data.max_faces = 32
+    cfg.mesh_diffusion.slot_budget = 32
+    cfg.mesh_diffusion.gen_eval_steps = 3
+    cfg.mesh_diffusion.ema_decay = 0.9
+    cfg.mesh_diffusion.ema_start_step = 0
+    m = MeshDiffusionModule(cfg)
+    torch.nn.init.normal_(m.denoiser.outc.weight, std=0.05)
+
+    opt = torch.optim.AdamW(m.denoiser.parameters(), lr=1e-2)
+    for i in range(6):
+        opt.zero_grad(); m.training_step(_batch(), i).backward(); opt.step()
+        m.ema.update_parameters(m.denoiser)
+    m.eval()
+
+    ds = _gen_ds()
+    ema = run_generative_monitor(m, ds, [0, 1], cfg, seed=3, weights="ema")
+    live = run_generative_monitor(m, ds, [0, 1], cfg, seed=3, weights="live")
+    assert ema["gen_coord_mse"] != live["gen_coord_mse"], \
+        "the two weight sets produced identical scores -- the switch is inert"
+    assert m.eval_weights == "ema", "using_weights must restore the previous setting"
+
+
+def test_optimizer_excludes_the_ema_copy():
+    """The EMA is exactly as large as the denoiser; handing it to the optimizer
+    is harmless today only because its grads stay None."""
+    m = MeshDiffusionModule(_cfg())
+    opt = m.configure_optimizers()
+    opt = opt if isinstance(opt, torch.optim.Optimizer) else opt["optimizer"]
+    n_opt = sum(p.numel() for g in opt.param_groups for p in g["params"])
+    assert n_opt == sum(p.numel() for p in m.denoiser.parameters())
+    assert n_opt < sum(p.numel() for p in m.parameters())

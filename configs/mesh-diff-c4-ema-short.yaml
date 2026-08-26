@@ -1,0 +1,14 @@
+# Stage 3, arm 4: a SHORTER EMA than the base 0.999.
+#
+# Length, not on/off. EMA never touches the gradients, so every run already
+# logs its own no-EMA control as `val_gen_*_live` -- an on/off arm would
+# retrain to reproduce a number we get for free. What genuinely needs separate
+# runs is the decay, because the average is accumulated during training.
+#
+# 0.99 is ~100 updates of memory against the base's ~1000. Karras et al.
+# (arXiv:2312.02696) find the optimal EMA length "differs considerably between
+# the configs" and moves DOWN as learning rate and model capacity rise -- we
+# run at 1e-3, which is high, so a shorter average is the plausible direction.
+mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: mse, denoiser: unet,
+                 state: continuous, process: ddpm, target: noise, ema_decay: 0.99}
+logging: {run_name: mesh-diff-c4-ema-short}

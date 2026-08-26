@@ -136,11 +136,21 @@ def generative_metrics(gen, batch, cfg):
     return out
 
 
-def run_generative_monitor(model, dataset, indices, cfg, seed=1234, scaffold=None):
+def run_generative_monitor(model, dataset, indices, cfg, seed=1234, scaffold=None,
+                           weights="ema"):
     """Tier 2: a free-running reverse trajectory, scored distributionally.
 
     Runs every validation epoch, so it is sized to be cheap: `n_val_gen`
     buildings at `gen_eval_steps` steps, ~10% of a training epoch as measured.
+
+    Args:
+        weights: "ema" or "live". EMA never touches the gradients, so the
+            live-weight score of an EMA run is exactly the no-EMA result --
+            which is why both are logged every epoch rather than costing a
+            separate arm. What the paired-diffusion literature does NOT report
+            is which of the two wins on a paired distortion metric: SR3 and
+            Palette both use EMA throughout without ablating it, and the
+            ablations that do exist (NCSNv2, EDM2) are on FID.
 
     Returns:
         dict: mean of `generative_metrics` over the sampled buildings.
@@ -152,7 +162,7 @@ def run_generative_monitor(model, dataset, indices, cfg, seed=1234, scaffold=Non
     model.eval()
     device = next(model.parameters()).device
     rows = []
-    with fixed_seed(seed):
+    with fixed_seed(seed), model.using_weights(weights):
         for start in range(0, len(indices), d.eval_batch_size):
             chunk = indices[start:start + d.eval_batch_size]
             batch = mesh_set_collate_fn([dataset[int(i)] for i in chunk],
@@ -320,16 +330,36 @@ class MeshSetEvalCallback(L.Callback):
                         {k: round(v, 4) for k, v in metrics.items()})
 
     def _monitor(self, trainer, pl_module):
-        """Tier 2: the early-stopping metric, every validation epoch."""
+        """Tier 2: the early-stopping metric, every validation epoch.
+
+        Scored twice when an EMA is live -- once from the averaged weights and
+        once from the raw ones -- because EMA leaves the training trajectory
+        untouched, so the second pass IS the no-EMA result at no extra training
+        cost. `val_gen_*` is the EMA reading and drives selection by default;
+        `val_gen_*_live` is the control, and pointing
+        `training.early_stopping.monitor` at `val_gen_coord_mse_live` switches
+        which one selects.
+        """
         dataset = getattr(trainer.datamodule, "val_dataset", None)
         if dataset is None or len(dataset) == 0:
             return
         indices = eval_indices(len(dataset), self.d.n_val_gen, self.seed)
+        logs = {}
         metrics = run_generative_monitor(pl_module, dataset, indices, self.cfg,
-                                         seed=self.seed, scaffold=self._scaffold)
-        if metrics:
-            pl_module.log_dict({f"val_{k}": v for k, v in metrics.items()},
-                               prog_bar=False, sync_dist=True)
+                                         seed=self.seed, scaffold=self._scaffold,
+                                         weights="ema")
+        logs.update({f"val_{k}": v for k, v in metrics.items()})
+        if pl_module.ema_active:
+            live = run_generative_monitor(pl_module, dataset, indices, self.cfg,
+                                          seed=self.seed, scaffold=self._scaffold,
+                                          weights="live")
+            logs.update({f"val_{k}_live": v for k, v in live.items()})
+        else:
+            # Before ema_start_step the two are the same weights; a second pass
+            # would spend 10% of an epoch reproducing the first one exactly.
+            logs.update({f"val_{k}_live": v for k, v in metrics.items()})
+        if logs:
+            pl_module.log_dict(logs, prog_bar=False, sync_dist=True)
 
     def on_validation_epoch_end(self, trainer, pl_module):
         if trainer.sanity_checking:
