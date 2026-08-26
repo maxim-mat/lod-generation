@@ -163,6 +163,77 @@ class GaussianProcess(BaseProcess):
         return torch.randn(shape, device=device)
 
 
+class FlowMatchingProcess(BaseProcess):
+    """Conditional flow matching along the straight path (Lipman et al.,
+    arXiv:2210.02747), with an Euler integrator.
+
+    Same denoiser, different target: instead of a noise level indexed into a
+    schedule, time is continuous and the network regresses the constant
+    velocity ``x0 - z`` of the straight line from prior to data. There is no
+    beta schedule to tune, and the trajectory is straight by construction, so
+    few-step sampling degrades far more gracefully than a strided DDPM does.
+
+    Time convention: ``t = 1`` is data, ``t = 0`` is the prior, matching
+    `BaseProcess.sample`, which runs ``t`` from 1 down to 0. That is the
+    reverse of the usual flow-matching paper convention and is chosen so all
+    three processes share one loop.
+
+    Args:
+        sigma_min: floor on the prior's contribution at ``t = 1``. 0 gives the
+            exact straight path; a small positive value keeps the target
+            distribution absolutely continuous, which matters for likelihood
+            evaluation and not at all for sampling.
+    """
+
+    def __init__(self, sigma_min=0.0):
+        super().__init__()
+        self.sigma_min = sigma_min
+        # No buffers, but keep the nn.Module contract so `create_process`
+        # returns something Lightning treats identically to GaussianProcess.
+        self.register_buffer("_unused", torch.zeros(1), persistent=False)
+
+    def _coef(self, t, ndim):
+        t = t.reshape(-1, *([1] * (ndim - 1)))
+        return t, (1.0 - (1.0 - self.sigma_min) * t)
+
+    def sample_t(self, n, device):
+        return torch.rand(n, device=device)
+
+    def corrupt(self, x0, t):
+        z = torch.randn_like(x0)
+        a, b = self._coef(t, x0.dim())
+        return a * x0 + b * z, z
+
+    def target_for(self, x0, x_t, t, aux):
+        return (1.0 - self.sigma_min) * x0 - (1.0 - self.sigma_min) * aux \
+            if self.sigma_min else x0 - aux
+
+    def to_x0(self, x_t, t, model_out):
+        """Read a velocity as an ``x0`` estimate: ``x0 = x_t + (1 - t) v``.
+
+        Exact on the straight path, and it is what makes the coordinate-error
+        log in `MeshDiffusionModule` comparable across all three processes.
+        """
+        tt = torch.as_tensor(t, device=x_t.device, dtype=x_t.dtype)
+        return x_t + (1.0 - tt) * model_out
+
+    def step(self, x_t, t, t_prev, model_out):
+        """One Euler step. ``t_prev < t`` in this convention, so the increment
+        is negative and the integrator walks *back* toward the prior; the
+        reverse loop's descending timesteps invert that into progress."""
+        return x_t + (t_prev - t) * model_out
+
+    def prior(self, shape, device):
+        return torch.randn(shape, device=device)
+
+    def timesteps(self, n_steps):
+        """Ascending here, not descending: flow matching integrates from the
+        prior at ``t = 0`` toward the data at ``t = 1``, which is the opposite
+        direction to a denoising trajectory."""
+        edges = torch.linspace(0.0, 1.0, n_steps + 1)
+        return list(zip(edges[:-1].tolist(), edges[1:].tolist()))
+
+
 def create_process(cfg):
     """Build the process named by ``cfg.mesh_diffusion.process``.
 

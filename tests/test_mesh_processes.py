@@ -88,3 +88,62 @@ def test_sample_callback_sees_every_step():
              torch.device("cpu"), n_steps=10,
              callback=lambda t, x: steps.append(t))
     assert len(steps) == 10
+
+
+from src.models.mesh_processes import FlowMatchingProcess
+
+
+def test_flow_corrupt_interpolates_linearly():
+    p = FlowMatchingProcess()
+    x0 = torch.ones(4, 10, 8)
+    torch.manual_seed(0)
+    x_t, noise = p.corrupt(x0, torch.full((4,), 0.25))
+    # Convention here: t = 1 is data, t = 0 is noise, matching the reverse loop
+    # in BaseProcess.sample which runs t from 1 down to 0.
+    assert torch.allclose(x_t, 0.25 * x0 + 0.75 * noise, atol=1e-6)
+
+
+def test_flow_target_is_the_velocity():
+    p = FlowMatchingProcess()
+    x0 = torch.randn(4, 10, 8)
+    torch.manual_seed(0)
+    x_t, noise = p.corrupt(x0, torch.rand(4))
+    v = p.target_for(x0, x_t, torch.rand(4), noise)
+    assert torch.allclose(v, x0 - noise, atol=1e-6)
+
+
+def test_flow_oracle_recovers_the_data():
+    torch.manual_seed(0)
+    p = FlowMatchingProcess()
+    x0 = torch.randn(8, 10, 8) * 0.3
+    noise_holder = {}
+
+    def oracle(x_t, t):
+        # A perfect velocity field for the straight path from the prior we drew.
+        return x0 - noise_holder["z"]
+
+    def prior_spy(shape, device):
+        noise_holder["z"] = torch.randn(shape, device=device)
+        return noise_holder["z"]
+
+    p.prior = prior_spy
+    out = p.sample(oracle, x0.shape, x0.device, n_steps=20)
+    assert (out - x0).abs().mean().item() < 1e-4
+
+
+def test_flow_step_count_is_honoured():
+    p = FlowMatchingProcess()
+    seen = []
+    p.sample(lambda x, t: (seen.append(float(t[0])), torch.zeros_like(x))[1],
+             (1, 10, 8), torch.device("cpu"), n_steps=12)
+    assert len(seen) == 12
+
+
+def test_flow_to_x0_is_consistent_with_the_path():
+    p = FlowMatchingProcess()
+    x0 = torch.randn(4, 10, 8)
+    torch.manual_seed(0)
+    t = torch.full((4,), 0.4)
+    x_t, noise = p.corrupt(x0, t)
+    v = x0 - noise
+    assert torch.allclose(p.to_x0(x_t, 0.4, v), x0, atol=1e-5)

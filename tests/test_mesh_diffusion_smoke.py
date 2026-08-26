@@ -151,3 +151,10 @@ def test_unordered_hungarian_arm_trains():
     loss.backward()
     assert any(p.grad is not None and p.grad.abs().sum() > 0
                for p in m.parameters())
+
+
+def test_flow_arm_trains_and_samples():
+    m = MeshDiffusionModule(_cfg(process="flow", target="velocity"))
+    assert torch.isfinite(m.training_step(_batch(), 0))
+    m.eval()
+    assert m.generate(_batch(), n_steps=4).shape == (2, 10, 16)
