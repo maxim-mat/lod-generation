@@ -330,3 +330,98 @@ def test_slot_budget_is_fixed_at_eval_and_jittered_at_train():
 
     with pytest.raises(ValueError, match="below this batch"):
         mesh_set_collate_fn(items, width=8)
+
+
+def _gen_ds():
+    """Two buildings in the shape MeshSetDataset returns."""
+    import numpy as np
+
+    class _Ds:
+        ids = ["a", "b"]
+
+        def __len__(self):
+            return 2
+
+        def mesh_pair(self, i):
+            v = np.array([[0.0, 0, 0], [1.0, 0, 0], [0.0, 1, 0], [0.0, 0, 1.0]])
+            f = np.array([[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]])
+            return ((v, f), (v, f))
+
+        def __getitem__(self, i):
+            g = torch.Generator().manual_seed(i)
+            x = torch.zeros(12, 10)
+            x[:, :9] = torch.rand(12, 9, generator=g) - 0.5
+            x[:, 9] = 0.5
+            return {"x": x, "cond": x.clone(), "id": self.ids[i],
+                    "center": torch.zeros(3), "scale": torch.ones(3)}
+    return _Ds()
+
+
+def test_generative_monitor_keys_and_direction():
+    """Tier 2 must produce one lower-is-better key for every arm, plus the
+    diagnostics that make a face-count collapse visible."""
+    from src.eval.mesh_set_eval import run_generative_monitor
+
+    cfg = _cfg()
+    cfg.mesh_data.max_faces = 32          # the gate requires budget >= filter
+    cfg.mesh_diffusion.slot_budget = 32
+    cfg.mesh_diffusion.gen_eval_steps = 3
+    m = MeshDiffusionModule(cfg).eval()
+    out = run_generative_monitor(m, _gen_ds(), [0, 1], cfg, seed=0)
+    for key in ("gen_coord_mse", "gen_presence_acc", "gen_n_faces",
+                "gen_n_faces_target"):
+        assert key in out, key
+    assert out["gen_coord_mse"] >= 0.0
+    assert 0.0 <= out["gen_presence_acc"] <= 1.0
+    assert "gen_bin_acc" not in out          # continuous arm has no alphabet
+
+
+def test_generative_monitor_adds_bin_accuracy_on_a_categorical_arm():
+    from src.eval.mesh_set_eval import run_generative_monitor
+
+    cfg = _cfg(state="bins", process="d3pm", loss="ce", target="original")
+    cfg.mesh_data.max_faces = 32          # the gate requires budget >= filter
+    cfg.mesh_diffusion.slot_budget = 32
+    cfg.mesh_diffusion.gen_eval_steps = 3
+    m = MeshDiffusionModule(cfg).eval()
+    out = run_generative_monitor(m, _gen_ds(), [0, 1], cfg, seed=0)
+    assert 0.0 <= out["gen_bin_acc"] <= 1.0
+
+
+def test_monitor_is_reproducible_and_leaves_the_training_rng_alone():
+    """Two properties at once.
+
+    Reproducible: the reverse trajectory starts from a random prior, so without
+    a fixed seed the monitor moves epoch to epoch on sampling noise and early
+    stopping fires on that.
+
+    Non-invasive: seeding globally inside a training loop would also reset the
+    TRAINING rng. With the monitor running every epoch that would correlate
+    dropout and shuffling across the whole run -- a real contaminant, not a
+    curiosity.
+    """
+    from src.eval.mesh_set_eval import run_generative_monitor
+
+    cfg = _cfg()
+    cfg.mesh_data.max_faces = 32          # the gate requires budget >= filter
+    cfg.mesh_diffusion.slot_budget = 32
+    cfg.mesh_diffusion.gen_eval_steps = 3
+    m = MeshDiffusionModule(cfg).eval()
+    ds = _gen_ds()
+
+    a = run_generative_monitor(m, ds, [0, 1], cfg, seed=7)
+    b = run_generative_monitor(m, ds, [0, 1], cfg, seed=7)
+    assert a["gen_coord_mse"] == pytest.approx(b["gen_coord_mse"], rel=1e-9)
+
+    torch.manual_seed(1234)
+    before = torch.randn(4)
+    torch.manual_seed(1234)
+    run_generative_monitor(m, ds, [0, 1], cfg, seed=7)
+    after = torch.randn(4)
+    assert torch.allclose(before, after), "the monitor perturbed the training RNG"
+
+
+def test_test_step_computes_no_single_step_loss():
+    """Test is the full reverse trajectory only."""
+    m = MeshDiffusionModule(_cfg())
+    assert m.test_step(_batch(), 0) is None

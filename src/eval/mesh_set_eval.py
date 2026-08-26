@@ -11,6 +11,7 @@ know whether the tokenizer's own round-trip floor at this bin count is 0.01 or
 the same grid, so the ground truth through the same snap is the best this
 branch could possibly score.
 """
+import contextlib
 import logging
 from pathlib import Path
 
@@ -46,6 +47,127 @@ def _aggregate(rows):
     return out
 
 
+@contextlib.contextmanager
+def fixed_seed(seed):
+    """Run a block under a fixed RNG, then put the caller's RNG back.
+
+    Both eval tiers must be deterministic across epochs -- otherwise the
+    monitor moves on prior noise and early stopping fires on that. But seeding
+    globally inside a training loop would also reset the TRAINING RNG, and with
+    the monitor running every epoch that would correlate dropout and shuffling
+    across the whole run. Save, seed, restore.
+    """
+    cpu = torch.get_rng_state()
+    cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    torch.manual_seed(seed)
+    try:
+        yield
+    finally:
+        torch.set_rng_state(cpu)
+        if cuda is not None:
+            torch.cuda.set_rng_state_all(cuda)
+
+
+def _scaffold_hook(batch, cfg, supplied=None):
+    """The per-batch scaffold callback, or whatever the caller supplied."""
+    d = cfg.mesh_diffusion
+    if supplied is not None or not d.scaffold.enabled:
+        return supplied
+    from src.models.mesh_scaffold import (
+        lod1_scaffold, make_bin_masker, make_projector)
+    grid = lod1_scaffold(batch["cond"], batch["cond_mask"],
+                         voxel=d.scaffold.voxel, dilate=d.scaffold.dilate)
+    return (make_bin_masker(grid, cfg.mesh_data.num_bins, d.scaffold.apply_below_t)
+            if d.process == "d3pm"
+            else make_projector(grid, d.scaffold.apply_below_t))
+
+
+def generative_metrics(gen, batch, cfg):
+    """Score a free-running sample against its target, with no mesh conversion.
+
+    This is the early-stopping tier. It deliberately stops short of
+    `faces_to_mesh` + `mesh_metrics`: those cost several times as much, and
+    chamfer is `nan` on an empty sample -- which is a real failure mode of a
+    presence channel, so the monitor would break exactly when the model is
+    worst.
+
+    Args:
+        gen: ``[B, 10, F]`` sample in the normalized box.
+        batch: the collated batch it was generated from.
+        cfg: the root `Config`.
+
+    Returns:
+        dict: `gen_coord_mse` is the monitor -- lower is better for every arm,
+        so `mode: min` is always right. The rest are diagnostics: coordinate
+        error can look healthy while face count collapses, and on an untrained
+        categorical arm it does exactly that.
+    """
+    d = cfg.mesh_diffusion
+    tgt, mask = batch["x"], batch["x_mask"]
+    if d.order == "none":
+        # Only when the arm is unordered. On an ordered arm the identity
+        # assignment is the one the model was trained against, and letting the
+        # matcher find a better one would report a flattered number that no
+        # longer corresponds to the objective.
+        from src.models.mesh_set_losses import hungarian_match
+        assign = hungarian_match(gen, tgt, mask, d.match_presence_weight)
+        tgt = torch.gather(tgt, 2, assign[:, None, :].expand(-1, tgt.shape[1], -1))
+        mask = torch.gather(mask, 1, assign)
+
+    m = mask[:, None, :].to(gen.dtype)
+    denom = (m.sum() * 9).clamp(min=1.0)
+    out = {
+        "gen_coord_mse": float((((gen[:, :9] - tgt[:, :9]) ** 2) * m).sum() / denom),
+        "gen_presence_acc": float(((gen[:, 9] > 0) == mask).to(gen.dtype).mean()),
+        "gen_n_faces": float((gen[:, 9] > 0).sum(dim=1).to(gen.dtype).mean()),
+        "gen_n_faces_target": float(mask.sum(dim=1).to(gen.dtype).mean()),
+    }
+    if d.state != "continuous":
+        # Both sides sit on the grid for these arms -- the target because
+        # `_pack` snapped it, the sample because the readout is categorical --
+        # so quantizing the (possibly reordered) target recovers its bins
+        # exactly, and no second gather is needed.
+        from src.dataset.mesh_dataset import quantize
+        k = cfg.mesh_data.num_bins
+        gb = quantize(gen[:, :9].detach().cpu().numpy(), k)
+        tb = quantize(tgt[:, :9].detach().cpu().numpy(), k)
+        agree = torch.from_numpy((gb == tb).astype("float32"))
+        out["gen_bin_acc"] = float((agree * m.detach().cpu()).sum() / denom.cpu())
+    return out
+
+
+def run_generative_monitor(model, dataset, indices, cfg, seed=1234, scaffold=None):
+    """Tier 2: a free-running reverse trajectory, scored distributionally.
+
+    Runs every validation epoch, so it is sized to be cheap: `n_val_gen`
+    buildings at `gen_eval_steps` steps, ~10% of a training epoch as measured.
+
+    Returns:
+        dict: mean of `generative_metrics` over the sampled buildings.
+    """
+    if len(indices) == 0:
+        return {}
+    d = cfg.mesh_diffusion
+    was_training = model.training
+    model.eval()
+    device = next(model.parameters()).device
+    rows = []
+    with fixed_seed(seed):
+        for start in range(0, len(indices), d.eval_batch_size):
+            chunk = indices[start:start + d.eval_batch_size]
+            batch = mesh_set_collate_fn([dataset[int(i)] for i in chunk],
+                                        multiple_of=8, width=d.slot_budget)
+            batch = {k: v.to(device) if torch.is_tensor(v) else v
+                     for k, v in batch.items()}
+            with torch.no_grad():
+                gen = model.generate(batch, n_steps=d.gen_eval_steps,
+                                     scaffold=_scaffold_hook(batch, cfg, scaffold))
+            rows.append(generative_metrics(gen, batch, cfg))
+    if was_training:
+        model.train()
+    return _aggregate(rows)
+
+
 def run_mesh_set_eval(model, dataset, indices, cfg, seed=1234, save_dir=None,
                       scaffold=None, gt_ceiling=True):
     """Sample a mesh per LOD1 condition and score it against its true LOD2.
@@ -72,86 +194,78 @@ def run_mesh_set_eval(model, dataset, indices, cfg, seed=1234, save_dir=None,
     num_bins = cfg.mesh_data.num_bins
     was_training = model.training
     model.eval()
-    torch.manual_seed(seed)
 
     rows, gt_rows, written = [], [], 0
-    for start in range(0, len(indices), d.eval_batch_size):
-        chunk = indices[start:start + d.eval_batch_size]
-        items = [dataset[int(i)] for i in chunk]
-        # Fixed slot budget, so the sample is a function of the weights alone
-        # and not of who else landed in the chunk.
-        batch = mesh_set_collate_fn(items, multiple_of=8, width=d.slot_budget)
-        device = next(model.parameters()).device
-        batch = {k: v.to(device) if torch.is_tensor(v) else v
-                 for k, v in batch.items()}
+    with fixed_seed(seed):
+        for start in range(0, len(indices), d.eval_batch_size):
+            chunk = indices[start:start + d.eval_batch_size]
+            items = [dataset[int(i)] for i in chunk]
+            # Fixed slot budget, so the sample is a function of the weights alone
+            # and not of who else landed in the chunk.
+            batch = mesh_set_collate_fn(items, multiple_of=8, width=d.slot_budget)
+            device = next(model.parameters()).device
+            batch = {k: v.to(device) if torch.is_tensor(v) else v
+                     for k, v in batch.items()}
 
-        # The scaffold is derived from *this batch's* LOD1, so it cannot be
-        # built once in the callback's __init__; `scaffold=None` there means
-        # "let this function decide", which is what the default already does.
-        step_hook = scaffold
-        if step_hook is None and d.scaffold.enabled:
-            from src.models.mesh_scaffold import (
-                lod1_scaffold, make_bin_masker, make_projector)
-            grid = lod1_scaffold(batch["cond"], batch["cond_mask"],
-                                 voxel=d.scaffold.voxel, dilate=d.scaffold.dilate)
-            step_hook = (make_bin_masker(grid, num_bins, d.scaffold.apply_below_t)
-                         if d.process == "d3pm"
-                         else make_projector(grid, d.scaffold.apply_below_t))
+            # The scaffold is derived from *this batch's* LOD1, so it cannot be
+            # built once in the callback's __init__; `scaffold=None` there means
+            # "let this function decide", which is what the default already does.
+            step_hook = _scaffold_hook(batch, cfg, scaffold)
 
-        with torch.no_grad():
-            sampled = model.generate(batch, n_steps=d.eval_steps,
-                                     scaffold=step_hook)
+            with torch.no_grad():
+                sampled = model.generate(batch, n_steps=d.eval_steps,
+                                         scaffold=step_hook)
 
-        for k, i in enumerate(chunk):
-            centre = batch["center"][k].cpu().numpy()
-            scale = batch["scale"][k].cpu().numpy()
-            gen_v, gen_f, stats = faces_to_mesh(
-                sampled[k], num_bins, snap=d.snap_before_weld,
-                min_area=d.min_face_area)
-            gen = (gen_v * scale + centre, gen_f)
-
-            _, gt_raw = _resolve(dataset, int(i))
-            row = {}
-            if len(gen_f):
-                row.update(mesh_metrics(gen, gt_raw, taus=list(d.taus),
-                                        n_points=d.n_points, seed=seed,
-                                        voxel_m=d.voxel_m))
-            else:
-                # An all-absent sample is a real failure mode of a presence
-                # channel, and silently dropping it would flatter the average.
-                row["chamfer_m"] = float("nan")
-            row["n_faces"] = float(stats["n_faces"])
-            row["n_verts"] = float(stats["n_verts"])
-            row["empty"] = float(len(gen_f) == 0)
-            for key in ("n_dropped_absent", "n_dropped_degenerate",
-                        "n_dropped_duplicate"):
-                row[key] = float(stats[key])
-            rows.append(row)
-
-            if gt_ceiling:
-                ceil_v, ceil_f, _ = faces_to_mesh(
-                    batch["x"][k], num_bins, snap=d.snap_before_weld,
+            for k, i in enumerate(chunk):
+                centre = batch["center"][k].cpu().numpy()
+                scale = batch["scale"][k].cpu().numpy()
+                gen_v, gen_f, stats = faces_to_mesh(
+                    sampled[k], num_bins, snap=d.snap_before_weld,
                     min_area=d.min_face_area)
-                ceil = (ceil_v * scale + centre, ceil_f)
-                if len(ceil_f):
-                    gt_rows.append(mesh_metrics(ceil, gt_raw, taus=list(d.taus),
-                                                n_points=d.n_points, seed=seed,
-                                                voxel_m=d.voxel_m))
+                gen = (gen_v * scale + centre, gen_f)
 
-            if save_dir is not None and written < d.save_samples and len(gen_f):
-                out = Path(save_dir)
-                out.mkdir(parents=True, exist_ok=True)
-                name = batch["ids"][k]
-                write_obj(out / f"{name}_gen.obj", *gen)
-                write_obj(out / f"{name}_gt.obj", *gt_raw)
-                try:
-                    save_to_file(mesh_to_cityjson(*gen), out / f"{name}_gen.city.json")
-                except Exception:
-                    # Write-back is a convenience; a sample that cannot be
-                    # expressed as CityJSON must not take the metrics down.
-                    logger.warning("CityJSON write-back failed for %s", name,
-                                   exc_info=True)
-                written += 1
+                _, gt_raw = _resolve(dataset, int(i))
+                row = {}
+                if len(gen_f):
+                    row.update(mesh_metrics(gen, gt_raw, taus=list(d.taus),
+                                            n_points=d.n_points, seed=seed,
+                                            voxel_m=d.voxel_m))
+                else:
+                    # An all-absent sample is a real failure mode of a presence
+                    # channel, and silently dropping it would flatter the average.
+                    row["chamfer_m"] = float("nan")
+                row["n_faces"] = float(stats["n_faces"])
+                row["n_verts"] = float(stats["n_verts"])
+                row["empty"] = float(len(gen_f) == 0)
+                for key in ("n_dropped_absent", "n_dropped_degenerate",
+                            "n_dropped_duplicate"):
+                    row[key] = float(stats[key])
+                rows.append(row)
+
+                if gt_ceiling:
+                    ceil_v, ceil_f, _ = faces_to_mesh(
+                        batch["x"][k], num_bins, snap=d.snap_before_weld,
+                        min_area=d.min_face_area)
+                    ceil = (ceil_v * scale + centre, ceil_f)
+                    if len(ceil_f):
+                        gt_rows.append(mesh_metrics(ceil, gt_raw, taus=list(d.taus),
+                                                    n_points=d.n_points, seed=seed,
+                                                    voxel_m=d.voxel_m))
+
+                if save_dir is not None and written < d.save_samples and len(gen_f):
+                    out = Path(save_dir)
+                    out.mkdir(parents=True, exist_ok=True)
+                    name = batch["ids"][k]
+                    write_obj(out / f"{name}_gen.obj", *gen)
+                    write_obj(out / f"{name}_gt.obj", *gt_raw)
+                    try:
+                        save_to_file(mesh_to_cityjson(*gen), out / f"{name}_gen.city.json")
+                    except Exception:
+                        # Write-back is a convenience; a sample that cannot be
+                        # expressed as CityJSON must not take the metrics down.
+                        logger.warning("CityJSON write-back failed for %s", name,
+                                       exc_info=True)
+                    written += 1
 
     if was_training:
         model.train()
@@ -205,11 +319,30 @@ class MeshSetEvalCallback(L.Callback):
             logger.info("%s mesh eval: %s", split,
                         {k: round(v, 4) for k, v in metrics.items()})
 
-    def on_validation_epoch_end(self, trainer, pl_module):
-        if trainer.sanity_checking or not self._due(trainer.current_epoch):
+    def _monitor(self, trainer, pl_module):
+        """Tier 2: the early-stopping metric, every validation epoch."""
+        dataset = getattr(trainer.datamodule, "val_dataset", None)
+        if dataset is None or len(dataset) == 0:
             return
-        self._run(trainer, pl_module, "val", self.d.n_val, None)
+        indices = eval_indices(len(dataset), self.d.n_val_gen, self.seed)
+        metrics = run_generative_monitor(pl_module, dataset, indices, self.cfg,
+                                         seed=self.seed, scaffold=self._scaffold)
+        if metrics:
+            pl_module.log_dict({f"val_{k}": v for k, v in metrics.items()},
+                               prog_bar=False, sync_dist=True)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            return
+        # Tier 2 runs every epoch: EarlyStopping(strict=True) raises when its
+        # monitored metric is missing, so the monitor cannot live behind the
+        # every_n_epochs gate that tier 3 does.
+        self._monitor(trainer, pl_module)
+        if self._due(trainer.current_epoch):
+            self._run(trainer, pl_module, "val", self.d.n_val, None)
 
     def on_test_epoch_end(self, trainer, pl_module):
+        """Tier 3 only. The single-step loss is deliberately not computed at
+        test time -- see `MeshDiffusionModule.test_step`."""
         out = self.save_dir / "samples" if self.save_dir else None
         self._run(trainer, pl_module, "test", self.d.n_test, out)

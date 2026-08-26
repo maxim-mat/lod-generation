@@ -36,6 +36,9 @@ mesh_diffusion:
   noise_steps: 1000
   eval_steps: 10
   every_n_epochs: 1        # the smoke run is allowed to be slow: 20 files
+  n_val_gen: 4
+  gen_eval_steps: 4
+  slot_budget: 200
   n_val: 4
   n_test: 4
   eval_batch_size: 4
@@ -50,7 +53,13 @@ training:
   gradient_clip_val: 1.0
   lr_scheduler: "none"
   early_stopping:
-    enabled: false
+    enabled: true
+    monitor: val_gen_coord_mse
+    patience: 5
+    mode: min
+  # Early stopping stays ON in the smoke: it is the cheapest check that the
+  # tier-2 monitor is actually being logged, which EarlyStopping(strict=True)
+  # would otherwise turn into a crash on epoch 1 of a real run.
   checkpoint:
     enabled: false
 

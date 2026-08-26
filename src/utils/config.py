@@ -460,6 +460,24 @@ class MeshDiffusionConfig:
     min_face_area: float = 1e-6
 
     # --- eval -------------------------------------------------------------
+    # Three eval tiers, because one number cannot do all three jobs.
+    #
+    #  1. Single-step loss, every batch. The objective. Cheap, but a bad
+    #     SELECTION criterion: it is a Monte-Carlo estimate over t, only loosely
+    #     coupled to sample quality, and in different units per arm (ln 128 for
+    #     the CE arms against ~0.10 for the x0 arms), so it is not comparable
+    #     across the grid.
+    #  2. A free-running reverse trajectory on `n_val_gen` fixed buildings at
+    #     `gen_eval_steps`, EVERY validation epoch. This is what early stopping
+    #     and checkpointing read. Measured at ~10% of a training epoch.
+    #  3. The geometric metrics (chamfer, IoU, watertight), every
+    #     `every_n_epochs`, on `n_val`. ~48% of an epoch, hence the gate.
+    #
+    # Tier 2 cannot be folded into tier 3: `EarlyStopping(strict=True)` raises
+    # when its monitored metric is absent from the logs, so a monitor produced
+    # only every N epochs crashes the run on epoch 1.
+    n_val_gen: int = 8
+    gen_eval_steps: int = 20
     every_n_epochs: int = 5
     n_val: int = 16
     n_test: int = 64

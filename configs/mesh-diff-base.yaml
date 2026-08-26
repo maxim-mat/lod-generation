@@ -48,6 +48,11 @@ mesh_diffusion:
     voxel: 0.03125
     dilate: 3
     apply_below_t: 0.5
+  # Tier 2, the early-stopping monitor: every validation epoch, 8 buildings,
+  # 20 reverse steps. Measured at ~10% of a training epoch.
+  n_val_gen: 8
+  gen_eval_steps: 20
+  # Tier 3, the geometric report: gated, 16 buildings, eval_steps (50).
   every_n_epochs: 10
   n_val: 16
   n_test: 64
@@ -78,20 +83,25 @@ training:
   lr_scheduler: "none"
   lr_decay_steps: 50
   lr_decay_rate: 0.5
-  # val_loss, NOT the geometric metrics: those exist only every 10 epochs, so
-  # they cannot be monitored. And NOT val_token_acc -- there are no tokens on
-  # this branch. Read the mode: min, because this loss is a regression error.
+  # val_gen_coord_mse: the coordinate error of a FREE-RUNNING sample, not the
+  # single-step loss. The single-step loss is a Monte-Carlo estimate over t,
+  # only loosely coupled to sample quality, and in different units per arm --
+  # selecting a checkpoint on it selects for one-step denoising rather than for
+  # generation. NOT the geometric metrics either: those run only every
+  # every_n_epochs, and EarlyStopping(strict=True) raises on a missing metric.
+  # mode: min is correct for every arm by construction -- the monitor is an
+  # error for the regression arms and for the categorical ones alike.
   early_stopping:
     enabled: true
-    monitor: val_loss
+    monitor: val_gen_coord_mse
     patience: 25
     mode: min
   checkpoint:
     enabled: true
-    monitor: val_loss
+    monitor: val_gen_coord_mse
     mode: min
     save_top_k: 3
-    filename: "{epoch:02d}-{val_loss:.4f}"
+    filename: "{epoch:02d}-{val_gen_coord_mse:.5f}"
 
 trainer:
   accelerator: auto

@@ -277,7 +277,15 @@ class MeshDiffusionModule(L.LightningModule):
         return self._shared_step(batch, "val")
 
     def test_step(self, batch, batch_idx):
-        return self._shared_step(batch, "test")
+        """Deliberately empty.
+
+        The test tier is the free-running reverse trajectory and the geometric
+        metrics it produces, run by `MeshSetEvalCallback.on_test_epoch_end`.
+        A single-step loss here would be a different quantity reported under
+        the same banner, and it is not what the branch is being judged on.
+        Lightning still needs the hook to exist for `trainer.test()`.
+        """
+        return None
 
     def configure_optimizers(self):
         opt = torch.optim.AdamW(self.parameters(), lr=self.lr)
