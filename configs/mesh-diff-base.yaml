@@ -69,12 +69,14 @@ mesh_diffusion:
   save_samples: 8
 
 training:
-  # 4 x 4 = effective batch 16, identical to every mesh-v3/v4 AR arm. Matching
-  # both numbers, not just the product, so peak activation memory is comparable
-  # too -- the one-hot arm (b5) is 1153 input channels wide and is the arm most
-  # likely to be the memory ceiling.
+  # Effective batch 4: no accumulation. This is a deliberate DEPARTURE from the
+  # mesh-v3/v4 AR arms, which run 4 x 4 = 16 -- so the optimisation is no longer
+  # matched to theirs, and a diffusion-vs-AR gap now has batch size in it as
+  # well as architecture. Read the stage-4 comparison with that in mind.
+  # The trade bought here is 4x the optimizer steps per epoch at the same
+  # forward cost, which matters at lr 5e-5 over 1000 epochs.
   batch_size: 4
-  accumulate_grad_batches: 4
+  accumulate_grad_batches: 1
   train_val_test_split: [0.8, 0.1, 0.1]
   # 5e-5 flat, matching the AR arms rather than the 1e-4 DDPM default this
   # file first carried. Deliberate: a diffusion number and an AR number are
