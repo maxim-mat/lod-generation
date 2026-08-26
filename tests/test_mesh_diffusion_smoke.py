@@ -141,3 +141,13 @@ def test_eval_callback_is_gated_by_epoch():
     cb = MeshSetEvalCallback(cfg, save_dir=None)
     assert not cb._due(epoch=0) and not cb._due(epoch=3)
     assert cb._due(epoch=4) and cb._due(epoch=9)
+
+
+def test_unordered_hungarian_arm_trains():
+    m = MeshDiffusionModule(_cfg(order="none", pos_embed="none",
+                                 loss="hungarian", denoiser="transformer"))
+    loss = m.training_step(_batch(), 0)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0
+               for p in m.parameters())

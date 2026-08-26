@@ -68,3 +68,80 @@ def test_unet_discrete_head_shapes():
     logits, presence = net(x, t, cond, mask, cond_mask)
     assert logits.shape == (2, 9, 128, 16)
     assert presence.shape == (2, 16)
+
+
+from src.models.mesh_set_transformer import MeshSetTransformer
+
+
+def _tf(pos_embed="none", **kw):
+    return MeshSetTransformer(d_model=32, n_head=2, num_layers=2,
+                              time_dim=32, pos_embed=pos_embed, **kw)
+
+
+def _wake(net):
+    """Undo the zero-init on the output head.
+
+    Both denoisers zero-initialise `outc` on purpose, so an untrained model
+    emits exactly 0 for every input. Every claim of the form "input change X
+    does / does not reach the output" is then vacuous -- the negative version
+    fails outright, and the positive version passes without testing anything.
+    """
+    torch.nn.init.normal_(net.outc.weight, std=0.05)
+    torch.nn.init.normal_(net.outc.bias, std=0.05)
+    return net
+
+
+def test_transformer_preserves_shape():
+    x, t, cond, mask, cond_mask = _inputs()
+    assert _tf()(x, t, cond, mask, cond_mask).shape == x.shape
+
+
+def test_transformer_accepts_any_length():
+    net = _tf()
+    x, t, cond, mask, cond_mask = _inputs(f=13)      # not a multiple of 8
+    assert net(x, t, cond, mask, cond_mask).shape == x.shape
+
+
+def test_no_pe_transformer_is_permutation_equivariant():
+    torch.manual_seed(0)
+    net = _wake(_tf(pos_embed="none")).eval()
+    x, t, cond, mask, cond_mask = _inputs(f=16)
+    mask[:] = True                                    # no padding to confuse it
+    perm = torch.randperm(16)
+    with torch.no_grad():
+        a = net(x, t, cond, mask, cond_mask)[:, :, perm]
+        b = net(x[:, :, perm], t, cond, mask[:, perm], cond_mask)
+    assert torch.allclose(a, b, atol=1e-5)
+
+
+def test_pe_transformer_is_not_permutation_equivariant():
+    torch.manual_seed(0)
+    net = _wake(_tf(pos_embed="sinusoidal")).eval()
+    x, t, cond, mask, cond_mask = _inputs(f=16)
+    mask[:] = True
+    perm = torch.randperm(16)
+    with torch.no_grad():
+        a = net(x, t, cond, mask, cond_mask)[:, :, perm]
+        b = net(x[:, :, perm], t, cond, mask[:, perm], cond_mask)
+    assert not torch.allclose(a, b, atol=1e-5)
+
+
+def test_transformer_is_invariant_to_condition_order():
+    """Cross-attention reads the condition as a set; the LOD1 face order must
+    not change the output, which is what makes a length-mismatched condition
+    legitimate in the first place."""
+    torch.manual_seed(0)
+    net = _wake(_tf()).eval()
+    x, t, cond, mask, cond_mask = _inputs(fc=8)
+    perm = torch.randperm(8)
+    with torch.no_grad():
+        a = net(x, t, cond, mask, cond_mask)
+        b = net(x, t, cond[:, :, perm], mask, cond_mask[:, perm])
+    assert torch.allclose(a, b, atol=1e-5)
+
+
+def test_transformer_discrete_head_shapes():
+    x, t, cond, mask, cond_mask = _inputs()
+    logits, presence = _tf(out_bins=128)(x, t, cond, mask, cond_mask)
+    assert logits.shape == (2, 9, 128, 16)
+    assert presence.shape == (2, 16)
