@@ -1,0 +1,10 @@
+# Stage 2, arm 7: categorical corruption with a discretized-Gaussian
+# transition (Austin et al. arXiv:2107.03006 section 3.2). Coordinate bins are
+# ORDINAL -- bin 40 and 41 are half a centimetre apart -- so this is the
+# better-matched process, and b6 vs b7 is the test of that claim (plan D11).
+# If b7 does not beat b6, the ordinality argument is wrong for this data, which
+# is a result rather than a failure.
+mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: ce, denoiser: unet,
+                 state: bins, process: d3pm, target: original,
+                 transition: gaussian, transition_sigma: 16.0}
+logging: {run_name: mesh-diff-b7-d3pm-gauss}

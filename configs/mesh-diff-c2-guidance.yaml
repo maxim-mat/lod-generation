@@ -1,0 +1,7 @@
+# Stage 3, arm 2: classifier-free guidance at 3.0. Doubles eval cost (two
+# forward passes per reverse step) and is the standard lever when samples are
+# plausible meshes but not plausible answers to THIS LOD1. Needs
+# cond_dropout > 0, which the base config already sets.
+mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: mse, denoiser: unet,
+                 state: continuous, process: ddpm, target: noise, guidance: 3.0}
+logging: {run_name: mesh-diff-c2-guidance}

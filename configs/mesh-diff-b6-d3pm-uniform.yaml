@@ -1,0 +1,6 @@
+# Stage 2, arm 6: categorical corruption with a uniform transition -- the
+# standard D3PM setting, and the right one for a NOMINAL alphabet.
+# Watch val_bin_acc_t3 (the high-noise bucket) from epoch 1.
+mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: ce, denoiser: unet,
+                 state: bins, process: d3pm, target: original, transition: uniform}
+logging: {run_name: mesh-diff-b6-d3pm-uniform}

@@ -26,9 +26,41 @@ DEFAULT_CONFIGS=(
   configs/mesh-v3-opt-amt.yaml
 )
 
+# The mesh-diffusion grid, in stages. Stage 1 decides denoiser and loss;
+# stage 2 decides the objective on stage 1's winner; stage 3 adds the two
+# sampling-time levers. Run one stage, read it, then edit the next stage's
+# configs to match the winner -- they ship set to arm a1's axes, not to a
+# placeholder, so an unedited stage-2 launch is a valid run rather than a
+# crash. It just answers a slightly different question.
+DIFF_STAGE1=(
+  configs/mesh-diff-a1-unet-mse.yaml
+  configs/mesh-diff-a2-tf-mse.yaml
+  configs/mesh-diff-a3-tf-hungarian.yaml
+)
+# Cheapest first inside each stage, so a config-level mistake surfaces before
+# the long runs. Within stage 2 that means the continuous arms before the
+# 1153-channel one-hot arm.
+DIFF_STAGE2=(
+  configs/mesh-diff-b1-x0.yaml
+  configs/mesh-diff-b2-flow.yaml
+  configs/mesh-diff-b3-quant-mse.yaml
+  configs/mesh-diff-b4-quant-ce.yaml
+  configs/mesh-diff-b6-d3pm-uniform.yaml
+  configs/mesh-diff-b7-d3pm-gauss.yaml
+  configs/mesh-diff-b5-onehot-ce.yaml
+)
+# c3 is conditional on stage 2's winner being b4 or b5 -- see its config header.
+DIFF_STAGE3=(
+  configs/mesh-diff-c1-scaffold.yaml
+  configs/mesh-diff-c2-guidance.yaml
+  configs/mesh-diff-c3-clamp-soft.yaml
+)
+DIFF_BASE="configs/mesh-diff-base.yaml"
+
 SMOKE="${SMOKE:-0}"
 KEEP_GOING="${KEEP_GOING:-1}"
 DATA_DIR="${DATA_DIR:-}"
+DIFF_STAGE=""
 CONFIGS=()
 
 usage() {
@@ -46,6 +78,13 @@ Usage: ./run_experiments.sh [options] [CONFIG ...]
                     arms cannot silently disagree about the dataset.
       --stop-early  abort the queue on the first failure (default: carry on,
                     because these arms are independent).
+      --diff-stage N
+                    run stage N (1, 2 or 3) of the mesh-diffusion grid instead
+                    of the default AR queue. Each arm config carries only the
+                    axes it sets, so it is merged over configs/mesh-diff-base
+                    .yaml first -- that base is what makes every arm share a
+                    dataset, split, effective batch and seed with the others
+                    and with the mesh-v3 AR arms.
   -h, --help
 
 Every option has an environment-variable form (SMOKE, DATA_DIR, KEEP_GOING).
@@ -61,11 +100,23 @@ while [[ $# -gt 0 ]]; do
     --smoke)      SMOKE=1; shift ;;
     --stop-early) KEEP_GOING=0; shift ;;
     --data)       need "$@"; DATA_DIR="$2"; shift 2 ;;
+    --diff-stage) need "$@"; DIFF_STAGE="$2"; shift 2 ;;
     -h|--help)    usage; exit 0 ;;
     -*)           usage >&2; die "unknown option: $1" ;;
     *)            CONFIGS+=("$1"); shift ;;
   esac
 done
+
+if [[ -n "$DIFF_STAGE" ]]; then
+  [[ ${#CONFIGS[@]} -eq 0 ]] || die "--diff-stage selects its own queue; do not also name configs"
+  case "$DIFF_STAGE" in
+    1) CONFIGS=("${DIFF_STAGE1[@]}") ;;
+    2) CONFIGS=("${DIFF_STAGE2[@]}") ;;
+    3) CONFIGS=("${DIFF_STAGE3[@]}") ;;
+    *) die "--diff-stage must be 1, 2 or 3 (got '$DIFF_STAGE')" ;;
+  esac
+  [[ -f "$DIFF_BASE" ]] || die "no such config: $DIFF_BASE"
+fi
 [[ ${#CONFIGS[@]} -gt 0 ]] || CONFIGS=("${DEFAULT_CONFIGS[@]}")
 
 # Check every config before running any of them. Finding a typo in arm 4 after
@@ -88,6 +139,20 @@ if [[ "$SMOKE" == "1" ]]; then
   trap 'rm -rf "$SMOKE_OUT"' EXIT
   COMMON+=("training.max_epochs=1" "mesh_data.max_files=20" "mesh_eval.enabled=false"
            "logging.save_dir=$SMOKE_OUT" "logging.loggers=[]")
+  # The diffusion branch's test-end eval is NOT epoch-gated -- it runs once,
+  # unconditionally, and at the shipped n_test=64 x eval_steps=50 that is 3200
+  # reverse-diffusion forward passes, which is eight minutes per arm and turns
+  # a thirteen-arm smoke into an afternoon. Shrink it: a smoke asks whether the
+  # sampler runs at all, not how well it scores. Harmless for the AR configs,
+  # which have no mesh_diffusion block of their own to read.
+  COMMON+=("mesh_diffusion.n_test=4" "mesh_diffusion.n_val=4"
+           "mesh_diffusion.eval_steps=5" "mesh_diffusion.eval_batch_size=4"
+           "mesh_diffusion.save_samples=1")
+  # And no dataloader workers. On Windows each one is a fresh process importing
+  # torch, respawned for fit/validate/test; at 20 files that spawn cost was
+  # measured at 6 of the 8 minutes an arm took, against 30s with workers off.
+  # Real runs keep the configured count -- this is a smoke-only trade.
+  COMMON+=("mesh_data.num_workers=0")
   LOG_DIR="$LOG_DIR-smoke"
 fi
 mkdir -p "$LOG_DIR"
@@ -102,11 +167,26 @@ failed=0
 
 for cfg in "${CONFIGS[@]}"; do
   name=$(basename "$cfg" .yaml)
-  log "=== start $name ($cfg)"
+  run_cfg="$cfg"
+  if [[ -n "$DIFF_STAGE" ]]; then
+    # Arm files carry only the axes they set. `load_config` takes one --config,
+    # so the base is merged in here rather than by inventing a CLI flag for it.
+    run_cfg="$LOG_DIR/$name.merged.yaml"
+    if ! python - "$DIFF_BASE" "$cfg" > "$run_cfg" <<'PY'
+import sys
+from omegaconf import OmegaConf
+print(OmegaConf.to_yaml(OmegaConf.merge(
+    OmegaConf.load(sys.argv[1]), OmegaConf.load(sys.argv[2]))))
+PY
+    then
+      die "failed to merge $cfg over $DIFF_BASE"
+    fi
+  fi
+  log "=== start $name ($run_cfg)"
   start=$SECONDS
   # `set -e` is deliberately off: a non-zero exit here is recorded and the queue
   # continues. pipefail is on, so the exit status is python's, not tee's.
-  if python main.py --train --config "$cfg" \
+  if python main.py --train --config "$run_cfg" \
        ${COMMON[@]+"${COMMON[@]}"} 2>&1 | tee "$LOG_DIR/$name.log"; then
     status=ok
   else

@@ -1,0 +1,5 @@
+# Stage 2, arm 1: x0-prediction instead of epsilon. Better conditioned at low
+# noise, and the parameterisation every set-based generative model uses.
+mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: mse, denoiser: unet,
+                 state: continuous, process: ddpm, target: original}
+logging: {run_name: mesh-diff-b1-x0}

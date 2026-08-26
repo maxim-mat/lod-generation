@@ -1,0 +1,6 @@
+# Stage 1, arm 1: sorted faces, slot-to-slot MSE, conv U-Net.
+# The closest thing to the trace-denoiser architecture this branch is ported
+# from, and the reference every other arm is read against.
+mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: mse,
+                 denoiser: unet, state: continuous, process: ddpm, target: noise}
+logging: {run_name: mesh-diff-a1-unet-mse}

@@ -1,0 +1,7 @@
+# Stage 2, arm 5: the reference's scheme exactly -- Gaussian noise on 9 x 128
+# indicator channels. 1153 input channels; one 1x1 conv absorbs them, and the
+# activations are ~7 MB at F=200, B=8. Against b4 this asks whether diffusing
+# in the simplex-like space earns its width over diffusing the scalar.
+mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: ce, denoiser: unet,
+                 state: onehot, process: ddpm, target: original, x0_clamp: hard}
+logging: {run_name: mesh-diff-b5-onehot-ce}

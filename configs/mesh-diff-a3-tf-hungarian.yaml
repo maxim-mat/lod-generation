@@ -1,0 +1,7 @@
+# Stage 1, arm 3: unordered faces, permutation-equivariant transformer, set
+# loss. The honest formulation -- a mesh is a set -- at the cost of a Hungarian
+# solve per sample. Against a2 it isolates order+loss with the denoiser fixed.
+# No U-Net counterpart exists: the convolution needs an order (plan D5).
+mesh_diffusion: {order: none, pos_embed: none, loss: hungarian,
+                 denoiser: transformer, state: continuous, process: ddpm, target: noise}
+logging: {run_name: mesh-diff-a3-tf-hungarian}

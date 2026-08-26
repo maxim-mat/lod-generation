@@ -1,0 +1,8 @@
+# Stage 2, arm 3: THE CONTROL. Target snapped to the 128 grid, readout still a
+# regression. Identical target to b4, identical readout to b1. Its gap to b4 is
+# the value of the categorical head with quantization held constant; without
+# this arm you cannot tell whether b4's numbers came from the snap or the
+# softmax. Output still leaves the grid, so welding still needs snap_before_weld.
+mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: mse, denoiser: unet,
+                 state: quantized, process: ddpm, target: original}
+logging: {run_name: mesh-diff-b3-quant-mse}

@@ -96,3 +96,21 @@ def test_sorted_plus_hungarian_warns_but_passes(caplog):
                               loss="hungarian", denoiser="transformer"))
     assert any("wasteful" in r.message.lower() or "wasteful" in r.getMessage().lower()
                for r in caplog.records)
+
+
+def test_every_shipped_diffusion_config_is_a_legal_arm():
+    """Every configs/mesh-diff-*.yaml must survive the gate.
+
+    This is the cheapest possible guard against the failure the gate exists
+    for: a config committed months ago, launched overnight, and rejected at
+    startup after the GPU was already reserved.
+    """
+    from pathlib import Path
+    from omegaconf import OmegaConf
+
+    paths = sorted(Path("configs").glob("mesh-diff-*.yaml"))
+    assert paths, "no mesh-diff configs found"
+    for path in paths:
+        cfg = OmegaConf.merge(OmegaConf.structured(Config),
+                              OmegaConf.load(path))
+        validate_combination(cfg)

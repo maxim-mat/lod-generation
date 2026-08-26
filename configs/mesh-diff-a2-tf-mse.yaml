@@ -1,0 +1,6 @@
+# Stage 1, arm 2: same data, same loss, transformer instead of the U-Net.
+# Isolates the denoiser. If the U-Net wins, the Morton sort is carrying real
+# locality; if the transformer wins, the convolution was reading noise.
+mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: mse,
+                 denoiser: transformer, state: continuous, process: ddpm, target: noise}
+logging: {run_name: mesh-diff-a2-tf-mse}

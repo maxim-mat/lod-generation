@@ -1,0 +1,6 @@
+# Stage 2, arm 2: conditional flow matching. Straight paths, no beta schedule,
+# and few-step sampling that degrades gracefully -- which matters because
+# eval_steps IS the eval budget.
+mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: mse, denoiser: unet,
+                 state: continuous, process: flow, target: velocity}
+logging: {run_name: mesh-diff-b2-flow}

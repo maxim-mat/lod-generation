@@ -1,0 +1,105 @@
+# Shared settings for every mesh-diff arm. Not runnable alone -- it sets no
+# mesh_diffusion axis. Merge an arm config over it:
+#   ./run_experiments.sh --diff-stage 1
+# which merges this file with each arm file before launching.
+#
+# Dataset, split, effective batch, schedule and seed are identical across all
+# arms and identical to the mesh-v3-*-sin autoregressive arms, so a diffusion
+# number and an AR number on the same corpus are directly comparable. That
+# comparability is the point of this file existing.
+mode: train
+config_set: mesh_diffusion
+seed: 42
+
+data:
+  dataset_dir: data/The Hague/mini_cleaner
+
+mesh_data:
+  dataset_dir: data/The Hague/mini_cleaner
+  lod_in: LOD1
+  lod_out: LOD2
+  num_bins: 128
+  margin_lo: [0.0, 0.0, 0.0]
+  margin_hi: [0.0, 0.0, 0.1]
+  # 200, matching every mesh-v3-*-sin arm. Here it is purely a corpus filter:
+  # nothing in this branch has a position table, and the batch pads to its own
+  # maximum, so max_faces decides only which buildings are in the dataset.
+  max_faces: 200
+  max_files: null
+  num_workers: 10
+  persistent_workers: false
+
+mesh_diffusion:
+  d_model: 256
+  n_head: 8
+  num_layers: 8
+  dropout: 0.1
+  time_dim: 128
+  cond_dropout: 0.1
+  noise_steps: 1000
+  eval_steps: 50
+  guidance: 1.0
+  presence_weight: 1.0
+  match_presence_weight: 1.0
+  snap_before_weld: true
+  min_face_area: 1.0e-6
+  scaffold:
+    enabled: false
+    voxel: 0.03125
+    dilate: 3
+    apply_below_t: 0.5
+  every_n_epochs: 10
+  n_val: 16
+  n_test: 64
+  eval_batch_size: 8
+  n_points: 4096
+  taus: [0.25, 0.5]
+  voxel_m: 0.25
+  save_samples: 8
+
+training:
+  batch_size: 8
+  accumulate_grad_batches: 2   # effective batch 16, matching the AR arms
+  train_val_test_split: [0.8, 0.1, 0.1]
+  # 1e-4 flat. Not the AR arms' 5e-5: that value was chosen for a from-scratch
+  # decoder at 1e-3-scale gradients, and a diffusion denoiser regressing a
+  # bounded target is a different optimisation. 1e-4 is the standard DDPM
+  # starting point and is the value to change first if training is unstable.
+  lr: 1.0e-4
+  max_epochs: 400
+  gradient_clip_val: 1.0
+  lr_scheduler: "none"
+  lr_decay_steps: 50
+  lr_decay_rate: 0.5
+  # val_loss, NOT the geometric metrics: those exist only every 10 epochs, so
+  # they cannot be monitored. And NOT val_token_acc -- there are no tokens on
+  # this branch. Read the mode: min, because this loss is a regression error.
+  early_stopping:
+    enabled: true
+    monitor: val_loss
+    patience: 25
+    mode: min
+  checkpoint:
+    enabled: true
+    monitor: val_loss
+    mode: min
+    save_top_k: 3
+    filename: "{epoch:02d}-{val_loss:.4f}"
+
+trainer:
+  accelerator: auto
+  devices: 1
+  precision: "32"
+  log_every_n_steps: 50
+
+logging:
+  loggers:
+    - wandb
+  project_name: lod-generation
+  experiment_name: initial-runs
+  save_dir: outputs
+  wandb_entity: maxim-lod
+  wandb_offline: false
+  log_model: false
+
+resume_from: null

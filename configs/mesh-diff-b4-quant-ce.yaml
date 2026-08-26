@@ -1,0 +1,8 @@
+# Stage 2, arm 4: Gaussian noise, categorical readout, on the nine coordinate
+# channels. This is what maxim-mat/trace-denoise-refactor actually does --
+# `noise_data` is Gaussian, the loss is CrossEntropy on argmax -- ported to
+# coordinates rather than one-hot. Output lands on the grid, so welding is
+# exact and snap_before_weld is a no-op.
+mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: ce, denoiser: unet,
+                 state: quantized, process: ddpm, target: original, x0_clamp: hard}
+logging: {run_name: mesh-diff-b4-quant-ce}

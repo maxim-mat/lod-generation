@@ -1,0 +1,11 @@
+# Stage 3, arm 3: CONDITIONAL. Run only if stage 2's winner is b4 or b5 -- the
+# arms where a continuous process reads out categorically and the clamping
+# trick (Li et al. arXiv:2205.14217 section 4.2) is what keeps samples on the
+# grid. `soft` replaces the argmax one-hot with the posterior mean, so output
+# leaves the grid and snap_before_weld starts mattering again. If this scores
+# the same as b4/b5, the trick is not load-bearing here.
+# Skip entirely when the winner is b6/b7 (no clamp exists in a categorical
+# chain) or b1/b2/b3 (no alphabet).
+mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: ce, denoiser: unet,
+                 state: quantized, process: ddpm, target: original, x0_clamp: soft}
+logging: {run_name: mesh-diff-c3-clamp-soft}

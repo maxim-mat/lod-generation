@@ -1,0 +1,13 @@
+# Stage 3, arm 1: scaffold masking on. MeshWeaver's fix (3) -- the research
+# scan's top transfer candidate -- as a projection onto the dilated LOD1
+# occupancy at every reverse step below t = 0.5.
+mesh_diffusion:
+  order: morton
+  pos_embed: sinusoidal
+  loss: mse
+  denoiser: unet
+  state: continuous
+  process: ddpm
+  target: noise
+  scaffold: {enabled: true, dilate: 3, apply_below_t: 0.5}
+logging: {run_name: mesh-diff-c1-scaffold}
