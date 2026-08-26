@@ -56,6 +56,8 @@ class MeshSetTransformer(nn.Module):
             meaningful under `order: morton`; "none" makes it permutation
             equivariant, which requires `loss: hungarian`.
         time_dim: timestep embedding width.
+        pos_scale: constant the face index is divided by in the positional
+            encoding. Pass `mesh_data.max_faces`; never the padded length.
         out_bins: when set, emits ``[B,9,K,F]`` bin logits and ``[B,F]``
             presence logits for the D3PM arm instead of ``[B,10,F]``.
         cond_ch: channels of the LOD1 condition. Always 10, and deliberately
@@ -64,14 +66,15 @@ class MeshSetTransformer(nn.Module):
 
     def __init__(self, in_ch=10, out_ch=10, d_model=256, n_head=8,
                  num_layers=8, dropout=0.1, pos_embed="sinusoidal",
-                 time_dim=128, out_bins=None, cond_ch=10):
+                 time_dim=128, out_bins=None, cond_ch=10, pos_scale=200):
         super().__init__()
         if pos_embed not in ("sinusoidal", "none"):
             raise ValueError(
                 f"pos_embed must be 'sinusoidal' or 'none', got {pos_embed!r}.")
         self.time_dim = time_dim
         self.out_bins = out_bins
-        self.pos = SinusoidalFacePositions(d_model) if pos_embed == "sinusoidal" else None
+        self.pos = (SinusoidalFacePositions(d_model, scale=pos_scale)
+                    if pos_embed == "sinusoidal" else None)
 
         self.inp = nn.Conv1d(in_ch, d_model, 1)
         self.cond_encoder = FaceEncoder(cond_ch, d_model)

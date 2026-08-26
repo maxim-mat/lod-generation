@@ -18,6 +18,7 @@ from src.models.mesh_set_modules import (
     Up,
     downsample_mask,
     timestep_embedding,
+    zero_pad,
 )
 
 
@@ -57,8 +58,11 @@ class ConditionalMeshUNet(nn.Module):
         self.down3, self.sa3 = Down(c3, c3, time_dim), SelfAttention1d(c3, n_head)
         self.ca3 = CrossAttention1d(c3, cond_dim, n_head)
 
-        self.bot = nn.Sequential(
-            DoubleConv(c3, c3 * 2), nn.Dropout(dropout), DoubleConv(c3 * 2, c3))
+        # Split rather than nn.Sequential: DoubleConv now takes the face mask,
+        # which a Sequential cannot pass through.
+        self.bot1 = DoubleConv(c3, c3 * 2)
+        self.drop = nn.Dropout(dropout)
+        self.bot2 = DoubleConv(c3 * 2, c3)
 
         self.up1, self.sa4 = Up(c3 + c3, c2, time_dim), SelfAttention1d(c2, n_head)
         self.ca4 = CrossAttention1d(c2, cond_dim, n_head)
@@ -92,16 +96,22 @@ class ConditionalMeshUNet(nn.Module):
         m3 = downsample_mask(m2)
         m4 = downsample_mask(m3)
 
-        x1 = self.inc(x)
-        x2 = self.ca1(self.sa1(self.down1(x1, temb), m2), c, cond_mask)
-        x3 = self.ca2(self.sa2(self.down2(x2, temb), m3), c, cond_mask)
-        x4 = self.ca3(self.sa3(self.down3(x3, temb), m4), c, cond_mask)
+        # Every stage takes its own resolution's mask, and every stage returns
+        # padded slots at exactly 0 (`zero_pad`). Both halves are needed: the
+        # mask keeps padding out of the norm statistics, and the zeroing keeps
+        # it out of the next convolution's receptive field. Attention is
+        # already exactly masked, but its output at pad slots is not zero, so
+        # it is re-zeroed before the convolution that follows.
+        x1 = zero_pad(self.inc(x, m1), m1)
+        x2 = zero_pad(self.ca1(self.sa1(self.down1(x1, temb, m2), m2), c, cond_mask), m2)
+        x3 = zero_pad(self.ca2(self.sa2(self.down2(x2, temb, m3), m3), c, cond_mask), m3)
+        x4 = zero_pad(self.ca3(self.sa3(self.down3(x3, temb, m4), m4), c, cond_mask), m4)
 
-        x4 = self.bot(x4)
+        x4 = zero_pad(self.bot2(self.drop(self.bot1(x4, m4)), m4), m4)
 
-        h = self.ca4(self.sa4(self.up1(x4, x3, temb), m3), c, cond_mask)
-        h = self.ca5(self.sa5(self.up2(h, x2, temb), m2), c, cond_mask)
-        h = self.sa6(self.up3(h, x1, temb), m1)
+        h = zero_pad(self.ca4(self.sa4(self.up1(x4, x3, temb, m3), m3), c, cond_mask), m3)
+        h = zero_pad(self.ca5(self.sa5(self.up2(h, x2, temb, m2), m2), c, cond_mask), m2)
+        h = zero_pad(self.sa6(self.up3(h, x1, temb, m1), m1), m1)
         out = self.outc(h)
 
         if self.out_bins is None:

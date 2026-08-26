@@ -46,10 +46,14 @@ def create_denoiser(cfg, in_ch=10, out_bins=None):
             out_bins=out_bins)
     if d.denoiser == "transformer":
         from src.models.mesh_set_transformer import MeshSetTransformer
+        # The positional encoding is scaled by the corpus face cap, never by
+        # the batch's padded width -- otherwise the same face is encoded
+        # differently depending on which buildings share its batch.
         return MeshSetTransformer(
             in_ch=in_ch, d_model=d.d_model, n_head=d.n_head,
             num_layers=d.num_layers, dropout=d.dropout,
-            pos_embed=d.pos_embed, time_dim=d.time_dim, out_bins=out_bins)
+            pos_embed=d.pos_embed, time_dim=d.time_dim, out_bins=out_bins,
+            pos_scale=cfg.mesh_data.max_faces or 200)
     raise ValueError(f"Unknown denoiser: {d.denoiser!r}.")
 
 

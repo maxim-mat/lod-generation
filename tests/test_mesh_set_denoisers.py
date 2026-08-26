@@ -68,75 +68,75 @@ def test_unet_accepts_a_dropped_condition():
     assert net(x, t, None, mask, None).shape == x.shape
 
 
-def test_unet_padding_leaks_through_groupnorm():
-    """KNOWN DEFECT, pinned so it cannot be mistaken for correctness.
+def test_output_is_invariant_to_batch_padding():
+    """The property that matters: a building's prediction must not depend on
+    which other buildings share its batch.
 
-    This test previously asserted the opposite and passed -- but only because
-    the output head is zero-initialised, so both sides were identically 0. Woken
-    up, the U-Net moves a real face's output by O(0.1) in response to padding
-    alone, at ANY distance from the pad boundary: at F=512 with 256 real faces,
-    face 0 still moves. No convolution receptive field reaches that far.
-
-    The path is `GroupNorm`, which normalises over (channel group x face axis)
-    and so folds padded positions into the mean and variance every real face is
-    then scaled by. Consequence: a building's prediction depends on which other
-    buildings share its batch. Fix is a mask-aware norm (statistics over real
-    positions only) or a per-face channel norm; both change trained-model
-    semantics, so neither is applied here without a decision.
+    Two bugs used to break this, both worth ~0.2 of a coordinate channel (~23
+    bins of mean drift). `GroupNorm` pooled its mean and variance over the face
+    axis *including* pad slots, so every real face was scaled by statistics
+    that moved with the padded width -- reaching face 0 at 256 slots from the
+    boundary, far outside any receptive field. And `SinusoidalFacePositions`
+    divided the face index by the padded length, so face 5 was encoded
+    differently at F_pad 24 than at F_pad 64.
     """
+    from src.dataset.mesh_set_dataset import mesh_set_collate_fn
+
+    def _item(n, seed):
+        g = torch.Generator().manual_seed(seed)
+        x = torch.zeros(n, 10)
+        x[:, :9] = torch.rand(n, 9, generator=g) - 0.5
+        x[:, 9] = 0.5
+        c = torch.zeros(6, 10)
+        c[:, :9] = torch.rand(6, 9, generator=g) - 0.5
+        c[:, 9] = 0.5
+        return {"x": x, "cond": c, "id": "a",
+                "center": torch.zeros(3), "scale": torch.ones(3)}
+
     torch.manual_seed(0)
-    net = _wake(ConditionalMeshUNet(base=16, cond_dim=32, time_dim=32, n_head=2)).eval()
-    x, t, cond, mask, cond_mask = _inputs()
-    with torch.no_grad():
-        a = net(x, t, cond, mask, cond_mask)
-        x2 = x.clone()
-        x2[:, :, ~mask[0]] = 99.0            # scribble on the padding
-        b = net(x2, t, cond, mask, cond_mask)
-    leak = (a - b).abs().max().item()
-    assert leak > 1e-3, (
-        "the U-Net no longer leaks padding into real faces -- if that was "
-        "deliberate, delete this test and tighten it to allclose instead")
+    target = _item(20, 1)
+    alone = mesh_set_collate_fn([target], 8)                    # F_pad = 24
+    crowded = mesh_set_collate_fn([target, _item(60, 2)], 8)    # F_pad = 64
+    t = torch.zeros(1) + 0.5
 
-
-def test_transformer_padding_is_exactly_masked():
-    """Both transformers must be bit-exact under a scribbled pad tail.
-
-    This is the property the U-Net lacks, and it is why `denoiser: transformer`
-    is the only backbone whose output does not depend on batch composition.
-    """
-    torch.manual_seed(0)
-    for pe in ("none", "sinusoidal"):
-        net = _wake(_tf(pos_embed=pe)).eval()   # dropout off: this is an exactness claim
-        x, t, cond, mask, cond_mask = _inputs()
+    nets = {
+        "unet": _wake(ConditionalMeshUNet(base=16, cond_dim=32, time_dim=32,
+                                          n_head=2)).eval(),
+        "tf-none": _wake(_tf(pos_embed="none")).eval(),
+        "tf-sinusoidal": _wake(_tf(pos_embed="sinusoidal")).eval(),
+    }
+    for name, net in nets.items():
         with torch.no_grad():
-            a = net(x, t, cond, mask, cond_mask)
-            x2 = x.clone()
-            x2[:, :, ~mask[0]] = 99.0
-            b = net(x2, t, cond, mask, cond_mask)
-        # Only the REAL slots. A padded query still produces an output and that
-        # output legitimately changes -- it is masked from the coordinate loss
-        # and dropped by presence in `faces_to_mesh`. The claim is that no real
-        # face moves.
-        real = mask[0]
-        assert torch.allclose(a[:, :, real], b[:, :, real], atol=1e-6), (
-            f"pos_embed={pe} leaked padding into a real face")
+            a = net(alone["x"], t, alone["cond"], alone["x_mask"], alone["cond_mask"])
+            b = net(crowded["x"][:1], t, crowded["cond"][:1],
+                    crowded["x_mask"][:1], crowded["cond_mask"][:1])
+        drift = (a[0, :, :20] - b[0, :, :20]).abs().max().item()
+        assert drift < 1e-5, f"{name}: batch composition moved a real face by {drift:.2e}"
 
 
-def test_sinusoidal_positions_depend_on_the_padded_width():
-    """KNOWN DEFECT, pinned. `SinusoidalFacePositions` normalises position by
-    the *padded* length, so face i is encoded as i/(F_pad-1) -- and F_pad is the
-    batch maximum rounded to 8. The same face therefore gets a different
-    positional encoding depending on which buildings share its batch.
+def test_masked_groupnorm_ignores_padded_faces():
+    """The norm's statistics must be computed over real faces only."""
+    from src.models.mesh_set_modules import MaskedGroupNorm
 
-    Fix is to normalise by a fixed constant (mesh_data.max_faces) or to use
-    absolute positions; both change trained-model semantics.
-    """
+    torch.manual_seed(0)
+    gn = MaskedGroupNorm(4, 16)
+    h = torch.randn(1, 16, 64)
+    mask = torch.zeros(1, 64, dtype=torch.bool)
+    mask[:, :20] = True
+    h2 = h.clone()
+    h2[:, :, 20:] = 99.0                       # garbage in the pad tail only
+    with torch.no_grad():
+        a, b = gn(h, mask), gn(h2, mask)
+    assert torch.allclose(a[:, :, :20], b[:, :, :20], atol=1e-6)
+
+
+def test_sinusoidal_positions_are_absolute():
+    """Face i must encode the same however wide the batch was padded."""
     from src.models.mesh_set_modules import SinusoidalFacePositions
 
-    pos = SinusoidalFacePositions(32)
-    narrow = pos(24, torch.device("cpu"))
-    wide = pos(64, torch.device("cpu"))
-    assert not torch.allclose(narrow[5], wide[5], atol=1e-6)
+    pos = SinusoidalFacePositions(32, scale=200)
+    assert torch.allclose(pos(24, torch.device("cpu"))[5],
+                          pos(64, torch.device("cpu"))[5], atol=1e-7)
 
 
 def test_unet_discrete_head_shapes():
