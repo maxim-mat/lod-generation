@@ -466,6 +466,24 @@ class MeshDiffusionConfig:
     # decile of buildings.
     slot_budget: int = 200
 
+    # --- weight averaging -------------------------------------------------
+    # EMA decay for the weights used at SAMPLING time. None disables.
+    #
+    # Near-universal in diffusion and worth more than any lr schedule here: it
+    # averages out late-training gradient noise, which is large in this branch
+    # because every sample draws its own t, so each update sees only
+    # batch_size timesteps of the whole schedule.
+    #
+    # The EMA lives on the module rather than in a callback so that it lands in
+    # `state_dict` automatically -- checkpoints are selected on a metric
+    # computed WITH these weights, so they are the ones that must be saved --
+    # and so no callback ordering decides whether eval sees them.
+    ema_decay: Optional[float] = 0.999
+    # Hold off until the live weights are worth averaging. Before this, `generate`
+    # uses the live weights; the EMA is still the initialisation and would make
+    # the early-stopping monitor report on noise.
+    ema_start_step: int = 1000
+
     # --- sampling and write-back -----------------------------------------
     scaffold: ScaffoldConfig = field(default_factory=ScaffoldConfig)
     # Snap to the num_bins grid before welding. Without it `weld` merges by
@@ -541,6 +559,19 @@ class TrainingConfig:
     # change meaning, though this project's schedulers are all epoch-interval.
     accumulate_grad_batches: int = 1
     lr_scheduler: str = "none"  # "none", "cosine", "step"
+    # Linear ramp from ~0 to `lr` over this many OPTIMIZER STEPS (not epochs),
+    # composable with any lr_scheduler value. 0 disables.
+    #
+    # Warmup is measured in steps because that is what it protects: the first
+    # few hundred updates, when Adam's second-moment estimate is still cold and
+    # a large lr can take a step it cannot walk back. At 127 steps/epoch an
+    # epoch-scaled warmup would ramp for thousands of steps, which is a
+    # different intervention entirely.
+    #
+    # NOTE: currently honoured by `config_set: mesh_diffusion` only. The mesh,
+    # mesh_vqvae and diffusion branches ignore it, so setting it there is a
+    # silent no-op rather than an error.
+    warmup_steps: int = 0
     lr_decay_steps: int = 50
     lr_decay_rate: float = 0.5
     early_stopping: EarlyStoppingConfig = field(default_factory=EarlyStoppingConfig)

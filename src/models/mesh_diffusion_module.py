@@ -15,6 +15,7 @@ import torch
 import torch.nn as nn
 import lightning as L
 from omegaconf import OmegaConf
+from torch.optim.swa_utils import AveragedModel
 
 from src.models.mesh_processes import create_process
 from src.models.mesh_set_losses import (
@@ -57,6 +58,23 @@ def create_denoiser(cfg, in_ch=10, out_bins=None):
     raise ValueError(f"Unknown denoiser: {d.denoiser!r}.")
 
 
+def _ramped_ema(decay):
+    """EMA whose decay ramps in, rather than a constant from step one.
+
+    A fresh `AveragedModel` is a copy of the *initialisation*, so a constant
+    0.999 leaves it 90% initial noise after 100 updates and 37% after 1000 --
+    measured. Since the early-stopping monitor samples from these weights, that
+    is not a slow start, it is a monitor reporting on noise. `min(decay,
+    (1+n)/(10+n))` tracks the live weights closely at first and tightens toward
+    `decay` as the average earns its length.
+    """
+    def ema_update(ema_params, current_params, num_averaged):
+        n = float(num_averaged)
+        d = min(decay, (1.0 + n) / (10.0 + n))
+        torch._foreach_lerp_(list(ema_params), list(current_params), 1.0 - d)
+    return ema_update
+
+
 def _guide(cond_out, uncond_out, weight):
     """Classifier-free guidance, for a tensor prediction or a logits tuple."""
     if torch.is_tensor(cond_out):
@@ -83,6 +101,9 @@ class MeshDiffusionModule(L.LightningModule):
         self.num_bins = cfg.mesh_data.num_bins
         self.lr = cfg.training.lr
         self.lr_scheduler = cfg.training.lr_scheduler
+        self.warmup_steps = cfg.training.warmup_steps
+        self.lr_decay_steps = cfg.training.lr_decay_steps
+        self.lr_decay_rate = cfg.training.lr_decay_rate
         self.cond_dropout = d.cond_dropout
         self.guidance = d.guidance
         self.eval_steps = d.eval_steps
@@ -99,6 +120,16 @@ class MeshDiffusionModule(L.LightningModule):
         self.denoiser = create_denoiser(
             cfg, in_ch=in_ch, out_bins=self.num_bins if self.categorical else None)
         self.process = create_process(cfg)
+
+        # Sampling-time weights. Held on the module, not in a callback, so they
+        # land in `state_dict` automatically -- checkpoints are selected on a
+        # metric computed WITH them -- and so no callback ordering decides
+        # whether eval sees them.
+        self.ema_start_step = d.ema_start_step
+        self.ema = None
+        if d.ema_decay is not None:
+            self.ema = AveragedModel(self.denoiser,
+                                     multi_avg_fn=_ramped_ema(d.ema_decay))
 
     # -- state routing (plan D10) -----------------------------------------
 
@@ -195,7 +226,16 @@ class MeshDiffusionModule(L.LightningModule):
     # -- plumbing ---------------------------------------------------------
 
     def _denoise(self, x, t, cond, mask, cond_mask):
-        return self.denoiser(x, t, cond, mask, cond_mask)
+        return self._eval_net()(x, t, cond, mask, cond_mask)
+
+    def _eval_net(self):
+        """The denoiser to run: the EMA copy outside training, once it has
+        actually accumulated something. `n_averaged == 0` means it is still the
+        initialisation, which would make every sampled metric meaningless."""
+        if (self.ema is not None and not self.training
+                and int(self.ema.n_averaged) > 0):
+            return self.ema.module
+        return self.denoiser
 
     def _loss(self, pred, target, batch, x0=None):
         mask = batch["x_mask"]
@@ -273,6 +313,11 @@ class MeshDiffusionModule(L.LightningModule):
     def training_step(self, batch, batch_idx):
         return self._shared_step(batch, "train")
 
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        """Fold the live weights into the EMA, once they are worth averaging."""
+        if self.ema is not None and self.global_step >= self.ema_start_step:
+            self.ema.update_parameters(self.denoiser)
+
     def validation_step(self, batch, batch_idx):
         return self._shared_step(batch, "val")
 
@@ -288,15 +333,59 @@ class MeshDiffusionModule(L.LightningModule):
         return None
 
     def configure_optimizers(self):
+        """AdamW, with optional linear warmup composed over any schedule.
+
+        Warmup runs on the STEP interval, never the epoch one. Lightning
+        defaults `interval` to "epoch", so a 500-step warmup left on the
+        default would ramp over 500 *epochs* -- at 127 steps/epoch that is
+        63,500 steps of ramp instead of 500. It trains, badly, silently, which
+        is why every branch below sets the interval explicitly.
+        """
+        import torch.optim.lr_scheduler as S
+
         opt = torch.optim.AdamW(self.parameters(), lr=self.lr)
+        warmup = int(self.warmup_steps)
+
+        if self.lr_scheduler not in ("none", "cosine", "step"):
+            raise ValueError(f"Unknown lr_scheduler: {self.lr_scheduler!r}.")
+
         if self.lr_scheduler == "none":
-            return opt
-        if self.lr_scheduler == "cosine":
-            sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-                opt, T_max=self.trainer.max_epochs if self.trainer else 100,
-                eta_min=0.01 * self.lr)
-            return {"optimizer": opt, "lr_scheduler": sched}
-        raise ValueError(f"Unknown lr_scheduler: {self.lr_scheduler!r}.")
+            if warmup <= 0:
+                return opt
+            # Ramp, then flat. Constant-after-warmup is the diffusion
+            # mainstream (DDPM, Improved DDPM, ADM, Imagen all do this); the
+            # annealing habit comes from classifiers.
+            sched = S.LambdaLR(opt, lambda step: min(1.0, (step + 1) / warmup))
+            return {"optimizer": opt,
+                    "lr_scheduler": {"scheduler": sched, "interval": "step"}}
+
+        if self.lr_scheduler == "step":
+            # Matches the AR branch's StepLR, on the epoch interval it assumes.
+            sched = S.StepLR(opt, step_size=self.lr_decay_steps,
+                             gamma=self.lr_decay_rate)
+            if warmup <= 0:
+                return {"optimizer": opt,
+                        "lr_scheduler": {"scheduler": sched, "interval": "epoch"}}
+            raise ValueError(
+                "warmup_steps > 0 with lr_scheduler: step mixes a step-interval "
+                "ramp with an epoch-interval decay. Use 'none' or 'cosine'.")
+
+        # Cosine. T_max in STEPS, from Lightning's own estimate, which accounts
+        # for max_epochs, accumulation and devices -- the previous version used
+        # max_epochs on the epoch interval, which silently disagrees with a
+        # step-interval warmup.
+        total = int(self.trainer.estimated_stepping_batches) if self.trainer else 1000
+        if warmup <= 0:
+            sched = S.CosineAnnealingLR(opt, T_max=total, eta_min=0.01 * self.lr)
+        else:
+            sched = S.SequentialLR(
+                opt,
+                [S.LinearLR(opt, start_factor=1e-3, total_iters=warmup),
+                 S.CosineAnnealingLR(opt, T_max=max(total - warmup, 1),
+                                     eta_min=0.01 * self.lr)],
+                milestones=[warmup])
+        return {"optimizer": opt,
+                "lr_scheduler": {"scheduler": sched, "interval": "step"}}
 
     # -- sampling ---------------------------------------------------------
 

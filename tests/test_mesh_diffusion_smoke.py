@@ -425,3 +425,83 @@ def test_test_step_computes_no_single_step_loss():
     """Test is the full reverse trajectory only."""
     m = MeshDiffusionModule(_cfg())
     assert m.test_step(_batch(), 0) is None
+
+
+def test_warmup_ramps_on_the_step_interval():
+    """Lightning defaults `interval` to "epoch". A step-scaled warmup left on
+    that default would ramp over 500 EPOCHS -- ~63k steps instead of 500. It
+    trains, badly and silently, so the interval is asserted here."""
+    cfg = _cfg()
+    cfg.training.warmup_steps = 50
+    cfg.training.lr = 1e-3
+    cfg.training.lr_scheduler = "none"
+    m = MeshDiffusionModule(cfg)
+    out = m.configure_optimizers()
+    assert out["lr_scheduler"]["interval"] == "step"
+
+    opt, sched = out["optimizer"], out["lr_scheduler"]["scheduler"]
+    seen = []
+    for _ in range(120):
+        seen.append(opt.param_groups[0]["lr"])
+        opt.step()
+        sched.step()
+    assert seen[0] == pytest.approx(1e-3 / 50, rel=1e-6)   # ramping from ~0
+    assert seen[49] == pytest.approx(1e-3, rel=1e-6)       # at peak by step 50
+    assert seen[119] == pytest.approx(1e-3, rel=1e-6)      # then flat
+
+
+def test_no_warmup_and_no_schedule_returns_a_bare_optimizer():
+    m = MeshDiffusionModule(_cfg())
+    assert isinstance(m.configure_optimizers(), torch.optim.Optimizer)
+
+
+def test_step_scheduler_is_supported_like_the_other_branches():
+    """`TrainingConfig` advertises "step" and mesh_transformer/mesh_vqvae both
+    implement it; this module used to raise on it."""
+    cfg = _cfg()
+    cfg.training.lr_scheduler = "step"
+    out = MeshDiffusionModule(cfg).configure_optimizers()
+    assert out["lr_scheduler"]["interval"] == "epoch"
+
+
+def test_ema_is_checkpointed_and_lags_the_live_weights():
+    cfg = _cfg()
+    cfg.mesh_diffusion.ema_decay = 0.999
+    cfg.mesh_diffusion.ema_start_step = 0
+    m = MeshDiffusionModule(cfg)
+    assert any(k.startswith("ema.") for k in m.state_dict()), \
+        "EMA must ride in state_dict -- checkpoints are selected on a metric computed with it"
+
+    # Untouched EMA is still the initialisation, so sampling must NOT use it.
+    assert int(m.ema.n_averaged) == 0
+    assert m._eval_net() is m.denoiser
+
+    opt = torch.optim.AdamW(m.parameters(), lr=1e-2)
+    for i in range(5):
+        opt.zero_grad(); m.training_step(_batch(), i).backward(); opt.step()
+        m.ema.update_parameters(m.denoiser)
+    assert int(m.ema.n_averaged) == 5
+    m.eval()
+    assert m._eval_net() is m.ema.module          # now it is worth using
+    live = next(m.denoiser.parameters())
+    shadow = next(m.ema.module.parameters())
+    assert not torch.allclose(live, shadow), "EMA never diverged from the live weights"
+
+
+def test_ema_can_be_disabled():
+    cfg = _cfg()
+    cfg.mesh_diffusion.ema_decay = None
+    m = MeshDiffusionModule(cfg).eval()
+    assert m.ema is None and m._eval_net() is m.denoiser
+
+
+def test_ema_decay_ramps_in():
+    """A constant 0.999 leaves a fresh EMA 90% initialisation after 100 updates.
+    The ramp tracks the live weights early and tightens as it earns length."""
+    from src.models.mesh_diffusion_module import _ramped_ema
+
+    fn = _ramped_ema(0.999)
+    ema = [torch.zeros(1)]
+    for n in range(200):
+        fn(ema, [torch.ones(1)], n)
+    assert ema[0].item() > 0.95        # a constant-0.999 EMA would be ~0.18 here

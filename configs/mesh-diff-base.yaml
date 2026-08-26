@@ -49,6 +49,15 @@ mesh_diffusion:
   match_presence_weight: 1.0
   snap_before_weld: true
   min_face_area: 1.0e-6
+  # Weights used for SAMPLING -- and therefore for the early-stopping monitor
+  # and the checkpoint it selects. Standard in diffusion and worth more here
+  # than any lr schedule: it averages out late-training gradient noise, which
+  # is large because each update sees only batch_size of the noise schedule.
+  # Decay ramps in (see `_ramped_ema`); null disables for the ablation.
+  ema_decay: 0.999
+  # Held off until step 1000, past the 500-step warmup: averaging weights from
+  # the ramp would drag the monitor toward the initialisation.
+  ema_start_step: 1000
   scaffold:
     enabled: false
     voxel: 0.03125
@@ -69,21 +78,38 @@ mesh_diffusion:
   save_samples: 8
 
 training:
-  # Effective batch 4: no accumulation. This is a deliberate DEPARTURE from the
-  # mesh-v3/v4 AR arms, which run 4 x 4 = 16 -- so the optimisation is no longer
-  # matched to theirs, and a diffusion-vs-AR gap now has batch size in it as
-  # well as architecture. Read the stage-4 comparison with that in mind.
-  # The trade bought here is 4x the optimizer steps per epoch at the same
-  # forward cost, which matters at lr 5e-5 over 1000 epochs.
-  batch_size: 4
+  # 32, no accumulation. The AR arms cap at 4 because `coord` tokenization is
+  # 9 tokens per face -- 1800 for a 200-face building against 200 slots here --
+  # and attention is quadratic, so their activation cost is ~81x ours at the
+  # same building. This branch has no such wall: measured, the U-Net is
+  # launch-bound and a step costs 75 ms at batch 4 and 78 ms at batch 256, with
+  # peak VRAM 508 MiB at 32. Batch 32 is therefore ~7.8x faster per epoch for
+  # free, and it also cuts a variance source specific to diffusion -- every
+  # sample draws its own t, so batch 4 estimated an expectation over the whole
+  # noise schedule from 4 timesteps per update.
+  #
+  # A DEPARTURE from the AR arms' effective 16, along with the lr below. Stage 4
+  # is therefore best-effort-vs-best-effort, not a controlled comparison; say so
+  # when reporting it.
+  batch_size: 32
   accumulate_grad_batches: 1
   train_val_test_split: [0.8, 0.1, 0.1]
-  # 5e-5 flat, matching the AR arms rather than the 1e-4 DDPM default this
-  # file first carried. Deliberate: a diffusion number and an AR number are
-  # only comparable if the optimisation is, and an unshared learning rate is
-  # the kind of difference that quietly explains a result. Many more epochs are
-  # expected at this rate, which is what max_epochs: 1000 is for.
-  lr: 5.0e-5
+  # 1e-3. Measured on arm a1 at batch 32 over 250 steps on the full corpus:
+  # lr 5e-5 dropped the loss 51% (to 0.969) while 1e-3 dropped it 91% (to
+  # 0.135), with gen_coord_mse 0.359 against 0.171. Nothing diverged even at
+  # 3e-3 -- the zero-init output head starts the model as the identity, so the
+  # early steps are forgiving. 5e-5 was simply far too low.
+  #
+  # Caveat carried deliberately: 250 steps ranks EARLY progress, and early lr
+  # rankings routinely fail to predict final quality. "5e-5 is too slow" is
+  # solid; "1e-3 beats 3e-4 at convergence" is not established.
+  lr: 1.0e-3
+  # Linear ramp over the first 500 optimizer steps (~4 epochs at batch 32),
+  # then flat. Insurance for the first hundred updates at a 20x higher lr,
+  # while Adam's second moment is still cold. Constant-after-warmup rather than
+  # cosine: early stopping would truncate an anneal anyway, so a run that stops
+  # has not been cut short of one.
+  warmup_steps: 500
   max_epochs: 1000
   gradient_clip_val: 1.0
   # No schedule. With none there is no annealing phase, so a run that early-
