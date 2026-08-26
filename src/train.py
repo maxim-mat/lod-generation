@@ -30,9 +30,13 @@ def train(cfg: Config):
     if cfg.config_set == "mesh_vqvae":
         from src.train_mesh_vqvae import train_mesh_vqvae
         return train_mesh_vqvae(cfg)
+    if cfg.config_set == "mesh_diffusion":
+        from src.train_mesh_diffusion import train_mesh_diffusion
+        return train_mesh_diffusion(cfg)
     if cfg.config_set not in ("diffusion", "mini"):
         raise ValueError(f"Unknown config_set: {cfg.config_set!r}. Expected "
-                         "'diffusion', 'mini', 'mesh' or 'mesh_vqvae'.")
+                         "'diffusion', 'mini', 'mesh', 'mesh_vqvae' or "
+                         "'mesh_diffusion'.")
 
     # Seed everything for reproducibility
     L.seed_everything(cfg.seed, workers=True)
