@@ -109,16 +109,26 @@ class GaussianProcess(BaseProcess):
         target: "noise" (epsilon-prediction, the default and what nearly every
             reported result uses) or "original" (x0-prediction, which is better
             conditioned at low t and is what D3PM and most set models use).
+        x0_clip: clamp the x0 estimate to ``+-x0_clip`` before it is used to
+            build the next state; ``None`` disables. Static thresholding, and
+            not cosmetic: an untrained epsilon model predicts ~0, which makes
+            the step a pure rescaling whose factor telescopes to x157 across
+            the trajectory. Every continuous state lives in [-0.5, 0.5], so
+            that is the natural bound.
     """
 
     def __init__(self, noise_steps=1000, beta_start=1e-4, beta_end=0.02,
-                 target="noise"):
+                 target="noise", x0_clip=0.5):
         super().__init__()
         if target not in ("noise", "original"):
             raise ValueError(
                 f"GaussianProcess target must be 'noise' or 'original', got {target!r}.")
+        if x0_clip is not None and x0_clip <= 0:
+            raise ValueError(
+                f"x0_clip must be positive or None, got {x0_clip!r}.")
         self.noise_steps = noise_steps
         self.target = target
+        self.x0_clip = x0_clip
         beta = torch.linspace(beta_start, beta_end, noise_steps)
         self.register_buffer("beta", beta)
         self.register_buffer("alpha_hat", torch.cumprod(1.0 - beta, dim=0))
@@ -147,10 +157,14 @@ class GaussianProcess(BaseProcess):
     def to_x0(self, x_t, t, model_out):
         """Whatever the denoiser predicted, read as an ``x0`` estimate."""
         if self.target == "original":
-            return model_out
+            return self._clip(model_out)
         a = self._abar(torch.as_tensor(t, device=x_t.device).expand(x_t.shape[0]),
                        x_t.dim())
-        return (x_t - (1 - a).sqrt() * model_out) / a.sqrt().clamp(min=1e-8)
+        return self._clip((x_t - (1 - a).sqrt() * model_out) / a.sqrt().clamp(min=1e-8))
+
+    def _clip(self, x0):
+        """Static thresholding. See the class docstring for why this is on."""
+        return x0 if self.x0_clip is None else x0.clamp(-self.x0_clip, self.x0_clip)
 
     def step(self, x_t, t, t_prev, model_out):
         """Deterministic DDIM step (eta = 0)."""
@@ -430,7 +444,8 @@ def create_process(cfg):
     """
     d = cfg.mesh_diffusion
     if d.process == "ddpm":
-        return GaussianProcess(d.noise_steps, d.beta_start, d.beta_end, d.target)
+        return GaussianProcess(d.noise_steps, d.beta_start, d.beta_end, d.target,
+                               x0_clip=d.x0_clip)
     if d.process == "flow":
         from src.models.mesh_processes import FlowMatchingProcess
         return FlowMatchingProcess()

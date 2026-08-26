@@ -397,6 +397,24 @@ class MeshDiffusionConfig:
     noise_steps: int = 1000
     beta_start: float = 1e-4
     beta_end: float = 0.02
+    # Clamp the x0 estimate to +-this before each reverse step; None disables.
+    # Static thresholding (Ho et al. arXiv:2006.11239), and it fixes a real
+    # pathology rather than polishing samples: with an untrained epsilon model
+    # predicting ~0, the DDIM step degenerates to x0 = x_t / sqrt(alpha_bar),
+    # whose per-step factor telescopes to x157 over the trajectory. Samples land
+    # in the hundreds, `quantize` clips every axis to bin 0 or 127, and the mesh
+    # welds to the 8 corners of the box. That also made the early-stopping
+    # monitor start around 24000 instead of O(0.1), and left it unbounded --
+    # one outlier face could dominate the mean it selects on.
+    #
+    # 0.5 because every continuous state lives in [-0.5, 0.5] by construction:
+    # coordinates, the presence channel, and the centred one-hot channels alike.
+    # Set to null for the ablation -- it is a sampler-side intervention, so the
+    # same checkpoint can be scored both ways.
+    #
+    # Gaussian processes only. Flow matching integrates a velocity and never
+    # forms an x0 estimate, and D3PM's state is bounded by its alphabet.
+    x0_clip: Optional[float] = 0.5
     # Reverse steps at eval. Full-length reverse diffusion per validation
     # building is what makes this callback expensive; 50 DDIM steps is the
     # standard trade and is what every reported number should be measured at.

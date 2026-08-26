@@ -37,6 +37,12 @@ mesh_diffusion:
   time_dim: 128
   cond_dropout: 0.1
   noise_steps: 1000
+  # Static thresholding on the x0 estimate. Without it an untrained epsilon
+  # model makes the DDIM step a pure rescaling that telescopes to x157, so
+  # samples leave the box entirely and the tier-2 monitor starts around 24000
+  # instead of ~0.36 -- measured. Set to null to ablate; it is sampler-side, so
+  # the same checkpoint can be scored both ways.
+  x0_clip: 0.5
   eval_steps: 50
   guidance: 1.0
   presence_weight: 1.0

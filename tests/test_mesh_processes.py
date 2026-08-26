@@ -252,3 +252,37 @@ def test_discrete_presence_transition_is_uniform_even_under_gaussian():
         st = _state(torch.zeros(4096, 9, 4, dtype=torch.long), presence=1)
         out, _ = p.corrupt(st, torch.full((4096,), 0.5))
         assert set(out[:, 9].unique().tolist()) <= {0, 1}
+
+
+def test_x0_clip_bounds_an_untrained_sample():
+    """The pathology the clamp exists for.
+
+    An untrained epsilon model predicts ~0, which turns the DDIM step into a
+    pure rescaling x <- sqrt(a_prev/a_t) x; that factor telescopes to ~157 over
+    a full trajectory, so samples land in the hundreds instead of [-0.5, 0.5].
+    """
+    torch.manual_seed(0)
+    zero = lambda x_t, t: torch.zeros_like(x_t)
+
+    loose = GaussianProcess(noise_steps=1000, target="noise", x0_clip=None)
+    tight = GaussianProcess(noise_steps=1000, target="noise", x0_clip=0.5)
+    torch.manual_seed(1)
+    a = loose.sample(zero, (4, 10, 8), torch.device("cpu"), n_steps=20)
+    torch.manual_seed(1)
+    b = tight.sample(zero, (4, 10, 8), torch.device("cpu"), n_steps=20)
+
+    assert a.abs().max().item() > 50.0            # unbounded without it
+    assert b.abs().max().item() < 1.0             # bounded with it
+
+
+def test_x0_clip_leaves_in_range_predictions_untouched():
+    """It is a guard rail, not a transform: a model already predicting inside
+    the box must be unaffected, so the ablation only moves what was broken."""
+    p = GaussianProcess(noise_steps=1000, target="original", x0_clip=0.5)
+    x0 = (torch.rand(4, 10, 8) - 0.5) * 0.9       # comfortably inside
+    assert torch.allclose(p.to_x0(torch.randn(4, 10, 8), 0.5, x0), x0)
+
+
+def test_x0_clip_rejects_a_nonpositive_bound():
+    with pytest.raises(ValueError, match="positive or None"):
+        GaussianProcess(x0_clip=0.0)
