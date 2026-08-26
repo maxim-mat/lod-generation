@@ -3,10 +3,10 @@
 #   ./run_experiments.sh --diff-stage 1
 # which merges this file with each arm file before launching.
 #
-# Dataset, split, effective batch, schedule and seed are identical across all
-# arms and identical to the mesh-v3-*-sin autoregressive arms, so a diffusion
-# number and an AR number on the same corpus are directly comparable. That
-# comparability is the point of this file existing.
+# Dataset, split, batch, schedule and seed are identical across all ARMS, which
+# is what makes arm-to-arm gaps mean something -- that is the point of this file
+# existing. Against the mesh-v3-*-sin AR arms the corpus, split and lr match but
+# the EFFECTIVE BATCH no longer does (4 here, 16 there); see the training block.
 mode: train
 config_set: mesh_diffusion
 seed: 42
@@ -102,7 +102,7 @@ training:
   early_stopping:
     enabled: true
     monitor: val_gen_coord_mse
-    patience: 25
+    patience: 100
     mode: min
   checkpoint:
     enabled: true
