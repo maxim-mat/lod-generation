@@ -1,0 +1,66 @@
+# Phase A smoke: does the diffusion branch run at all?
+# Usage: python main.py --train --config configs/mesh-diff-smoke.yaml
+#
+# 20 files, 1 epoch, no logger, no eval callback. Not a result -- the only
+# question it answers is whether dataset, denoiser, process and loss are wired
+# to each other.
+mode: train
+config_set: mesh_diffusion
+seed: 42
+
+data:
+  dataset_dir: data/The Hague/mini_cleaner
+
+mesh_data:
+  dataset_dir: data/The Hague/mini_cleaner
+  lod_in: LOD1
+  lod_out: LOD2
+  num_bins: 128
+  margin_lo: [0.0, 0.0, 0.0]
+  margin_hi: [0.0, 0.0, 0.1]
+  max_faces: 200
+  max_files: 20
+  num_workers: 0
+  persistent_workers: false
+
+mesh_diffusion:
+  order: morton
+  pos_embed: sinusoidal
+  loss: mse
+  denoiser: unet
+  d_model: 128
+  time_dim: 64
+  n_head: 4
+  process: ddpm
+  target: noise
+  noise_steps: 1000
+  eval_steps: 10
+  every_n_epochs: 0        # eval callback lands in Task 8
+
+training:
+  batch_size: 4
+  accumulate_grad_batches: 1
+  train_val_test_split: [0.8, 0.1, 0.1]
+  lr: 1e-4
+  max_epochs: 1
+  gradient_clip_val: 1.0
+  lr_scheduler: "none"
+  early_stopping:
+    enabled: false
+  checkpoint:
+    enabled: false
+
+trainer:
+  accelerator: auto
+  devices: 1
+  precision: "32"
+  log_every_n_steps: 1
+
+logging:
+  loggers: []
+  project_name: lod-generation
+  experiment_name: smoke
+  run_name: mesh-diff-smoke
+  save_dir: outputs
+
+resume_from: null
