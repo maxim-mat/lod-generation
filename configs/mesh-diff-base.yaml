@@ -47,6 +47,10 @@ mesh_diffusion:
   guidance: 1.0
   presence_weight: 1.0
   match_presence_weight: 1.0
+  # Slot budget: how many face slots the model gets, independent of how many
+  # the building has. The surplus are no-object slots it must mark absent --
+  # the only mechanism deciding face count. Must be >= mesh_data.max_faces.
+  slot_budget: 200
   snap_before_weld: true
   min_face_area: 1.0e-6
   # Weights used for SAMPLING -- and therefore for the early-stopping monitor
