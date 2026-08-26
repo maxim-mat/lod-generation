@@ -1,10 +1,19 @@
 # Mesh-set diffusion: what this branch is for, and what it gives up
 
 Companion to `docs/superpowers/plans/2026-08-25-mesh-set-diffusion.md` (the
-implementation) and `docs/research/2026-08-24-preliminary-future-plan.md` (the
-scan this reads against). Written when the code landed, before any arm had run
-to convergence — the comparison table in section 5 is the deliverable this note
-exists to be filled into.
+plan) and `docs/research/2026-08-24-preliminary-future-plan.md` (the scan this
+reads against). Written when the code landed and revised as the design moved;
+**no arm has yet been trained to convergence**, and the comparison table in
+section 5 is the deliverable this note exists to be filled into.
+
+Sections 1-5 are the framing. Sections 6-8 record where the plan as written
+turned out to be wrong and what replaced it — the D5 premise, three grid-design
+defects, and the evaluation design including an EMA question the literature
+leaves open. Section 8 is the one with content that is not just bookkeeping.
+
+The grid is **18 arms** across four stages (`./run_experiments.sh --diff-stage
+1|2|3|revisit`), ~2.8 h per U-Net arm and ~1.6 h per transformer arm at 127
+steps/epoch on 4060 training pairs, so ~1.9 days end to end.
 
 ## 1. The framing gap
 
@@ -90,6 +99,16 @@ temporary:
   diffused presence channel (plan D2). A miscalibrated presence head produces a
   mesh with the wrong number of faces and no error signal saying so — which is
   why `n_faces`, `n_verts` and `empty` are logged alongside chamfer.
+
+  This was nearly not true at all. The denoiser was originally handed
+  `x_mask` — built from the *ground-truth* face counts — which its own masking
+  turned into an exact signal: the presence output at unused slots was
+  literally the output head's bias, bit-identical across three completely
+  different inputs. Face count came from the label, not the model. The slots
+  past a building's face count are now DETR no-object slots (arXiv:2005.12872
+  section 3.1): the model sees no mask on the target axis, `slot_budget` fixes
+  how many slots it gets, and presence is the only thing deciding the count.
+  `x_mask` survives as loss supervision alone.
 - **There is no exact tokenizer inverse.** The AR branch's `coord` tokenizer
   round-trips exactly; here the ground truth pushed through `faces_to_mesh` is
   itself lossy. `gt_chamfer_m` is that ceiling, it is measured every eval, and
@@ -102,6 +121,17 @@ To be filled in after stage 4 of the grid (no new training: score the stage-3
 winner and the AR checkpoints on the same test indices with the same
 `mesh_metrics` call). The AR rows and the passthrough floor are named here so
 the comparison cannot quietly drop the unflattering ones.
+
+**This is best-effort against best-effort, not a controlled comparison, and it
+must be reported that way.** The corpus, split and seed match the AR arms; the
+optimisation no longer does. The AR arms run effective batch 16 at lr 5e-5
+because `coord` tokenization makes a 200-face building 1800 tokens and
+attention is quadratic — ~81x our activation cost at the same building, which
+is what caps them at batch 4. This branch has no such wall (measured: the U-Net
+is launch-bound, 75 ms/step at batch 4 and 78 ms at batch 256, 508 MiB peak at
+batch 32), so it runs batch 32 at lr 1e-3 with a 500-step warmup. Crippling one
+branch for symmetry would have been the worse choice, but the gap is not purely
+architectural.
 
 `NFE` is the column that makes any speed claim honest: an autoregressive sample
 is ~1800 *sequential* forward passes, a 50-step diffusion sample is 50 (100 with
@@ -117,7 +147,7 @@ classifier-free guidance on). A wall-clock claim that omits it is not a claim.
 | mesh-v4-scratch-sin | | | | | | | | ~1800 |
 | mesh-diff (stage-3 winner) | | | | | | | | 50 |
 
-## 5b. File order already carries most of the locality the U-Net needs
+## 6. File order already carries most of the locality the U-Net needs
 
 The plan excluded a conv U-Net over unordered faces (its D5) on the grounds
 that "with `order: none` the axis is arbitrary and the convolution is noise".
@@ -154,7 +184,7 @@ and the `pos_embed` half of D4 was narrowed to the transformer, since
 translation-equivariant along the face axis, so requiring `pos_embed` of it was
 requiring a no-op. Setting it under `denoiser: unet` now warns.
 
-## 5a. Two things the grid design gets wrong, and what was done about them
+## 7. Three things the grid design got wrong, and what was done about them
 
 Recorded because both are properties of the *experiment*, not of the model, and
 both would otherwise be invisible in the results.
@@ -175,6 +205,19 @@ re-run stage 1's alternatives under stage 2's winner. Two runs against the ~8 a
 full cross would add. `r2-loss` is conditional on the winner's loss not being
 `ce`, for the reason above.
 
+**The denoiser's output depended on which buildings shared its batch.** Two
+independent paths, both worth ~0.2 of a coordinate channel — about 23 bins of
+mean drift on the same building batched two ways. `GroupNorm` pooled its mean
+and variance over the face axis *including* pad slots, so every real face was
+scaled by statistics that moved with the padded width; the effect reached face
+0 at 256 slots from the boundary, far outside any receptive field. And
+`SinusoidalFacePositions` divided the face index by the *padded* length, so
+face 5 was encoded differently at width 24 than at width 64. Fixed by a
+mask-aware norm plus zeroing pads between the two convolutions of every
+`DoubleConv` (the norm's learned bias made the intermediate non-zero, and the
+second convolution reads its neighbours), and by scaling positions by a fixed
+constant. Both are now pinned by tests asserting invariance to batch padding.
+
 **`presence_weight: 1.0` did not mean the same thing across arms.** The two
 loss terms start at scales set by the target and the readout. Measured at init
 on `mini_cleaner`, with the zero-init head predicting 0 and E[x0²] = 0.0958:
@@ -194,7 +237,94 @@ sensitive to. Every arm now sets its regime's parity value;
 already at parity, so the a-block and c1/c2 are unchanged at 1.0. Re-derive the
 0.0958 if the corpus changes.
 
-## 6. The open confound
+## 8. How this branch is evaluated, and an open question the literature does not answer
+
+**Three tiers, because one number cannot do all three jobs.**
+
+| tier | when | what | cost |
+|---|---|---|---|
+| single-step loss | every batch | the objective | — |
+| free-running reverse on 8 fixed buildings, 20 steps | every val epoch | `val_gen_*`, drives early stopping | +10% of an epoch |
+| geometric metrics (chamfer, IoU, watertight) on 16, 50 steps | every 10 epochs | reporting | +48% |
+| full reverse only, 64 at 50 steps | test, once | reporting | 192%, once |
+
+Early stopping deliberately does **not** watch the single-step loss. That loss
+is a Monte-Carlo estimate over `t` — each update sees only `batch_size`
+timesteps of the whole schedule — it is only loosely coupled to sample quality,
+and it is in different units per arm (ln 128 ≈ 4.85 for the CE arms against
+~0.10 for the x0 arms), so it cannot rank the grid. The monitor is
+`val_gen_coord_mse`: coordinate MSE of a *free-running* sample, slot-to-slot on
+ordered arms and Hungarian-matched only on `order: none`. One key, `mode: min`,
+correct for every arm by construction. `test_step` computes nothing — test is
+the reverse trajectory alone.
+
+Two implementation notes that are easy to get wrong and were: the reverse
+trajectory is run under a **fixed seed that is saved and restored**, because
+seeding globally inside a training loop would also reset the *training* RNG and
+correlate dropout and shuffling across every epoch; and `EarlyStopping(strict=True)`
+**raises** on a missing metric, so the monitor cannot live behind the
+`every_n_epochs` gate the geometric tier uses.
+
+**Static thresholding is not optional here.** An untrained epsilon model
+predicts ~0, which turns the DDIM step into a pure rescaling whose factor
+telescopes to **x157** over a trajectory: samples leave the box entirely,
+`quantize` clips every axis to bin 0 or 127, and the mesh welds to the 8 corners
+of the normalized box. Measured effect on the monitor at initialisation:
+**23216 without the clamp, 0.36 with it** (`x0_clip: 0.5`, Ho et al.
+arXiv:2006.11239). Gaussian processes only — flow matching integrates a
+velocity and never forms an x0 estimate, and D3PM's state is bounded by its
+alphabet.
+
+### The EMA question, and what the literature actually says
+
+Weights used for sampling are an EMA of the training weights (`ema_decay:
+0.999`, ramped in, started at step 1000 so the average does not carry the
+initialisation). The natural objection is that EMA is a confound in an
+architecture comparison, and that one should rank denoisers on raw performance
+and add EMA at the end. The literature does not support that, but the reason
+depends on which literature:
+
+- **Unconditional generation.** Song & Ermon (arXiv:2006.09011) introduce EMA as
+  their Technique 5 — *"Apply exponential moving average to parameters when
+  sampling"* — motivated explicitly by checkpoint-to-checkpoint stability:
+  *"the FID scores for the vanilla NCSN often fluctuate significantly during
+  training… EMA can effectively stabilize FIDs."* Selecting the minimum of a
+  volatile series is biased, and the bias scales with the volatility — so
+  ranking arms by their best raw-weight epoch would favour whichever arm is
+  noisiest.
+- **Paired ground truth, which is our setting.** Palette (arXiv:2111.05826)
+  covers four image-to-image tasks with ground truth and states *"We use 0.9999
+  EMA for all our experiments"*, with warmup + constant lr and **no checkpoint
+  selection at all** — *"we use the model checkpoint at 1M steps"*. SR3
+  (arXiv:2104.07636) likewise does *"not perform any checkpoint selection on SR3
+  models and simply select the latest checkpoint."* So in paired diffusion the
+  practice is EMA throughout at high decay, and no selection.
+- **Not evidence either way:** DDRM and its relatives are *training-free* — they
+  run a pretrained unconditional model inside a restoration sampler, so EMA is
+  inherited from the public checkpoint rather than chosen.
+
+**The gap worth recording: no paper found ablates EMA against a paired
+distortion metric.** NCSNv2 and EDM2 ablate it, but on FID; SR3 and Palette use
+it without ablating it. On the exact question — does EMA help when the metric is
+a coordinate error against a known target — the literature offers convention,
+not measurement.
+
+Hence **dual logging**: every validation epoch scores the same trajectory from
+both weight sets, `val_gen_*` (EMA) and `val_gen_*_live` (raw). EMA never
+touches the gradients, so the live reading of an EMA run *is* the no-EMA result
+— the comparison is free inside every run, and only the decay **length** needs
+separate arms (`c4-ema-short` 0.99, base 0.999, `c5-ema-long` 0.9999). That
+choice of axis follows EDM2 (arXiv:2312.02696), which finds *"the optimal EMA
+length differs considerably between the configs"* and moves down as learning
+rate and capacity rise — we run at lr 1e-3, so a shorter average is the
+plausible direction.
+
+One reason to expect we need selection where Palette did not: they report *"We
+do not find over fitting to be an issue"* at ImageNet scale with 1M steps at
+batch 1024. This corpus is 4060 training buildings against an 8 M-parameter
+model, where overfitting is far more plausible.
+
+## 9. The open confound
 
 The dataset issue recorded in the mesh-v3 analysis gates this branch exactly as
 it gates scaffold masking and BPT block indexing in section 4 of the scan: an
@@ -203,7 +333,7 @@ than either of those, not a smaller one, so it inherits that gate rather than
 escaping it. Every number this branch produces before the corpus is settled is a
 plumbing check, not a result — including the smoke numbers quoted in section 4.
 
-## 7. Two things worth watching from epoch 1
+## 10. Things worth watching from epoch 1
 
 - **`val_bin_acc_t3`** on the b6/b7 pair. Plan D11 argues that coordinate bins
   are an *ordinal* alphabet, unlike the Levi branch's nominal class labels, and
@@ -214,3 +344,17 @@ plumbing check, not a result — including the smoke numbers quoted in section 4
 - **`n_verts` against `n_faces`.** A sample with a plausible chamfer and three
   times the vertices it should have is a welding failure, not a geometry
   failure, and chamfer alone will not distinguish them.
+- **`val_gen_n_faces` against `val_gen_n_faces_target`.** Face count is now
+  genuinely predicted rather than read off the input (section 4), so this is the
+  first place a presence channel that has collapsed to all-absent — or that
+  over-fires across the whole slot budget — becomes visible. An untrained model
+  marks ~107 of 200 slots absent and lands ~37 faces against a median target of
+  20; convergence should close that, and if it does not, `presence_weight` is
+  the knob and it is already calibrated per regime (section 7).
+- **`val_gen_coord_mse` against `val_gen_coord_mse_live`.** The EMA question
+  from section 8, answered per arm at no extra training cost. If the two rank
+  a1-a4 identically, the confound is closed cheaply; if they do not, that is a
+  result the paired-diffusion literature does not report.
+- **A discontinuity in the monitor around epoch 8.** `ema_start_step: 1000` is
+  ~8 epochs at batch 32, and before it `generate` uses the live weights. The
+  jump is expected, not a bug.
