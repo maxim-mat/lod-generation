@@ -121,3 +121,28 @@ def test_collate_pads_to_multiple_of_eight_and_sets_presence():
     assert torch.allclose(out["x"][0, :9, 5:], torch.zeros(9, 11))
     # Condition padded independently, also to a multiple of 8.
     assert out["cond"].shape == (2, 10, 8)
+
+
+def test_bins_padding_describes_the_same_point_as_the_coordinate_padding():
+    """Unused slots must look the same whichever channel an arm reads.
+
+    `x` pads to 0.0 (the box centre) and `x_bins` used to pad to bin 0 (a box
+    corner), so `state: onehot` and `state: bins` -- which build their state
+    from `x_bins` -- marked unused slots somewhere completely different from
+    the continuous arms. Harmless while those slots were masked out of the
+    model; they are DETR no-object slots now, so their content is real input.
+    """
+    from src.dataset.mesh_dataset import dequantize, quantize
+
+    items = [{"x": torch.zeros(3, 10), "cond": torch.zeros(2, 10), "id": "a",
+              "center": torch.zeros(3), "scale": torch.ones(3),
+              "x_bins": torch.full((3, 9), 64, dtype=torch.long)}]
+    items[0]["x"][:, 9] = 0.5
+    out = mesh_set_collate_fn(items, width=16, num_bins=NUM_BINS)
+
+    pad = ~out["x_mask"][0]
+    pad_coord = float(out["x"][0, 0][pad][0])
+    pad_bin = int(out["x_bins"][0, 0][pad][0])
+    assert pad_bin == int(quantize(np.zeros((1, 3)), NUM_BINS)[0, 0])
+    assert float(dequantize(np.array([[pad_bin] * 3]), NUM_BINS)[0, 0]) == \
+        pytest.approx(pad_coord, abs=1.0 / (NUM_BINS - 1))

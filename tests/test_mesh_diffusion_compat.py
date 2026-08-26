@@ -210,3 +210,13 @@ def test_shipped_configs_equalise_presence_weight():
             f"needs {want:.3f} for init parity")
         checked += 1
     assert checked >= 13
+
+
+def test_a_zero_sized_monitor_is_rejected():
+    """`n_val_gen: 0` would not disable the monitor -- it would log nothing, and
+    `EarlyStopping(strict=True)` raises on a missing metric, so the run dies on
+    the first validation epoch instead."""
+    with pytest.raises(ValueError, match="n_val_gen"):
+        validate_combination(_cfg(n_val_gen=0))
+    with pytest.raises(ValueError, match="gen_eval_steps"):
+        validate_combination(_cfg(gen_eval_steps=0))

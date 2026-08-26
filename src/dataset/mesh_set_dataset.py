@@ -243,7 +243,8 @@ def _pad_stack(seqs, width, fill_coord=0.0):
     return out.permute(0, 2, 1).contiguous(), mask
 
 
-def mesh_set_collate_fn(batch, multiple_of=8, width=None, jitter_to=None):
+def mesh_set_collate_fn(batch, multiple_of=8, width=None, jitter_to=None,
+                        num_bins=NUM_BINS):
     """Right-pad a batch of face sets to a common, U-Net-divisible width.
 
     The slots past a building's face count are NOT masked out of the model --
@@ -268,6 +269,8 @@ def mesh_set_collate_fn(batch, multiple_of=8, width=None, jitter_to=None):
         width: exact slot budget. Must be >= the batch's own requirement.
         jitter_to: sample a budget uniformly in ``[base, jitter_to]``. Ignored
             when `width` is given.
+        num_bins: only used to pad `x_bins` to the same point the float
+            channels are padded to. Must match the dataset's.
 
     Returns:
         dict: channels-first tensors plus boolean masks (True = real face).
@@ -300,7 +303,15 @@ def mesh_set_collate_fn(batch, multiple_of=8, width=None, jitter_to=None):
         out[key] = torch.stack([item[key] for item in batch])
     if "x_bins" in batch[0]:
         w = x.shape[-1]
-        bins = torch.zeros((len(batch), w, 9), dtype=torch.long)
+        # Padded to the BIN of the coordinate fill, not to bin 0. Left at 0 the
+        # two channels described different points at unused slots -- 0.0 is the
+        # box centre, bin 0 is a box corner -- so `state: onehot` and
+        # `state: bins`, which build their state from `x_bins`, marked unused
+        # slots at a corner while the continuous arms marked them at the
+        # centre. Harmless while unused slots were masked out of the model;
+        # they are no-object slots now, so their content is real input.
+        pad_bin = int(quantize(np.zeros((1, 3)), num_bins)[0, 0])
+        bins = torch.full((len(batch), w, 9), pad_bin, dtype=torch.long)
         for i, item in enumerate(batch):
             bins[i, : len(item["x_bins"])] = item["x_bins"]
         out["x_bins"] = bins.permute(0, 2, 1).contiguous()

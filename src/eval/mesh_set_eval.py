@@ -166,7 +166,8 @@ def run_generative_monitor(model, dataset, indices, cfg, seed=1234, scaffold=Non
         for start in range(0, len(indices), d.eval_batch_size):
             chunk = indices[start:start + d.eval_batch_size]
             batch = mesh_set_collate_fn([dataset[int(i)] for i in chunk],
-                                        multiple_of=8, width=d.slot_budget)
+                                        multiple_of=8, width=d.slot_budget,
+                                        num_bins=cfg.mesh_data.num_bins)
             batch = {k: v.to(device) if torch.is_tensor(v) else v
                      for k, v in batch.items()}
             with torch.no_grad():
@@ -212,7 +213,8 @@ def run_mesh_set_eval(model, dataset, indices, cfg, seed=1234, save_dir=None,
             items = [dataset[int(i)] for i in chunk]
             # Fixed slot budget, so the sample is a function of the weights alone
             # and not of who else landed in the chunk.
-            batch = mesh_set_collate_fn(items, multiple_of=8, width=d.slot_budget)
+            batch = mesh_set_collate_fn(items, multiple_of=8, width=d.slot_budget,
+                                    num_bins=num_bins)
             device = next(model.parameters()).device
             batch = {k: v.to(device) if torch.is_tensor(v) else v
                      for k, v in batch.items()}

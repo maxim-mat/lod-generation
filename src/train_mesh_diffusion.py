@@ -38,8 +38,11 @@ class MeshSetDataModule(L.LightningDataModule):
         # a range of no-object counts rather than overfitting to one; val and
         # test pin it, so a score is reproducible and two epochs are
         # comparable. Neither ever hands the model a real-vs-unused mask.
-        self.collate = partial(mesh_set_collate_fn, multiple_of=8, jitter_to=budget)
-        self.collate_eval = partial(mesh_set_collate_fn, multiple_of=8, width=budget)
+        nb = cfg.mesh_data.num_bins
+        self.collate = partial(mesh_set_collate_fn, multiple_of=8,
+                               jitter_to=budget, num_bins=nb)
+        self.collate_eval = partial(mesh_set_collate_fn, multiple_of=8,
+                                    width=budget, num_bins=nb)
         self.dataset = None
         self.train_dataset = self.val_dataset = self.test_dataset = None
 
@@ -103,9 +106,13 @@ def train_mesh_diffusion(cfg: Config):
                 sum(p.numel() for p in model.denoiser.parameters()) / 1e6)
 
     callbacks = create_callbacks(cfg, save_dir)
-    if cfg.mesh_diffusion.every_n_epochs > 0:
-        from src.eval.mesh_set_eval import MeshSetEvalCallback
-        callbacks.append(MeshSetEvalCallback(cfg, save_dir, seed=cfg.seed))
+    # Always attached. `every_n_epochs` gates the GEOMETRIC tier only -- the
+    # callback also carries the per-epoch monitor that early stopping and
+    # checkpointing read, and `EarlyStopping(strict=True)` raises outright when
+    # its metric is missing. Skipping the callback at every_n_epochs: 0 used to
+    # take the monitor with it and kill the run on epoch 1.
+    from src.eval.mesh_set_eval import MeshSetEvalCallback
+    callbacks.append(MeshSetEvalCallback(cfg, save_dir, seed=cfg.seed))
 
     trainer = L.Trainer(
         max_epochs=cfg.training.max_epochs,

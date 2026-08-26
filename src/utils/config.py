@@ -846,6 +846,19 @@ def validate_combination(cfg):
             "limit would not fit the budget. Raise the budget or lower the "
             "filter -- lowering both together is the cheap option.")
 
+    # The per-epoch monitor is what early stopping and checkpointing read, and
+    # `EarlyStopping(strict=True)` raises when its metric is absent -- so a zero
+    # sample count would not disable the monitor, it would kill the run.
+    if d.n_val_gen < 1:
+        raise ValueError(
+            f"mesh_diffusion.n_val_gen must be >= 1, got {d.n_val_gen}. It sizes "
+            "the per-epoch generative monitor, which early stopping and "
+            "checkpointing read; at 0 nothing is logged and the run fails on "
+            "the first validation epoch.")
+    if d.gen_eval_steps < 1:
+        raise ValueError(
+            f"mesh_diffusion.gen_eval_steps must be >= 1, got {d.gen_eval_steps}.")
+
     if d.guidance != 1.0 and d.cond_dropout <= 0:
         raise ValueError(
             "guidance != 1.0 needs cond_dropout > 0: classifier-free guidance "
