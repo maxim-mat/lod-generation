@@ -221,3 +221,15 @@ def test_module_construction_rejects_flow_with_ce():
     with pytest.raises(ValueError, match="incompatible"):
         MeshDiffusionModule(_cfg(state="quantized", loss="ce",
                                  process="flow", target="velocity"))
+
+
+def test_discrete_arm_trains_and_samples():
+    cfg = _cfg(process="d3pm", target="original", loss="ce", state="bins")
+    m = MeshDiffusionModule(cfg)
+    batch = _batch()
+    batch["x_bins"] = torch.randint(0, 128, (2, 9, 16))
+    assert torch.isfinite(m.training_step(batch, 0))
+    m.eval()
+    out = m.generate(batch, n_steps=4)
+    assert out.shape == (2, 10, 16)
+    assert set(out[:, 9].unique().tolist()) <= {0.5, -0.5}

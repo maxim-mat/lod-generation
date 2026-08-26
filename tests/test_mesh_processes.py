@@ -147,3 +147,78 @@ def test_flow_to_x0_is_consistent_with_the_path():
     x_t, noise = p.corrupt(x0, t)
     v = x0 - noise
     assert torch.allclose(p.to_x0(x_t, 0.4, v), x0, atol=1e-5)
+
+
+from src.models.mesh_processes import DiscreteProcess
+
+
+def test_discrete_corrupt_leaves_most_bins_alone_at_low_t():
+    p = DiscreteProcess(noise_steps=1000, num_bins=128)
+    bins = torch.randint(0, 128, (256, 9, 8))
+    noisy, _ = p.corrupt(bins, torch.full((256,), 0.02))
+    assert (noisy == bins).float().mean().item() > 0.9
+
+
+@pytest.mark.parametrize("transition", ["uniform", "gaussian"])
+def test_discrete_terminal_marginal_is_the_sampler_prior(transition):
+    """Both transitions must end uniform, or the reverse loop starts from a
+    distribution the forward process never produces. For `gaussian` this is the
+    (1 - alpha_bar)^2 mixture weight doing its job, and it is the single
+    easiest thing to get wrong in that transition."""
+    p = DiscreteProcess(noise_steps=1000, num_bins=32, transition=transition)
+    bins = torch.zeros(8192, 9, 4, dtype=torch.long)
+    noisy, _ = p.corrupt(bins, torch.ones(8192))
+    counts = torch.bincount(noisy.reshape(-1), minlength=32).float()
+    assert counts.std().item() / counts.mean().item() < 0.15
+
+
+def test_gaussian_transition_moves_bins_locally_mid_trajectory():
+    """The whole reason the gaussian transition exists: at moderate noise a
+    coordinate should land NEAR where it was, not anywhere on the grid."""
+    torch.manual_seed(0)
+    uni = DiscreteProcess(noise_steps=1000, num_bins=128, transition="uniform")
+    gau = DiscreteProcess(noise_steps=1000, num_bins=128, transition="gaussian",
+                          sigma_max=16.0)
+    bins = torch.full((4096, 9, 4), 64, dtype=torch.long)
+    t = torch.full((4096,), 0.4)
+    d_uni = (uni.corrupt(bins, t)[0] - 64).abs().float().mean().item()
+    d_gau = (gau.corrupt(bins, t)[0] - 64).abs().float().mean().item()
+    assert d_gau < 0.5 * d_uni
+
+
+def test_discrete_corrupt_stays_in_range():
+    p = DiscreteProcess(noise_steps=100, num_bins=128)
+    noisy, _ = p.corrupt(torch.randint(0, 128, (32, 9, 8)), torch.rand(32))
+    assert noisy.min() >= 0 and noisy.max() < 128
+
+
+def test_discrete_prior_is_uniform():
+    p = DiscreteProcess(noise_steps=100, num_bins=128)
+    x = p.prior((4096, 9, 8), torch.device("cpu"))
+    counts = torch.bincount(x.reshape(-1), minlength=128).float()
+    assert counts.std().item() / counts.mean().item() < 0.1
+
+
+def test_discrete_oracle_reverse_recovers_the_bins():
+    torch.manual_seed(0)
+    p = DiscreteProcess(noise_steps=1000, num_bins=32)
+    bins = torch.randint(0, 32, (4, 9, 8))
+    presence = torch.ones(4, 8)
+
+    def oracle(x_t, t):
+        logits = torch.full((4, 9, 32, 8), -10.0)
+        logits.scatter_(2, bins.unsqueeze(2), 10.0)
+        return logits, torch.full((4, 8), 10.0)
+
+    out = p.sample(oracle, (4, 9, 8), torch.device("cpu"), n_steps=50)
+    agree = (out[0] == bins).float().mean().item()
+    assert agree > 0.95
+
+
+def test_discrete_sample_returns_bins_and_presence():
+    p = DiscreteProcess(noise_steps=100, num_bins=32)
+    out = p.sample(lambda x, t: (torch.zeros(2, 9, 32, 8), torch.zeros(2, 8)),
+                   (2, 9, 8), torch.device("cpu"), n_steps=5)
+    bins, presence = out
+    assert bins.shape == (2, 9, 8) and bins.dtype == torch.long
+    assert presence.shape == (2, 8)

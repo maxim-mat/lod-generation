@@ -164,6 +164,22 @@ class MeshDiffusionModule(L.LightningModule):
         out[:, 9] = torch.where(presence_logits > 0, 0.5, -0.5)
         return out
 
+    def _model_input(self, x_t):
+        """The process's state as something a denoiser can consume.
+
+        Only `bins` needs this: its state is int64 indices, and the network
+        reads the same [B, 10, F] float layout every other arm does. Presence
+        is left at 0 -- at input time it is unknown, and the model predicts it.
+        """
+        if self.state != "bins":
+            return x_t
+        from src.dataset.mesh_dataset import dequantize
+        coords = torch.from_numpy(
+            dequantize(x_t.detach().cpu().numpy(), self.num_bins)).float()
+        out = torch.zeros(x_t.shape[0], 10, x_t.shape[-1], device=x_t.device)
+        out[:, :9] = coords.to(x_t.device)
+        return out
+
     # -- plumbing ---------------------------------------------------------
 
     def _denoise(self, x, t, cond, mask, cond_mask):
@@ -196,7 +212,8 @@ class MeshDiffusionModule(L.LightningModule):
 
         t = self.process.sample_t(x0.shape[0], x0.device)
         x_t, aux = self.process.corrupt(x0, t)
-        pred = self._denoise(x_t, t, cond, batch["x_mask"], cond_mask)
+        pred = self._denoise(self._model_input(x_t), t, cond,
+                             batch["x_mask"], cond_mask)
         if self.categorical:
             # The CE label is `x_bins`, which the loss reads off the batch --
             # there is no regression target to build here.
@@ -207,6 +224,22 @@ class MeshDiffusionModule(L.LightningModule):
 
         self.log(f"{stage}_loss", loss, on_step=(stage == "train"),
                  on_epoch=True, prog_bar=True, batch_size=x0.shape[0])
+        if self.state == "bins":
+            with torch.no_grad():
+                logits = pred[0]
+                correct = (logits.argmax(dim=2) == x0).float()
+                m = batch["x_mask"][:, None, :].float()
+                acc = (correct * m).sum() / (m.sum() * 9).clamp(min=1)
+                # Bucketed by noise level, because the aggregate hides exactly
+                # what D11 is about: heads that are accurate at low t and carry
+                # nothing at high t still average to a healthy-looking number,
+                # and the uniform-vs-gaussian transition A/B is precisely a
+                # question about the high-noise buckets.
+                bucket = int(min(float(t.mean()), 0.999) * 4)
+            self.log(f"{stage}_bin_acc", acc, on_epoch=True,
+                     batch_size=x0.shape[0])
+            self.log(f"{stage}_bin_acc_t{bucket}", acc, on_epoch=True,
+                     batch_size=x0.shape[0])
         # Coordinate error in bins, logged separately from the objective:
         # under target=noise the loss is in epsilon units and is not comparable
         # across timesteps, so it says nothing about geometry on its own.
@@ -279,7 +312,7 @@ class MeshDiffusionModule(L.LightningModule):
         shape = self._state_shape(batch)
 
         def denoiser_fn(x_t, t):
-            out = self._denoise(x_t, t, cond, mask, cond_mask)
+            out = self._denoise(self._model_input(x_t), t, cond, mask, cond_mask)
             if self.guidance != 1.0:
                 # Classifier-free guidance (Ho & Salimans, arXiv:2207.12598):
                 # push away from the unconditional prediction. Two forward
@@ -305,6 +338,11 @@ class MeshDiffusionModule(L.LightningModule):
                                   callback=scaffold)
         if not self.categorical:
             return out
+        if self.state == "bins":
+            # A categorical chain carries its own state out: bins are already
+            # on the grid, and the presence logits ride alongside them.
+            bins, presence_logits = out
+            return self._from_state(None, bins, presence_logits)
         # The trajectory's last x0 *prediction* is the answer, not the process's
         # own final state: that state is the same x0 re-noised by one schedule
         # rung, which would drift it straight back off the grid the clamp just

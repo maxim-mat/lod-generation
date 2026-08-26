@@ -13,8 +13,11 @@ continuous and does not.
 import logging
 from abc import ABC, abstractmethod
 
+import numpy as np
 import torch
 import torch.nn as nn
+
+from src.models.noise import cosine_beta_schedule_discrete
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +235,165 @@ class FlowMatchingProcess(BaseProcess):
         direction to a denoising trajectory."""
         edges = torch.linspace(0.0, 1.0, n_steps + 1)
         return list(zip(edges[:-1].tolist(), edges[1:].tolist()))
+
+
+class DiscreteProcess(BaseProcess):
+    """D3PM over coordinate bins (Austin et al., arXiv:2107.03006), x0-parameterised.
+
+    Nine independent categorical chains per face -- one per coordinate channel
+    -- plus a two-state chain for presence.
+
+    Two transitions, and the choice is the arm (plan D11):
+
+      * ``uniform`` -- a corrupted bin is redrawn uniformly. The standard
+        text/graph setting, and the right one when the alphabet is *nominal*.
+      * ``gaussian`` -- a corrupted bin moves to a nearby one, with a
+        discretized-Gaussian kernel whose width grows along the schedule
+        (their section 3.2, ``D3PM-gauss``). Coordinate bins are *ordinal*:
+        bin 40 and bin 41 are half a centimetre apart, and a uniform transition
+        discards that structure at every step. This is the better-matched
+        process for quantized geometry and is the default here.
+
+    Why this arm exists at all: bins never leave the grid, so two faces naming
+    the same corner emit byte-identical coordinates and `weld` merges them with
+    no snap. It shares that property with the ``state: onehot`` arm in Task 11;
+    what it does *not* share is the corruption, which is the thing under test.
+
+    Args:
+        noise_steps: schedule resolution.
+        num_bins: alphabet size per coordinate channel.
+        transition: "uniform" or "gaussian".
+        sigma_max: discretized-Gaussian width at t = 1, in bins. Only read
+            under ``transition="gaussian"``. 16 on a 128-bin grid is an eighth
+            of the range, which reaches near-uniform by the end of the schedule
+            while staying local for most of it.
+    """
+
+    def __init__(self, noise_steps=1000, num_bins=128, transition="gaussian",
+                 sigma_max=16.0):
+        super().__init__()
+        if transition not in ("uniform", "gaussian"):
+            raise ValueError(
+                f"transition must be 'uniform' or 'gaussian', got {transition!r}.")
+        self.noise_steps = noise_steps
+        self.num_bins = num_bins
+        self.transition = transition
+        self.sigma_max = sigma_max
+        # One nu per chain, all 1.0: the per-feature exponent exists for the
+        # Levi branch, where nodes and edges corrupt at different rates. Here
+        # every chain is the same kind of variable.
+        betas = cosine_beta_schedule_discrete(noise_steps, [1.0])[:, 0]
+        alpha_bar = np.cumprod(1.0 - betas)
+        self.register_buffer("alpha_bar", torch.tensor(alpha_bar, dtype=torch.float32))
+        # Offsets used by the Gaussian transition, precomputed once.
+        self.register_buffer(
+            "_offsets", torch.arange(-num_bins + 1, num_bins, dtype=torch.float32))
+
+    def _gaussian_offsets(self, t, shape, device):
+        """Signed bin displacements drawn from the discretized Gaussian at t.
+
+        Width interpolates from ~0 at t = 0 to `sigma_max` at t = 1, so a
+        coordinate wanders locally early and reaches the whole grid late. The
+        draw is truncated by the reflect-free clamp in `corrupt`, which is the
+        one place the boundary is handled.
+        """
+        a = self.alpha_bar[self.to_index(t)]
+        sigma = ((1.0 - a) * self.sigma_max).reshape(-1, *([1] * (len(shape) - 1)))
+        return torch.round(torch.randn(shape, device=device) * sigma).long()
+
+    def to_index(self, t):
+        idx = (t.clamp(0.0, 1.0) * (len(self.alpha_bar) - 1)).round().long()
+        return idx.clamp(0, len(self.alpha_bar) - 1)
+
+    def _keep_prob(self, t, shape):
+        """P(a bin survives to time t) under the uniform transition."""
+        a = self.alpha_bar[self.to_index(t)]
+        return a.reshape(-1, *([1] * (len(shape) - 1)))
+
+    def sample_t(self, n, device):
+        return torch.rand(n, device=device)
+
+    def corrupt(self, x0, t):
+        """``x0 [B,9,F]`` int64 bins -> ``(x_t [B,9,F], None)``.
+
+        Sampled from the marginal q(x_t | x0) directly rather than by walking
+        the chain. Under `uniform` the marginal is exactly "keep with
+        probability alpha_bar, else redraw uniformly", which is O(1) in t.
+        Under `gaussian` it is a single displacement drawn at the width the
+        schedule has reached, which is the marginal of the composed kernel up
+        to the boundary clamp -- exact in the interior, and the interior is
+        where every coordinate that matters lives.
+        """
+        if self.transition == "uniform":
+            keep = self._keep_prob(t, x0.shape)
+            redraw = torch.randint_like(x0, 0, self.num_bins)
+            stay = torch.rand(x0.shape, device=x0.device) < keep
+            return torch.where(stay, x0, redraw), None
+
+        # Three-way mixture, and the weights are not arbitrary: the terminal
+        # distribution has to BE the sampler's prior, or the reverse loop
+        # starts somewhere the forward process never reaches. `p_uniform` is
+        # (1 - alpha_bar)^2 so it goes to 1 exactly as alpha_bar goes to 0,
+        # which makes the t = 1 marginal uniform and `prior` correct for both
+        # transitions. The local component peaks in the middle of the
+        # trajectory -- which is where ordinal structure is worth having, since
+        # that is the stretch on which the model learns to refine a coordinate
+        # rather than to invent one.
+        a = self._keep_prob(t, x0.shape)
+        p_uniform = (1.0 - a) ** 2
+        u = torch.rand(x0.shape, device=x0.device)
+        shifted = (x0 + self._gaussian_offsets(t, x0.shape, x0.device))
+        # Clamp, not wrap: bin 0 and bin 127 are opposite ends of a building,
+        # not neighbours, and a wrapping kernel would teach the model that the
+        # floor is adjacent to the roof.
+        shifted = shifted.clamp(0, self.num_bins - 1)
+        uniform = torch.randint_like(x0, 0, self.num_bins)
+        out = torch.where(u < a, x0,
+                          torch.where(u < a + p_uniform, uniform, shifted))
+        return out, None
+
+    def target_for(self, x0, x_t, t, aux):
+        return x0
+
+    def step(self, x_t, t, t_prev, model_out):
+        """Ancestral step: sample x0 from the predicted posterior, re-noise to
+        ``t_prev``.
+
+        The exact reverse posterior for a uniform chain would weight q(s|t,x0)
+        against the predicted p(x0); this samples x0 first and re-noises, which
+        is the same expectation with one extra sampling step and none of the
+        [B, F, K, K] intermediate that the exact form needs at K = 128. ponytail:
+        exact posterior via `compute_batched_over0_posterior_distribution` if
+        the sample quality turns out to be limited by this and not by the model.
+        """
+        logits, presence_logits = model_out
+        b, c, k, f = logits.shape
+        probs = torch.softmax(logits, dim=2).permute(0, 1, 3, 2).reshape(-1, k)
+        x0 = torch.multinomial(probs, 1).reshape(b, c, f)
+        if t_prev <= 0.0:
+            return x0, presence_logits
+        t_batch = torch.full((b,), t_prev, device=logits.device)
+        x_prev, _ = self.corrupt(x0, t_batch)
+        return x_prev, presence_logits
+
+    def prior(self, shape, device):
+        return torch.randint(0, self.num_bins, shape, device=device)
+
+    def sample(self, denoiser_fn, shape, device, n_steps=50, callback=None):
+        """As `BaseProcess.sample`, but the state is integer bins and the last
+        step's presence logits are carried out alongside them."""
+        x = self.prior(shape, device)
+        presence = None
+        for t, t_prev in self.timesteps(n_steps):
+            t_batch = torch.full((shape[0],), t, device=device)
+            with torch.no_grad():
+                out = denoiser_fn(x, t_batch)
+            x, presence = self.step(x, t, t_prev, out)
+            if callback is not None:
+                replaced = callback(t_prev, x)
+                if replaced is not None:
+                    x = replaced
+        return x, presence
 
 
 def create_process(cfg):
