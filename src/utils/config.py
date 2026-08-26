@@ -593,13 +593,19 @@ def validate_combination(cfg):
         raise ValueError(
             f"mesh_diffusion.pos_embed must be 'sinusoidal' or 'none', got {d.pos_embed!r}.")
 
-    # D4. Slot-to-slot MSE asks the model which output slot a face belongs in.
-    # Without positional information it cannot answer, and without a canonical
-    # order there is no right answer to give. Either fix works; neither alone.
-    if d.loss == "mse" and not (sorted_order and has_pe):
+    # D4. A slot-to-slot loss asks the model which output slot a face belongs
+    # in. Without positional information it cannot answer, and without a
+    # canonical order there is no right answer to give. Either fix works;
+    # neither alone.
+    #
+    # This covers `ce` as well as `mse`: a categorical readout is still scored
+    # slot against slot, so swapping the regression head for a softmax changes
+    # nothing about the permutation problem. `hungarian` is the only loss that
+    # escapes it, because it solves for the correspondence first.
+    if d.loss in ("mse", "ce") and not (sorted_order and has_pe):
         raise ValueError(
-            "loss: mse requires order: morton AND pos_embed: sinusoidal. With "
-            f"order={d.order!r}, pos_embed={d.pos_embed!r} the target is a "
+            f"loss: {d.loss} requires order: morton AND pos_embed: sinusoidal. "
+            f"With order={d.order!r}, pos_embed={d.pos_embed!r} the target is a "
             "permutation the model cannot see, which is unlearnable rather "
             "than merely hard. Use loss: hungarian instead.")
     if not sorted_order and has_pe:

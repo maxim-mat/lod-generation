@@ -114,3 +114,18 @@ def test_every_shipped_diffusion_config_is_a_legal_arm():
         cfg = OmegaConf.merge(OmegaConf.structured(Config),
                               OmegaConf.load(path))
         validate_combination(cfg)
+
+
+@pytest.mark.parametrize("order,pos_embed", [("morton", "none"), ("none", "none")])
+def test_ce_needs_an_order_and_a_positional_encoding(order, pos_embed):
+    """`loss: ce` follows `loss: mse` in the compatibility matrix.
+
+    A categorical readout is still scored slot against slot, so swapping the
+    regression head for a softmax does nothing about the permutation the model
+    cannot see. Missed once already: the D4 gate was keyed on `mse` alone,
+    which let every unordered categorical arm through.
+    """
+    with pytest.raises(ValueError, match="hungarian"):
+        validate_combination(_cfg(loss="ce", state="quantized", target="original",
+                                  order=order, pos_embed=pos_embed,
+                                  denoiser="transformer"))
