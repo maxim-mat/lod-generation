@@ -34,15 +34,45 @@ def test_unordered_with_pos_embed_raises():
             _cfg(order="none", pos_embed="sinusoidal", loss="hungarian"))
 
 
-def test_no_pos_embed_with_mse_raises():
+def test_no_pos_embed_with_mse_raises_for_the_transformer():
     with pytest.raises(ValueError, match="hungarian"):
-        validate_combination(_cfg(order="morton", pos_embed="none", loss="mse"))
+        validate_combination(_cfg(order="morton", pos_embed="none", loss="mse",
+                                  denoiser="transformer"))
 
 
-def test_unet_requires_sorted_order():
-    with pytest.raises(ValueError, match="unet"):
-        validate_combination(_cfg(denoiser="unet", order="none",
-                                  pos_embed="none", loss="hungarian"))
+def test_unet_with_file_order_warns_but_passes(caplog):
+    """D5, relaxed. The convolution needs adjacent slots to be spatially
+    adjacent, and file order on this corpus already is: 72.4% of consecutive
+    faces share a corner against 40.9% for a random permutation, because
+    CityJSON groups faces by surface. What it lacks is canonicality -- it is a
+    property of the writer, not the geometry -- so this warns rather than
+    passing silently. It is the a4-unet-hungarian arm.
+    """
+    validate_combination(_cfg(denoiser="unet", order="none",
+                              pos_embed="none", loss="hungarian"))
+    assert any("not" in r.getMessage() and "canonical" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_pos_embed_is_flagged_as_inert_for_the_unet(caplog):
+    """`ConditionalMeshUNet` has no positional input; a convolution is
+    translation-equivariant along the face axis. The knob stays legal so a1 and
+    a2 differ on `denoiser` alone, but a logged config must not imply it did
+    something."""
+    validate_combination(_cfg(denoiser="unet", order="morton",
+                              pos_embed="sinusoidal", loss="mse"))
+    assert any("ignored under denoiser: unet" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_unet_may_drop_pos_embed_under_mse():
+    """The pos_embed half of D4 binds the transformer only -- requiring it of
+    the U-Net would be requiring a no-op."""
+    validate_combination(_cfg(denoiser="unet", order="morton",
+                              pos_embed="none", loss="mse"))
+    with pytest.raises(ValueError, match="pos_embed: sinusoidal"):
+        validate_combination(_cfg(denoiser="transformer", order="morton",
+                                  pos_embed="none", loss="mse"))
 
 
 def test_flow_requires_velocity_target():

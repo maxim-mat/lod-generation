@@ -267,3 +267,18 @@ def test_scaffold_enabled_eval_path_runs():
     m = MeshDiffusionModule(cfg).eval()
     out = run_mesh_set_eval(m, _Ds(), [0, 1], cfg, seed=0)
     assert out and "chamfer_m" in out
+
+
+def test_unet_hungarian_arm_trains():
+    """a4: conv U-Net over file order with a set loss. Legal since D5 was
+    relaxed -- file order carries most of the locality the convolution needs
+    (72.4% of consecutive faces share a corner on this corpus)."""
+    m = MeshDiffusionModule(_cfg(order="none", pos_embed="none",
+                                 loss="hungarian", denoiser="unet"))
+    loss = m.training_step(_batch(), 0)
+    assert torch.isfinite(loss)
+    loss.backward()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0
+               for p in m.parameters())
+    m.eval()
+    assert m.generate(_batch(), n_steps=3).shape == (2, 10, 16)

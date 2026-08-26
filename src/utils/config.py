@@ -612,36 +612,69 @@ def validate_combination(cfg):
         raise ValueError(
             f"mesh_diffusion.pos_embed must be 'sinusoidal' or 'none', got {d.pos_embed!r}.")
 
-    # D4. A slot-to-slot loss asks the model which output slot a face belongs
-    # in. Without positional information it cannot answer, and without a
-    # canonical order there is no right answer to give. Either fix works;
-    # neither alone.
-    #
-    # This covers `ce` as well as `mse`: a categorical readout is still scored
-    # slot against slot, so swapping the regression head for a softmax changes
-    # nothing about the permutation problem. `hungarian` is the only loss that
-    # escapes it, because it solves for the correspondence first.
-    if d.loss in ("mse", "ce") and not (sorted_order and has_pe):
-        raise ValueError(
-            f"loss: {d.loss} requires order: morton AND pos_embed: sinusoidal. "
-            f"With order={d.order!r}, pos_embed={d.pos_embed!r} the target is a "
-            "permutation the model cannot see, which is unlearnable rather "
-            "than merely hard. Use loss: hungarian instead.")
-    if not sorted_order and has_pe:
-        raise ValueError(
-            "pos_embed: sinusoidal with order: none embeds file order, which "
-            "carries no geometric information. Set pos_embed: none.")
-
-    # D5. Stride-2 convolution along the face axis is only meaningful if
-    # adjacent slots are spatially adjacent.
-    if d.denoiser == "unet" and not sorted_order:
-        raise ValueError(
-            "denoiser: unet requires order: morton -- its downsampling convolves "
-            "along the face axis, which is arbitrary under order: none. Use "
-            "denoiser: transformer for unordered sets.")
     if d.denoiser not in ("unet", "transformer"):
         raise ValueError(
             f"mesh_diffusion.denoiser must be 'unet' or 'transformer', got {d.denoiser!r}.")
+
+    # D4. A slot-to-slot loss needs a canonical face order: without one the
+    # target permutation is an artifact of the source file rather than a
+    # function of the geometry, and at high noise -- where x_t carries no
+    # content to denoise -- the model has no way to decide what belongs where.
+    #
+    # Covers `ce` as well as `mse`: a categorical readout is still scored slot
+    # against slot, so swapping the regression head for a softmax changes
+    # nothing. `hungarian` is the only loss that escapes it, because it solves
+    # for the correspondence first.
+    #
+    # The positional-encoding half of this rule applies to the TRANSFORMER
+    # only. `ConditionalMeshUNet` has no positional input at all -- a
+    # convolution is translation-equivariant along the face axis -- so
+    # requiring pos_embed there would be requiring a no-op.
+    if d.loss in ("mse", "ce"):
+        if not sorted_order:
+            raise ValueError(
+                f"loss: {d.loss} requires order: morton. Under order: none the "
+                "target permutation follows the source file rather than the "
+                "geometry, which is unlearnable rather than merely hard. Use "
+                "loss: hungarian instead.")
+        if d.denoiser == "transformer" and not has_pe:
+            raise ValueError(
+                f"loss: {d.loss} with denoiser: transformer requires "
+                "pos_embed: sinusoidal. Without it the model is permutation "
+                "equivariant and cannot tell one output slot from another, so "
+                "a slot-to-slot target is unlearnable. Use loss: hungarian.")
+    if not sorted_order and has_pe:
+        raise ValueError(
+            "pos_embed: sinusoidal with order: none embeds file order, which "
+            "is an artifact of the writer rather than a function of the "
+            "geometry. Set pos_embed: none.")
+
+    if d.denoiser == "unet" and has_pe:
+        logger.warning(
+            "pos_embed: sinusoidal is ignored under denoiser: unet -- the "
+            "U-Net has no positional input. Kept legal so the a1/a2 arms "
+            "differ on `denoiser` alone, but do not read it as an active axis.")
+
+    # D5, relaxed from a hard rejection. The convolution needs adjacent slots
+    # to be spatially adjacent -- but measured on The Hague/mini_cleaner LOD2,
+    # file order already is: 72.4% of consecutive faces share a corner and the
+    # mean consecutive-centroid step is 0.362, against Morton's 78.5% / 0.316
+    # and a random permutation's 40.9% / 0.513. CityJSON groups faces by
+    # surface, so the triangles of one wall arrive together. The original rule
+    # assumed file order was arbitrary; it is not, and forbidding the pairing
+    # foreclosed an arm rather than preventing a mistake.
+    #
+    # What file order still lacks is *canonicality*: it is a property of the
+    # writer, not of the geometry, so the same building re-exported can permute.
+    # That costs consistency, which is why this warns rather than passing
+    # silently -- and it is exactly what the a1-vs-a4 comparison measures.
+    if d.denoiser == "unet" and not sorted_order:
+        logger.warning(
+            "denoiser: unet with order: none convolves along the file's face "
+            "order. That order carries real locality on this corpus (72.4%% of "
+            "consecutive faces share a corner, against 40.9%% for a random "
+            "permutation), so this is a legitimate arm -- but file order is not "
+            "canonical, so the same mesh re-exported may serialise differently.")
 
     allowed_targets = {"ddpm": {"noise", "original"},
                        "flow": {"velocity"},

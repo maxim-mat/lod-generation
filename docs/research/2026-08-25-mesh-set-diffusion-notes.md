@@ -117,6 +117,43 @@ classifier-free guidance on). A wall-clock claim that omits it is not a claim.
 | mesh-v4-scratch-sin | | | | | | | | ~1800 |
 | mesh-diff (stage-3 winner) | | | | | | | | 50 |
 
+## 5b. File order already carries most of the locality the U-Net needs
+
+The plan excluded a conv U-Net over unordered faces (its D5) on the grounds
+that "with `order: none` the axis is arbitrary and the convolution is noise".
+Measured on 150 `mini_cleaner` LOD2 buildings, normalized to the unit box, that
+premise is false:
+
+| face order | mean consecutive-centroid step | consecutive pairs sharing a corner |
+|---|---|---|
+| file order | 0.3618 | 72.4% |
+| Morton | 0.3161 | 78.5% |
+| random permutation | 0.5125 | 40.9% |
+
+CityJSON groups faces by surface, so the triangles of one wall arrive
+consecutively. File order sits far closer to Morton than to a random
+permutation; the sort buys ~13% on the step and ~6 points of adjacency, not the
+difference between signal and noise.
+
+The image analogy that prompted this is worth stating precisely, because it is
+mostly right. An image *does* have a canonical ordering — row-major on a grid —
+it is simply free, because the array index is a bijection with spatial
+position. A face set has no such structure, so any 1-D convolution over it
+requires serialising a set, and that serialisation is a choice. But the choice
+already made by the file is not arbitrary.
+
+That separates two properties the plan conflated. **Locality** — do adjacent
+indices mean adjacent geometry? File order: yes. **Canonicality** — is the order
+a function of the geometry rather than of the writer? File order: no. The
+convolution needs the first; only the slot-to-slot *loss* needs the second.
+
+Consequences, all shipped: D5 is now a warning rather than a rejection;
+`a4-unet-hungarian` joins stage 1 and prices canonicality directly against a1;
+and the `pos_embed` half of D4 was narrowed to the transformer, since
+`ConditionalMeshUNet` has no positional input at all — a convolution is
+translation-equivariant along the face axis, so requiring `pos_embed` of it was
+requiring a no-op. Setting it under `denoiser: unet` now warns.
+
 ## 5a. Two things the grid design gets wrong, and what was done about them
 
 Recorded because both are properties of the *experiment*, not of the model, and

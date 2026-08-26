@@ -1,0 +1,22 @@
+# Stage 1, arm 4: conv U-Net over the file's own face order, set loss.
+#
+# The plan originally excluded this cell on the grounds that a convolution
+# needs a sorted order and file order is arbitrary. Measured on The Hague/
+# mini_cleaner LOD2, that premise is wrong: CityJSON groups faces by surface,
+# so 72.4% of consecutive faces already share a corner (Morton 78.5%, random
+# permutation 40.9%), and the mean consecutive-centroid step is 0.362 against
+# Morton's 0.316. File order carries most of the locality the convolution
+# needs.
+#
+# What it does NOT carry is canonicality -- the order is a property of whoever
+# wrote the file, not of the geometry, so the same building re-exported can
+# serialise differently. Against a1 (identical but Morton-sorted, slot-to-slot
+# MSE) this arm prices exactly that: what the sort buys once locality is
+# already present. A large a1 win means canonicality matters; a small one means
+# the Morton sort is mostly redundant with how the data was already stored.
+#
+# presence_weight stays at the 1.0 default: hungarian_loss delegates to
+# masked_mse_loss, and under target: noise both terms start at 1.0 already.
+mesh_diffusion: {order: none, pos_embed: none, loss: hungarian,
+                 denoiser: unet, state: continuous, process: ddpm, target: noise}
+logging: {run_name: mesh-diff-a4-unet-hungarian}

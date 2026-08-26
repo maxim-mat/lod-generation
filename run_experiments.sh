@@ -36,6 +36,7 @@ DIFF_STAGE1=(
   configs/mesh-diff-a1-unet-mse.yaml
   configs/mesh-diff-a2-tf-mse.yaml
   configs/mesh-diff-a3-tf-hungarian.yaml
+  configs/mesh-diff-a4-unet-hungarian.yaml
 )
 # Cheapest first inside each stage, so a config-level mistake surfaces before
 # the long runs. Within stage 2 that means the continuous arms before the
