@@ -88,3 +88,56 @@ def test_x0_target_arm_also_trains():
 def test_illegal_arm_is_rejected_at_construction():
     with pytest.raises(ValueError, match="hungarian"):
         MeshDiffusionModule(_cfg(order="none", pos_embed="none", loss="mse"))
+
+
+def test_run_mesh_set_eval_returns_paired_metrics(tmp_path):
+    """The eval must produce metrics from a model that has learned nothing.
+
+    A random model's chamfer is meaningless; that it is a finite float, keyed
+    the way the AR branch keys its metrics, is not.
+    """
+    import numpy as np
+    from src.eval.mesh_set_eval import run_mesh_set_eval
+
+    class _FakeDataset:
+        """Two identical cubes, in the shape MeshSetDataset returns."""
+
+        def __init__(self):
+            v = np.array([[x, y, z] for x in (-0.4, 0.4) for y in (-0.4, 0.4)
+                          for z in (-0.4, 0.4)], dtype=float)
+            f = np.array([[0, 1, 3], [0, 3, 2], [4, 7, 5], [4, 6, 7],
+                          [0, 4, 5], [0, 5, 1], [2, 3, 7], [2, 7, 6],
+                          [0, 2, 6], [0, 6, 4], [1, 5, 7], [1, 7, 3]])
+            self.tri = v[f]
+            self.ids = ["cube0", "cube1"]
+            self.pairs = [((v, f), (v, f))] * 2
+
+        def __len__(self):
+            return 2
+
+        def mesh_pair(self, i):
+            return self.pairs[i]
+
+        def __getitem__(self, i):
+            x = torch.zeros(12, 10)
+            x[:, :9] = torch.from_numpy(self.tri.reshape(12, 9)).float()
+            x[:, 9] = 0.5
+            return {"x": x, "cond": x.clone(), "id": self.ids[i],
+                    "center": torch.zeros(3), "scale": torch.ones(3)}
+
+    m = MeshDiffusionModule(_cfg()).eval()
+    out = run_mesh_set_eval(m, _FakeDataset(), [0, 1], _cfg(),
+                            save_dir=tmp_path, seed=0)
+    assert "chamfer_m" in out and np.isfinite(out["chamfer_m"])
+    assert "n_faces" in out and "gt_chamfer_m" in out
+    assert list(tmp_path.glob("*.obj"))
+
+
+def test_eval_callback_is_gated_by_epoch():
+    from src.eval.mesh_set_eval import MeshSetEvalCallback
+
+    cfg = _cfg()
+    cfg.mesh_diffusion.every_n_epochs = 5
+    cb = MeshSetEvalCallback(cfg, save_dir=None)
+    assert not cb._due(epoch=0) and not cb._due(epoch=3)
+    assert cb._due(epoch=4) and cb._due(epoch=9)

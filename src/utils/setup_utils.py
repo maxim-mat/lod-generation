@@ -165,14 +165,17 @@ def create_callbacks(cfg: Config, save_dir: Path) -> list:
     except Exception:
         pass
 
-    # Generative Eval. Not for either mesh path: it samples unconditionally via
-    # model.sample(), which neither module has, and unconditional distribution
-    # metrics are meaningless when every input has one right answer -- the
-    # VQ-VAE is not even generative, it reconstructs its own input. Gated on
-    # config_set rather than trusting the yaml so a stale file cannot resurrect
-    # a callback that would crash on the first test batch.
+    # Generative Eval. Not for any mesh path: it samples unconditionally via
+    # model.sample(), which none of those modules has, and unconditional
+    # distribution metrics are meaningless when every input has one right
+    # answer -- the VQ-VAE is not even generative, it reconstructs its own
+    # input, and mesh_diffusion samples conditioned on an LOD1 through
+    # MeshSetEvalCallback instead. Gated on config_set rather than trusting the
+    # yaml so a stale file cannot resurrect a callback that would crash on the
+    # first test batch.
     ge_cfg = cfg.generative_eval
-    if ge_cfg.enabled and cfg.config_set not in ("mesh", "mesh_vqvae"):
+    if ge_cfg.enabled and cfg.config_set not in ("mesh", "mesh_vqvae",
+                                                 "mesh_diffusion"):
         from src.eval.callback import GenerativeEvalCallback
         callbacks.append(GenerativeEvalCallback(ge_cfg, save_dir, cfg.seed))
 

@@ -35,7 +35,11 @@ mesh_diffusion:
   target: noise
   noise_steps: 1000
   eval_steps: 10
-  every_n_epochs: 0        # eval callback lands in Task 8
+  every_n_epochs: 1        # the smoke run is allowed to be slow: 20 files
+  n_val: 4
+  n_test: 4
+  eval_batch_size: 4
+  save_samples: 2
 
 training:
   batch_size: 4
