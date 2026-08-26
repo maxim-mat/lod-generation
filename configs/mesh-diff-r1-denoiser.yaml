@@ -1,0 +1,22 @@
+# REVISIT, arm 1: does stage 1's denoiser choice survive the objective change?
+#
+# The grid is greedy: stage 1 ranks (denoiser, loss) under exactly one
+# objective -- continuous / ddpm / epsilon -- and stage 2 then assumes that
+# ranking holds for six other objectives. Nothing guarantees it. The clearest
+# reason to doubt it is state: onehot, where the denoiser sees 1153 input
+# channels instead of 10; a 3-kernel convolution that also mixes neighbouring
+# faces and a 1x1 projection that treats a face as a token have very different
+# inductive biases at that width.
+#
+# This arm flips ONLY the denoiser, under stage 2's winning objective. One run
+# buys the check that stage 1's choice was not an artifact of its objective.
+#
+# Ships at b1's objective and at the transformer (i.e. assuming a1 won stage 1).
+# Before launching: set the objective to stage 2's winner, and set `denoiser`
+# to whichever backbone stage 1 did NOT pick.
+# presence_weight 0.383: parity at init for target: original. Re-derive from
+# the table in MeshDiffusionConfig.presence_weight if you change the objective.
+mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: mse,
+                 denoiser: transformer, state: continuous, process: ddpm,
+                 target: original, presence_weight: 0.383}
+logging: {run_name: mesh-diff-r1-denoiser}

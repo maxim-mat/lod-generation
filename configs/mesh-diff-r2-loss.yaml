@@ -1,0 +1,21 @@
+# REVISIT, arm 2: does stage 1's ordering/loss regime survive the objective
+# change? CONDITIONAL -- see the constraint below before scheduling it.
+#
+# The set regime (unordered faces, permutation-equivariant transformer,
+# Hungarian matching) under stage 2's winning objective, against that winner.
+#
+# ONLY LEGAL WHEN THE STAGE-2 WINNER'S LOSS IS NOT `ce`. A categorical readout
+# is scored slot against slot, so it requires order: morton and pos_embed:
+# sinusoidal (plan D4, enforced by validate_combination) and has no unordered
+# form. If stage 2's winner is b4, b5, b6 or b7, this arm cannot be run at all
+# and the order axis simply does not reach those objectives -- which is a real
+# limitation of the grid, not an oversight to route around. Record it and skip.
+#
+# Ships at b1's objective. Before launching: set the objective to stage 2's
+# winner, having first confirmed its loss is `mse`.
+# presence_weight 0.383: parity at init for target: original. hungarian_loss
+# delegates to masked_mse_loss, so it shares the mse regime exactly.
+mesh_diffusion: {order: none, pos_embed: none, loss: hungarian,
+                 denoiser: transformer, state: continuous, process: ddpm,
+                 target: original, presence_weight: 0.383}
+logging: {run_name: mesh-diff-r2-loss}

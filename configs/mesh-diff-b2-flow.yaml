@@ -1,6 +1,9 @@
 # Stage 2, arm 2: conditional flow matching. Straight paths, no beta schedule,
 # and few-step sampling that degrades gracefully -- which matters because
 # eval_steps IS the eval budget.
+# presence_weight 0.877: parity at init for this arm's regime
+# (target: velocity -> coord 1.0958 vs presence 1.2500). See MeshDiffusionConfig.presence_weight -- a flat 1.0
+# makes arms with different targets/readouts incomparable on face count.
 mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: mse, denoiser: unet,
-                 state: continuous, process: flow, target: velocity}
+                 state: continuous, process: flow, target: velocity, presence_weight: 0.877}
 logging: {run_name: mesh-diff-b2-flow}

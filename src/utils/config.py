@@ -410,6 +410,25 @@ class MeshDiffusionConfig:
     # Weight on the presence channel relative to the nine coordinate channels.
     # Presence decides face count, which the geometric metrics are far more
     # sensitive to than to a fraction of a bin on one vertex.
+    #
+    # NOT comparable across arms at a fixed value. The two terms start at
+    # scales set by the target and the readout, so 1.0 buys wildly different
+    # amounts of pull. Measured at init on The Hague/mini_cleaner, with the
+    # zero-init head predicting 0 and E[x0^2] = 0.0958 over real faces:
+    #
+    #   regime                     coord   presence   p/c    w for parity
+    #   target: noise              1.0000    1.0000   1.000     1.000
+    #   target: original           0.0958    0.2500   2.610     0.383
+    #   target: velocity           1.0958    1.2500   1.141     0.877
+    #   loss: ce             ln128=4.8520  ln2=0.693  0.143     7.000
+    #
+    # Left at 1.0 the b3-vs-b4 control is unreadable: those two arms share a
+    # target and differ only in readout, but would differ by 18x in effective
+    # presence weight -- landing squarely on face count, which is what the
+    # geometric metrics are most sensitive to. Every shipped arm therefore sets
+    # this to its regime's parity value (presence and coordinates on equal
+    # footing at init), and `test_shipped_configs_equalise_presence_weight`
+    # pins that. Re-derive the 0.0958 if the corpus changes.
     presence_weight: float = 1.0
     # Hungarian only: relative weight of presence inside the matching cost.
     match_presence_weight: float = 1.0

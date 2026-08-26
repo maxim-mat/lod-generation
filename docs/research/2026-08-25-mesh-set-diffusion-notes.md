@@ -117,6 +117,46 @@ classifier-free guidance on). A wall-clock claim that omits it is not a claim.
 | mesh-v4-scratch-sin | | | | | | | | ~1800 |
 | mesh-diff (stage-3 winner) | | | | | | | | 50 |
 
+## 5a. Two things the grid design gets wrong, and what was done about them
+
+Recorded because both are properties of the *experiment*, not of the model, and
+both would otherwise be invisible in the results.
+
+**The grid is greedy, and the axes are not separable.** Stage 1 ranks
+`(denoiser, loss)` under exactly one objective — `continuous`/`ddpm`/`ε` — and
+stage 2 assumes that ranking transfers to six others. Nothing guarantees it.
+One failure is structural and certain: `loss: ce` is scored slot-to-slot, so it
+requires `order: morton` (plan D4), and the unordered set regime therefore
+**cannot reach b4–b7 at all**. If a3 wins stage 1, stage 2 either abandons the
+winner or loses its four on-grid arms. Two more are plausible but unmeasured:
+the denoiser comparison is made at 10 input channels and applied at 1153 (b5),
+and `eval_steps: 50` is fixed for every arm although it is the entire eval
+budget and the processes degrade differently under it.
+
+Mitigation is a **revisit pass** (`--diff-stage revisit`), not a full factorial:
+re-run stage 1's alternatives under stage 2's winner. Two runs against the ~8 a
+full cross would add. `r2-loss` is conditional on the winner's loss not being
+`ce`, for the reason above.
+
+**`presence_weight: 1.0` did not mean the same thing across arms.** The two
+loss terms start at scales set by the target and the readout. Measured at init
+on `mini_cleaner`, with the zero-init head predicting 0 and E[x0²] = 0.0958:
+
+| regime | coord | presence | presence/coord | weight for parity |
+|---|---|---|---|---|
+| `target: noise` | 1.0000 | 1.0000 | 1.000 | 1.000 |
+| `target: original` | 0.0958 | 0.2500 | 2.610 | 0.383 |
+| `target: velocity` | 1.0958 | 1.2500 | 1.141 | 0.877 |
+| `loss: ce` | ln 128 = 4.852 | ln 2 = 0.693 | 0.143 | 7.000 |
+
+Left flat, **b3 and b4 — the grid's cleanest control, sharing a target and
+differing only in readout — would have differed by 18× in effective presence
+weight**, landing on face count, which is what the geometric metrics are most
+sensitive to. Every arm now sets its regime's parity value;
+`test_shipped_configs_equalise_presence_weight` pins it. `target: noise` is
+already at parity, so the a-block and c1/c2 are unchanged at 1.0. Re-derive the
+0.0958 if the corpus changes.
+
 ## 6. The open confound
 
 The dataset issue recorded in the mesh-v3 analysis gates this branch exactly as

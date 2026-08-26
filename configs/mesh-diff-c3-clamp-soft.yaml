@@ -6,6 +6,9 @@
 # the same as b4/b5, the trick is not load-bearing here.
 # Skip entirely when the winner is b6/b7 (no clamp exists in a categorical
 # chain) or b1/b2/b3 (no alphabet).
+# presence_weight 7.0: parity at init for this arm's regime
+# (loss: ce -> coord ln(128)=4.852 vs presence ln(2)=0.693). See MeshDiffusionConfig.presence_weight -- a flat 1.0
+# makes arms with different targets/readouts incomparable on face count.
 mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: ce, denoiser: unet,
-                 state: quantized, process: ddpm, target: original, x0_clamp: soft}
+                 state: quantized, process: ddpm, target: original, x0_clamp: soft, presence_weight: 7.0}
 logging: {run_name: mesh-diff-c3-clamp-soft}

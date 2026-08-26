@@ -3,6 +3,9 @@
 # `noise_data` is Gaussian, the loss is CrossEntropy on argmax -- ported to
 # coordinates rather than one-hot. Output lands on the grid, so welding is
 # exact and snap_before_weld is a no-op.
+# presence_weight 7.0: parity at init for this arm's regime
+# (loss: ce -> coord ln(128)=4.852 vs presence ln(2)=0.693). See MeshDiffusionConfig.presence_weight -- a flat 1.0
+# makes arms with different targets/readouts incomparable on face count.
 mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: ce, denoiser: unet,
-                 state: quantized, process: ddpm, target: original, x0_clamp: hard}
+                 state: quantized, process: ddpm, target: original, x0_clamp: hard, presence_weight: 7.0}
 logging: {run_name: mesh-diff-b4-quant-ce}

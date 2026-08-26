@@ -55,6 +55,16 @@ DIFF_STAGE3=(
   configs/mesh-diff-c2-guidance.yaml
   configs/mesh-diff-c3-clamp-soft.yaml
 )
+# The revisit pass. The grid is greedy -- stage 1 ranks denoiser and loss under
+# ONE objective and stage 2 assumes that ranking transfers to six others -- and
+# this is the cheap check on that assumption, not a full factorial: re-run the
+# stage-1 alternatives under stage 2's winner. Two runs against the ~8 a full
+# cross would add. r2 is conditional: a `ce` winner has no unordered form
+# (plan D4), so the order axis cannot reach b4-b7 at all. See its config header.
+DIFF_REVISIT=(
+  configs/mesh-diff-r1-denoiser.yaml
+  configs/mesh-diff-r2-loss.yaml
+)
 DIFF_BASE="configs/mesh-diff-base.yaml"
 
 SMOKE="${SMOKE:-0}"
@@ -79,12 +89,16 @@ Usage: ./run_experiments.sh [options] [CONFIG ...]
       --stop-early  abort the queue on the first failure (default: carry on,
                     because these arms are independent).
       --diff-stage N
-                    run stage N (1, 2 or 3) of the mesh-diffusion grid instead
-                    of the default AR queue. Each arm config carries only the
-                    axes it sets, so it is merged over configs/mesh-diff-base
-                    .yaml first -- that base is what makes every arm share a
-                    dataset, split, effective batch and seed with the others
-                    and with the mesh-v3 AR arms.
+                    run stage N of the mesh-diffusion grid instead of the
+                    default AR queue. N is 1, 2, 3, or `revisit`.
+                    `revisit` re-runs stage 1's alternatives under stage 2's
+                    winner: the cheap check that the greedy search did not pick
+                    a denoiser or a loss that only won under stage 1's own
+                    objective. Each arm config carries only the axes it sets,
+                    so it is merged over configs/mesh-diff-base.yaml first --
+                    that base is what makes every arm share a dataset, split,
+                    effective batch and seed with the others and with the
+                    mesh-v3 AR arms.
   -h, --help
 
 Every option has an environment-variable form (SMOKE, DATA_DIR, KEEP_GOING).
@@ -113,7 +127,8 @@ if [[ -n "$DIFF_STAGE" ]]; then
     1) CONFIGS=("${DIFF_STAGE1[@]}") ;;
     2) CONFIGS=("${DIFF_STAGE2[@]}") ;;
     3) CONFIGS=("${DIFF_STAGE3[@]}") ;;
-    *) die "--diff-stage must be 1, 2 or 3 (got '$DIFF_STAGE')" ;;
+    revisit|r) CONFIGS=("${DIFF_REVISIT[@]}") ;;
+    *) die "--diff-stage must be 1, 2, 3 or revisit (got '$DIFF_STAGE')" ;;
   esac
   [[ -f "$DIFF_BASE" ]] || die "no such config: $DIFF_BASE"
 fi

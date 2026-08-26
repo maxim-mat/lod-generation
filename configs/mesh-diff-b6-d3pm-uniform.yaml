@@ -1,6 +1,9 @@
 # Stage 2, arm 6: categorical corruption with a uniform transition -- the
 # standard D3PM setting, and the right one for a NOMINAL alphabet.
 # Watch val_bin_acc_t3 (the high-noise bucket) from epoch 1.
+# presence_weight 7.0: parity at init for this arm's regime
+# (loss: ce -> coord ln(128)=4.852 vs presence ln(2)=0.693). See MeshDiffusionConfig.presence_weight -- a flat 1.0
+# makes arms with different targets/readouts incomparable on face count.
 mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: ce, denoiser: unet,
-                 state: bins, process: d3pm, target: original, transition: uniform}
+                 state: bins, process: d3pm, target: original, transition: uniform, presence_weight: 7.0}
 logging: {run_name: mesh-diff-b6-d3pm-uniform}

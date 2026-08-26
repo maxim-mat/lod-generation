@@ -2,6 +2,9 @@
 # indicator channels. 1153 input channels; one 1x1 conv absorbs them, and the
 # activations are ~7 MB at F=200, B=8. Against b4 this asks whether diffusing
 # in the simplex-like space earns its width over diffusing the scalar.
+# presence_weight 7.0: parity at init for this arm's regime
+# (loss: ce -> coord ln(128)=4.852 vs presence ln(2)=0.693). See MeshDiffusionConfig.presence_weight -- a flat 1.0
+# makes arms with different targets/readouts incomparable on face count.
 mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: ce, denoiser: unet,
-                 state: onehot, process: ddpm, target: original, x0_clamp: hard}
+                 state: onehot, process: ddpm, target: original, x0_clamp: hard, presence_weight: 7.0}
 logging: {run_name: mesh-diff-b5-onehot-ce}
