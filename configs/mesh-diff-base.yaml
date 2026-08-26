@@ -58,16 +58,23 @@ mesh_diffusion:
   save_samples: 8
 
 training:
-  batch_size: 8
-  accumulate_grad_batches: 2   # effective batch 16, matching the AR arms
+  # 4 x 4 = effective batch 16, identical to every mesh-v3/v4 AR arm. Matching
+  # both numbers, not just the product, so peak activation memory is comparable
+  # too -- the one-hot arm (b5) is 1153 input channels wide and is the arm most
+  # likely to be the memory ceiling.
+  batch_size: 4
+  accumulate_grad_batches: 4
   train_val_test_split: [0.8, 0.1, 0.1]
-  # 1e-4 flat. Not the AR arms' 5e-5: that value was chosen for a from-scratch
-  # decoder at 1e-3-scale gradients, and a diffusion denoiser regressing a
-  # bounded target is a different optimisation. 1e-4 is the standard DDPM
-  # starting point and is the value to change first if training is unstable.
-  lr: 1.0e-4
-  max_epochs: 400
+  # 5e-5 flat, matching the AR arms rather than the 1e-4 DDPM default this
+  # file first carried. Deliberate: a diffusion number and an AR number are
+  # only comparable if the optimisation is, and an unshared learning rate is
+  # the kind of difference that quietly explains a result. Many more epochs are
+  # expected at this rate, which is what max_epochs: 1000 is for.
+  lr: 5.0e-5
+  max_epochs: 1000
   gradient_clip_val: 1.0
+  # No schedule. With none there is no annealing phase, so a run that early-
+  # stops has not been cut short of one.
   lr_scheduler: "none"
   lr_decay_steps: 50
   lr_decay_rate: 0.5
