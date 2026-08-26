@@ -83,9 +83,22 @@ def run_mesh_set_eval(model, dataset, indices, cfg, seed=1234, save_dir=None,
         batch = {k: v.to(device) if torch.is_tensor(v) else v
                  for k, v in batch.items()}
 
+        # The scaffold is derived from *this batch's* LOD1, so it cannot be
+        # built once in the callback's __init__; `scaffold=None` there means
+        # "let this function decide", which is what the default already does.
+        step_hook = scaffold
+        if step_hook is None and d.scaffold.enabled:
+            from src.models.mesh_scaffold import (
+                lod1_scaffold, make_bin_masker, make_projector)
+            grid = lod1_scaffold(batch["cond"], batch["cond_mask"],
+                                 voxel=d.scaffold.voxel, dilate=d.scaffold.dilate)
+            step_hook = (make_bin_masker(grid, num_bins, d.scaffold.apply_below_t)
+                         if d.process == "d3pm"
+                         else make_projector(grid, d.scaffold.apply_below_t))
+
         with torch.no_grad():
             sampled = model.generate(batch, n_steps=d.eval_steps,
-                                     scaffold=scaffold)
+                                     scaffold=step_hook)
 
         for k, i in enumerate(chunk):
             centre = batch["center"][k].cpu().numpy()
@@ -168,7 +181,9 @@ class MeshSetEvalCallback(L.Callback):
         self.d = cfg.mesh_diffusion
         self.save_dir = Path(save_dir) if save_dir is not None else None
         self.seed = seed
-        self._scaffold = None      # populated in Task 14
+        # None means "let run_mesh_set_eval build one per batch from that
+        # batch's LOD1", which is the only place the condition is known.
+        self._scaffold = None
 
     def _due(self, epoch):
         n = self.d.every_n_epochs

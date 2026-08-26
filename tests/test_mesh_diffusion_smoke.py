@@ -233,3 +233,37 @@ def test_discrete_arm_trains_and_samples():
     out = m.generate(batch, n_steps=4)
     assert out.shape == (2, 10, 16)
     assert set(out[:, 9].unique().tolist()) <= {0.5, -0.5}
+
+
+def test_scaffold_enabled_eval_path_runs():
+    """The scaffold hook is built inside run_mesh_set_eval, per batch, and is
+    the one piece of Task 13 no unit test reaches: a shape error there would
+    only surface hours into the c1 arm."""
+    from src.eval.mesh_set_eval import run_mesh_set_eval
+
+    cfg = _cfg()
+    cfg.mesh_diffusion.scaffold.enabled = True
+    cfg.mesh_diffusion.scaffold.apply_below_t = 0.9   # fire on most steps
+
+    batch = _batch()
+
+    class _Ds:
+        ids = ["a", "b"]
+
+        def __len__(self):
+            return 2
+
+        def mesh_pair(self, i):
+            import numpy as np
+            v = np.array([[0.0, 0, 0], [1.0, 0, 0], [0.0, 1, 0], [0.0, 0, 1.0]])
+            f = np.array([[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]])
+            return ((v, f), (v, f))
+
+        def __getitem__(self, i):
+            return {"x": batch["x"][i].T.clone(), "cond": batch["cond"][i].T.clone(),
+                    "id": self.ids[i], "center": torch.zeros(3),
+                    "scale": torch.ones(3)}
+
+    m = MeshDiffusionModule(cfg).eval()
+    out = run_mesh_set_eval(m, _Ds(), [0, 1], cfg, seed=0)
+    assert out and "chamfer_m" in out
