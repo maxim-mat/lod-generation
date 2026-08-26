@@ -152,11 +152,18 @@ def test_flow_to_x0_is_consistent_with_the_path():
 from src.models.mesh_processes import DiscreteProcess
 
 
+def _state(coord_bins, presence=1):
+    """Coordinate bins [B,9,F] -> the [B,10,F] state, occupancy appended."""
+    b, _, f = coord_bins.shape
+    return torch.cat([coord_bins,
+                      torch.full((b, 1, f), presence, dtype=torch.long)], dim=1)
+
+
 def test_discrete_corrupt_leaves_most_bins_alone_at_low_t():
     p = DiscreteProcess(noise_steps=1000, num_bins=128)
-    bins = torch.randint(0, 128, (256, 9, 8))
+    bins = _state(torch.randint(0, 128, (256, 9, 8)))
     noisy, _ = p.corrupt(bins, torch.full((256,), 0.02))
-    assert (noisy == bins).float().mean().item() > 0.9
+    assert (noisy[:, :9] == bins[:, :9]).float().mean().item() > 0.9
 
 
 @pytest.mark.parametrize("transition", ["uniform", "gaussian"])
@@ -166,9 +173,9 @@ def test_discrete_terminal_marginal_is_the_sampler_prior(transition):
     (1 - alpha_bar)^2 mixture weight doing its job, and it is the single
     easiest thing to get wrong in that transition."""
     p = DiscreteProcess(noise_steps=1000, num_bins=32, transition=transition)
-    bins = torch.zeros(8192, 9, 4, dtype=torch.long)
+    bins = _state(torch.zeros(8192, 9, 4, dtype=torch.long))
     noisy, _ = p.corrupt(bins, torch.ones(8192))
-    counts = torch.bincount(noisy.reshape(-1), minlength=32).float()
+    counts = torch.bincount(noisy[:, :9].reshape(-1), minlength=32).float()
     assert counts.std().item() / counts.mean().item() < 0.15
 
 
@@ -179,23 +186,24 @@ def test_gaussian_transition_moves_bins_locally_mid_trajectory():
     uni = DiscreteProcess(noise_steps=1000, num_bins=128, transition="uniform")
     gau = DiscreteProcess(noise_steps=1000, num_bins=128, transition="gaussian",
                           sigma_max=16.0)
-    bins = torch.full((4096, 9, 4), 64, dtype=torch.long)
+    bins = _state(torch.full((4096, 9, 4), 64, dtype=torch.long))
     t = torch.full((4096,), 0.4)
-    d_uni = (uni.corrupt(bins, t)[0] - 64).abs().float().mean().item()
-    d_gau = (gau.corrupt(bins, t)[0] - 64).abs().float().mean().item()
+    d_uni = (uni.corrupt(bins, t)[0][:, :9] - 64).abs().float().mean().item()
+    d_gau = (gau.corrupt(bins, t)[0][:, :9] - 64).abs().float().mean().item()
     assert d_gau < 0.5 * d_uni
 
 
 def test_discrete_corrupt_stays_in_range():
     p = DiscreteProcess(noise_steps=100, num_bins=128)
-    noisy, _ = p.corrupt(torch.randint(0, 128, (32, 9, 8)), torch.rand(32))
-    assert noisy.min() >= 0 and noisy.max() < 128
+    noisy, _ = p.corrupt(_state(torch.randint(0, 128, (32, 9, 8))), torch.rand(32))
+    assert noisy[:, :9].min() >= 0 and noisy[:, :9].max() < 128
+    assert set(noisy[:, 9].unique().tolist()) <= {0, 1}
 
 
 def test_discrete_prior_is_uniform():
     p = DiscreteProcess(noise_steps=100, num_bins=128)
-    x = p.prior((4096, 9, 8), torch.device("cpu"))
-    counts = torch.bincount(x.reshape(-1), minlength=128).float()
+    x = p.prior((4096, 10, 8), torch.device("cpu"))
+    counts = torch.bincount(x[:, :9].reshape(-1), minlength=128).float()
     assert counts.std().item() / counts.mean().item() < 0.1
 
 
@@ -203,22 +211,44 @@ def test_discrete_oracle_reverse_recovers_the_bins():
     torch.manual_seed(0)
     p = DiscreteProcess(noise_steps=1000, num_bins=32)
     bins = torch.randint(0, 32, (4, 9, 8))
-    presence = torch.ones(4, 8)
 
     def oracle(x_t, t):
         logits = torch.full((4, 9, 32, 8), -10.0)
         logits.scatter_(2, bins.unsqueeze(2), 10.0)
         return logits, torch.full((4, 8), 10.0)
 
-    out = p.sample(oracle, (4, 9, 8), torch.device("cpu"), n_steps=50)
-    agree = (out[0] == bins).float().mean().item()
-    assert agree > 0.95
+    out = p.sample(oracle, (4, 10, 8), torch.device("cpu"), n_steps=50)
+    assert (out[:, :9] == bins).float().mean().item() > 0.95
+    assert (out[:, 9] == 1).float().mean().item() > 0.95   # occupancy chain too
 
 
-def test_discrete_sample_returns_bins_and_presence():
+def test_discrete_sample_returns_one_state_tensor():
+    """Occupancy is a channel of the state, not a value smuggled alongside it,
+    so `DiscreteProcess` needs no `sample` override at all."""
     p = DiscreteProcess(noise_steps=100, num_bins=32)
     out = p.sample(lambda x, t: (torch.zeros(2, 9, 32, 8), torch.zeros(2, 8)),
-                   (2, 9, 8), torch.device("cpu"), n_steps=5)
-    bins, presence = out
-    assert bins.shape == (2, 9, 8) and bins.dtype == torch.long
-    assert presence.shape == (2, 8)
+                   (2, 10, 8), torch.device("cpu"), n_steps=5)
+    assert out.shape == (2, 10, 8) and out.dtype == torch.long
+    assert set(out[:, 9].unique().tolist()) <= {0, 1}
+
+
+def test_discrete_presence_is_corrupted_toward_a_coin_flip():
+    """Occupancy has its own two-state chain: nearly intact at low t, and a
+    fair coin at t = 1, which is what makes `prior` its terminal marginal."""
+    p = DiscreteProcess(noise_steps=1000, num_bins=32)
+    st = _state(torch.zeros(8192, 9, 4, dtype=torch.long), presence=1)
+    lo, _ = p.corrupt(st, torch.full((8192,), 0.02))
+    hi, _ = p.corrupt(st, torch.ones(8192))
+    assert lo[:, 9].float().mean().item() > 0.9
+    assert abs(hi[:, 9].float().mean().item() - 0.5) < 0.05
+
+
+def test_discrete_presence_transition_is_uniform_even_under_gaussian():
+    """The discretized-Gaussian kernel exploits ordinality, and {absent,
+    present} has none -- there is no sense in which absent is *near* present."""
+    torch.manual_seed(0)
+    for transition in ("uniform", "gaussian"):
+        p = DiscreteProcess(noise_steps=1000, num_bins=32, transition=transition)
+        st = _state(torch.zeros(4096, 9, 4, dtype=torch.long), presence=1)
+        out, _ = p.corrupt(st, torch.full((4096,), 0.5))
+        assert set(out[:, 9].unique().tolist()) <= {0, 1}

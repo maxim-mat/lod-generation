@@ -433,6 +433,21 @@ class MeshDiffusionConfig:
     # Hungarian only: relative weight of presence inside the matching cost.
     match_presence_weight: float = 1.0
 
+    # Slot budget: how many face slots the model is given, independent of how
+    # many the building actually has. The surplus are DETR no-object slots --
+    # the model must mark them absent, and that is the ONLY mechanism deciding
+    # face count at generation time. Must be >= mesh_data.max_faces and a
+    # multiple of 8 (three stride-2 U-Net levels).
+    #
+    # Eval pins the budget here so a score is reproducible; training jitters up
+    # to it so the model meets a range. Cost is real and it is the eval path
+    # that pays: median LOD2 is 20 faces and median batch-max width 24, so a
+    # budget of 200 is ~8x the convolution cost and ~69x the attention cost of
+    # a tight batch. Lowering max_faces and slot_budget together to the corpus
+    # p90 (88) cuts that to ~3.7x / ~13x, at the price of dropping the top
+    # decile of buildings.
+    slot_budget: int = 200
+
     # --- sampling and write-back -----------------------------------------
     scaffold: ScaffoldConfig = field(default_factory=ScaffoldConfig)
     # Snap to the num_bins grid before welding. Without it `weld` merges by
@@ -749,6 +764,20 @@ def validate_combination(cfg):
     if d.x0_clamp not in ("hard", "soft"):
         raise ValueError(
             f"mesh_diffusion.x0_clamp must be 'hard' or 'soft', got {d.x0_clamp!r}.")
+
+    # The slot budget has to hold the largest building the corpus filter lets
+    # through, or a batch containing one cannot be padded to it at all.
+    if d.slot_budget % 8:
+        raise ValueError(
+            f"mesh_diffusion.slot_budget must be a multiple of 8 (three "
+            f"stride-2 U-Net levels), got {d.slot_budget}.")
+    max_faces = getattr(cfg.mesh_data, "max_faces", None)
+    if max_faces is not None and d.slot_budget < max_faces:
+        raise ValueError(
+            f"mesh_diffusion.slot_budget ({d.slot_budget}) is below "
+            f"mesh_data.max_faces ({max_faces}); a building at the filter's "
+            "limit would not fit the budget. Raise the budget or lower the "
+            "filter -- lowering both together is the cheap option.")
 
     if d.guidance != 1.0 and d.cond_dropout <= 0:
         raise ValueError(

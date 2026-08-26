@@ -33,7 +33,13 @@ class MeshSetDataModule(L.LightningDataModule):
         super().__init__()
         self.cfg = cfg
         self.batch_size = cfg.training.batch_size
-        self.collate = partial(mesh_set_collate_fn, multiple_of=8)
+        budget = cfg.mesh_diffusion.slot_budget
+        # Training jitters the slot budget up toward the cap so the model meets
+        # a range of no-object counts rather than overfitting to one; val and
+        # test pin it, so a score is reproducible and two epochs are
+        # comparable. Neither ever hands the model a real-vs-unused mask.
+        self.collate = partial(mesh_set_collate_fn, multiple_of=8, jitter_to=budget)
+        self.collate_eval = partial(mesh_set_collate_fn, multiple_of=8, width=budget)
         self.dataset = None
         self.train_dataset = self.val_dataset = self.test_dataset = None
 
@@ -49,20 +55,21 @@ class MeshSetDataModule(L.LightningDataModule):
         self.train_dataset, self.val_dataset, self.test_dataset = random_split(
             self.dataset, fracs, generator=gen)
 
-    def _loader(self, ds, shuffle):
+    def _loader(self, ds, shuffle, collate=None):
         md = self.cfg.mesh_data
         return DataLoader(ds, batch_size=self.batch_size, shuffle=shuffle,
-                          collate_fn=self.collate, num_workers=md.num_workers,
+                          collate_fn=collate or self.collate,
+                          num_workers=md.num_workers,
                           persistent_workers=md.persistent_workers and md.num_workers > 0)
 
     def train_dataloader(self):
         return self._loader(self.train_dataset, True)
 
     def val_dataloader(self):
-        return self._loader(self.val_dataset, False)
+        return self._loader(self.val_dataset, False, self.collate_eval)
 
     def test_dataloader(self):
-        return self._loader(self.test_dataset, False)
+        return self._loader(self.test_dataset, False, self.collate_eval)
 
 
 def train_mesh_diffusion(cfg: Config):

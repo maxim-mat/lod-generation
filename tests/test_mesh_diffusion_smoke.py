@@ -282,3 +282,51 @@ def test_unet_hungarian_arm_trains():
                for p in m.parameters())
     m.eval()
     assert m.generate(_batch(), n_steps=3).shape == (2, 10, 16)
+
+
+def test_face_count_is_predicted_not_read_from_the_input():
+    """The denoiser must never see which slots are real.
+
+    It used to: `generate` passed `batch["x_mask"]`, which the U-Net's masking
+    turned into an exact signal -- the presence output at unused slots was
+    literally the head bias, identical for any input. Face count then came from
+    the label, not the model, and plan D2's "presence decides face count at
+    generation time" was false.
+
+    The property that replaces it: unused slots are DETR no-object slots, so
+    their output must depend on their content like any other slot.
+    """
+    m = MeshDiffusionModule(_cfg()).eval()
+    torch.nn.init.normal_(m.denoiser.outc.weight, std=0.05)
+    torch.nn.init.normal_(m.denoiser.outc.bias, std=0.05)
+
+    batch = _batch()                       # 12 real slots of 16
+    outs = []
+    for seed in range(3):
+        torch.manual_seed(seed)
+        b = {**batch, "x": torch.randn_like(batch["x"])}
+        with torch.no_grad():
+            outs.append(m._denoise(b["x"], torch.rand(2), b["cond"], None,
+                                   b["cond_mask"]))
+    unused = torch.stack([o[:, 9, 12:] for o in outs])
+    assert unused.std(dim=0).max().item() > 1e-3, (
+        "output at unused slots is input-independent -- the model is being "
+        "told where the mesh ends instead of predicting it")
+
+
+def test_slot_budget_is_fixed_at_eval_and_jittered_at_train():
+    from src.dataset.mesh_set_dataset import mesh_set_collate_fn
+
+    items = [{"x": torch.zeros(n, 10), "cond": torch.zeros(3, 10), "id": "a",
+              "center": torch.zeros(3), "scale": torch.ones(3)} for n in (5, 11)]
+    fixed = mesh_set_collate_fn(items, width=64)
+    assert fixed["x"].shape[-1] == 64
+    assert fixed["x_mask"].sum(1).tolist() == [5, 11]   # supervision survives
+
+    torch.manual_seed(0)
+    widths = {mesh_set_collate_fn(items, jitter_to=64)["x"].shape[-1]
+              for _ in range(30)}
+    assert len(widths) > 1 and min(widths) >= 16 and max(widths) <= 64
+
+    with pytest.raises(ValueError, match="below this batch"):
+        mesh_set_collate_fn(items, width=8)

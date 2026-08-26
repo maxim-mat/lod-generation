@@ -113,7 +113,11 @@ class MeshDiffusionModule(L.LightningModule):
         if self.state in ("continuous", "quantized"):
             return batch["x"]
         if self.state == "bins":
-            return batch["x_bins"]
+            # [B,10,F]: nine coordinate-bin channels plus a two-state occupancy
+            # channel, so presence rides its own categorical chain instead of
+            # being a bare logit carried past the reverse loop.
+            return torch.cat([batch["x_bins"],
+                              batch["x_mask"].long().unsqueeze(1)], dim=1)
         b, _, f = batch["x"].shape
         oh = torch.zeros(b, 9, self.num_bins, f, device=batch["x"].device)
         oh.scatter_(2, batch["x_bins"].unsqueeze(2), 1.0)
@@ -179,9 +183,13 @@ class MeshDiffusionModule(L.LightningModule):
             return x_t
         from src.dataset.mesh_dataset import dequantize
         coords = torch.from_numpy(
-            dequantize(x_t.detach().cpu().numpy(), self.num_bins)).float()
+            dequantize(x_t[:, :9].detach().cpu().numpy(), self.num_bins)).float()
         out = torch.zeros(x_t.shape[0], 10, x_t.shape[-1], device=x_t.device)
         out[:, :9] = coords.to(x_t.device)
+        # The network SEES the current occupancy state, mapped to the same
+        # +-0.5 the continuous arms use. Leaving it at 0 would hide the very
+        # variable the chain is there to refine.
+        out[:, 9] = torch.where(x_t[:, 9] > 0, 0.5, -0.5)
         return out
 
     # -- plumbing ---------------------------------------------------------
@@ -216,8 +224,12 @@ class MeshDiffusionModule(L.LightningModule):
 
         t = self.process.sample_t(x0.shape[0], x0.device)
         x_t, aux = self.process.corrupt(x0, t)
-        pred = self._denoise(self._model_input(x_t), t, cond,
-                             batch["x_mask"], cond_mask)
+        # No target-axis mask. The surplus slots are the model's no-object
+        # slots, not padding to be hidden: handing over `x_mask` told it
+        # exactly where the mesh ended, so presence had nothing left to learn
+        # and face count came from the label rather than the model. The mask
+        # still gates the COORDINATE loss below -- that is supervision.
+        pred = self._denoise(self._model_input(x_t), t, cond, None, cond_mask)
         if self.categorical:
             # The CE label is `x_bins`, which the loss reads off the batch --
             # there is no regression target to build here.
@@ -231,7 +243,7 @@ class MeshDiffusionModule(L.LightningModule):
         if self.state == "bins":
             with torch.no_grad():
                 logits = pred[0]
-                correct = (logits.argmax(dim=2) == x0).float()
+                correct = (logits.argmax(dim=2) == x0[:, :9]).float()
                 m = batch["x_mask"][:, None, :].float()
                 acc = (correct * m).sum() / (m.sum() * 9).clamp(min=1)
                 # Bucketed by noise level, because the aggregate hides exactly
@@ -290,7 +302,7 @@ class MeshDiffusionModule(L.LightningModule):
         """
         b, _, f = batch["x"].shape
         if self.state == "bins":
-            return (b, 9, f)
+            return (b, 10, f)
         if self.state == "onehot":
             return (b, 9 * self.num_bins + 1, f)
         return (b, 10, f)
@@ -312,17 +324,16 @@ class MeshDiffusionModule(L.LightningModule):
             Tensor: ``[B, 10, F]`` in the LOD1-normalized frame.
         """
         cond, cond_mask = batch["cond"], batch["cond_mask"]
-        mask = batch["x_mask"]
         shape = self._state_shape(batch)
 
         def denoiser_fn(x_t, t):
-            out = self._denoise(self._model_input(x_t), t, cond, mask, cond_mask)
+            out = self._denoise(self._model_input(x_t), t, cond, None, cond_mask)
             if self.guidance != 1.0:
                 # Classifier-free guidance (Ho & Salimans, arXiv:2207.12598):
                 # push away from the unconditional prediction. Two forward
                 # passes per step, so it doubles the eval cost -- which is why
                 # it defaults to 1.0 and is a per-experiment choice.
-                uncond = self._denoise(x_t, t, None, mask, None)
+                uncond = self._denoise(self._model_input(x_t), t, None, None, None)
                 out = _guide(out, uncond, self.guidance)
             if not self.categorical or self.state == "bins":
                 return out
@@ -343,10 +354,16 @@ class MeshDiffusionModule(L.LightningModule):
         if not self.categorical:
             return out
         if self.state == "bins":
-            # A categorical chain carries its own state out: bins are already
-            # on the grid, and the presence logits ride alongside them.
-            bins, presence_logits = out
-            return self._from_state(None, bins, presence_logits)
+            # The chain carries occupancy in its own channel, so the final
+            # state is the answer: bins are on the grid and presence is a bit.
+            from src.dataset.mesh_dataset import dequantize
+            coords = torch.from_numpy(
+                dequantize(out[:, :9].detach().cpu().numpy(), self.num_bins)
+            ).float().to(out.device)
+            final = torch.zeros(out.shape[0], 10, out.shape[-1], device=out.device)
+            final[:, :9] = coords
+            final[:, 9] = torch.where(out[:, 9] > 0, 0.5, -0.5)
+            return final
         # The trajectory's last x0 *prediction* is the answer, not the process's
         # own final state: that state is the same x0 re-noised by one schedule
         # rung, which would drift it straight back off the grid the clamp just

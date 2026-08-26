@@ -78,7 +78,9 @@ def run_mesh_set_eval(model, dataset, indices, cfg, seed=1234, save_dir=None,
     for start in range(0, len(indices), d.eval_batch_size):
         chunk = indices[start:start + d.eval_batch_size]
         items = [dataset[int(i)] for i in chunk]
-        batch = mesh_set_collate_fn(items, multiple_of=8)
+        # Fixed slot budget, so the sample is a function of the weights alone
+        # and not of who else landed in the chunk.
+        batch = mesh_set_collate_fn(items, multiple_of=8, width=d.slot_budget)
         device = next(model.parameters()).device
         batch = {k: v.to(device) if torch.is_tensor(v) else v
                  for k, v in batch.items()}

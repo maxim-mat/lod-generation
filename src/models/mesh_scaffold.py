@@ -173,7 +173,9 @@ def make_bin_masker(scaffold, num_bins=128, apply_below_t=0.5):
         apply_below_t: as `make_projector`.
 
     Returns:
-        callable: ``(t, bins [B,9,F]) -> bins``.
+        callable: ``(t, state [B,10,F]) -> state``. Channel 9 is the two-state
+        occupancy chain and is never projected -- occupancy is not a coordinate
+        and has no legal region.
     """
     grid = scaffold.shape[-1]
     legal = [_legal_points(scaffold[i], grid) for i in range(scaffold.shape[0])]
@@ -186,13 +188,13 @@ def make_bin_masker(scaffold, num_bins=128, apply_below_t=0.5):
             if len(pts) == 0:
                 continue
             coords = torch.from_numpy(
-                dequantize(out[i].detach().cpu().numpy(), num_bins)).float()
+                dequantize(out[i, :9].detach().cpu().numpy(), num_bins)).float()
             v = coords.T.reshape(-1, 3)
             d = torch.cdist(v, pts.cpu())
             outside = d.min(dim=1).values > (1.5 / (grid - 1))
             v = torch.where(outside[:, None], pts.cpu()[d.argmin(dim=1)], v)
             snapped = quantize(v.reshape(-1, 9).numpy(), num_bins)
-            out[i] = torch.from_numpy(snapped).to(out.device).T
+            out[i, :9] = torch.from_numpy(snapped).to(out.device).T
         return out
 
     return project

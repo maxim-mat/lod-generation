@@ -88,7 +88,10 @@ def test_bin_masker_moves_illegal_bins_and_keeps_legal_ones():
     cond, mask = _prism_cond()
     sc = lod1_scaffold(cond, mask, dilate=3)
     masker = make_bin_masker(sc, num_bins=128, apply_below_t=0.5)
-    bins = torch.full((1, 9, 8), 127, dtype=torch.long)   # corner of the box
+    # [B,10,F]: nine coordinate-bin channels plus the occupancy chain.
+    bins = torch.full((1, 10, 8), 127, dtype=torch.long)   # corner of the box
+    bins[:, 9] = 1
     out = masker(0.1, bins)
     assert out.shape == bins.shape and out.dtype == torch.long
-    assert (out != bins).any()
+    assert (out[:, :9] != bins[:, :9]).any()
+    assert torch.equal(out[:, 9], bins[:, 9]), "occupancy must not be projected"

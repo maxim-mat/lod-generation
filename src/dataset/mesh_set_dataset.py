@@ -243,28 +243,57 @@ def _pad_stack(seqs, width, fill_coord=0.0):
     return out.permute(0, 2, 1).contiguous(), mask
 
 
-def mesh_set_collate_fn(batch, multiple_of=8):
+def mesh_set_collate_fn(batch, multiple_of=8, width=None, jitter_to=None):
     """Right-pad a batch of face sets to a common, U-Net-divisible width.
 
-    Padded to the batch maximum rounded up, not to a corpus-wide constant: the
-    face-count distribution is long-tailed, so a fixed width would spend most
-    of every batch denoising padding. `multiple_of` exists because three
-    stride-2 downsamples need a length divisible by 8; the transformer denoiser
-    does not care and is unaffected by the rounding.
+    The slots past a building's face count are NOT masked out of the model --
+    they are the slots it must learn to mark absent, DETR's no-object class
+    (arXiv:2005.12872 section 3.1). `x_mask` is still returned, because the
+    coordinate loss needs to know which slots carry a real target, but it is
+    supervision and never a model input. Handing it to the denoiser is what
+    made face count readable straight off the input rather than predicted.
+
+    That makes the slot budget a real hyperparameter rather than a packing
+    detail:
+
+    * training uses the batch maximum, optionally jittered up toward
+      `jitter_to`, so the model meets a range of budgets and does not overfit
+      to one;
+    * eval pins `width` to a constant so a score is reproducible and two
+      epochs are comparable.
 
     Args:
         batch: list of `MeshSetDataset` items.
         multiple_of: pad width is rounded up to this. 8 for the 3-level U-Net.
+        width: exact slot budget. Must be >= the batch's own requirement.
+        jitter_to: sample a budget uniformly in ``[base, jitter_to]``. Ignored
+            when `width` is given.
 
     Returns:
         dict: channels-first tensors plus boolean masks (True = real face).
     """
-    def width(key):
+    def base_width(key):
         longest = max(len(item[key]) for item in batch)
         return int(np.ceil(max(longest, 1) / multiple_of) * multiple_of)
 
-    x, x_mask = _pad_stack([item["x"] for item in batch], width("x"))
-    cond, cond_mask = _pad_stack([item["cond"] for item in batch], width("cond"))
+    base = base_width("x")
+    if width is not None:
+        target = int(width)
+        if target < base:
+            raise ValueError(
+                f"slot budget {target} is below this batch's requirement {base}. "
+                "mesh_data.max_faces must not exceed mesh_diffusion.slot_budget.")
+    elif jitter_to is not None and int(jitter_to) > base:
+        steps = (int(jitter_to) - base) // multiple_of + 1
+        target = base + multiple_of * int(torch.randint(steps, (1,)).item())
+    else:
+        target = base
+
+    x, x_mask = _pad_stack([item["x"] for item in batch], target)
+    # The condition keeps its own tight width: it is an input the model reads
+    # through cross-attention, never something it has to decide the extent of,
+    # so its padding stays masked and costs nothing to keep minimal.
+    cond, cond_mask = _pad_stack([item["cond"] for item in batch], base_width("cond"))
     out = {"x": x, "x_mask": x_mask, "cond": cond, "cond_mask": cond_mask,
            "ids": [item["id"] for item in batch]}
     for key in ("center", "scale"):

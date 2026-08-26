@@ -313,8 +313,34 @@ class DiscreteProcess(BaseProcess):
     def sample_t(self, n, device):
         return torch.rand(n, device=device)
 
+    def _corrupt_presence(self, p0, t):
+        """Two-state chain over occupancy: keep, else redraw from {0, 1}.
+
+        Presence gets a chain of its own rather than riding through the reverse
+        loop as a bare logit. Without it, face count in the categorical arms was
+        decided by a single forward pass at the last step while every other arm
+        refined it across the whole trajectory -- so b6/b7's face-count numbers
+        were not comparable with b1-b5's, and plan D2's "presence is diffused"
+        was false for exactly the arms whose alphabet has no natural two-state
+        member.
+
+        Always a uniform transition, whatever `self.transition` says: the
+        discretized-Gaussian kernel exists to exploit *ordinality*, and {absent,
+        present} has none. There is no sense in which absent is "near" present.
+        """
+        keep = self._keep_prob(t, p0.shape)
+        redraw = torch.randint_like(p0, 0, 2)
+        stay = torch.rand(p0.shape, device=p0.device) < keep
+        return torch.where(stay, p0, redraw)
+
     def corrupt(self, x0, t):
-        """``x0 [B,9,F]`` int64 bins -> ``(x_t [B,9,F], None)``.
+        """``x0 [B,10,F]`` int64 -> ``(x_t [B,10,F], None)``.
+
+        Channels 0-8 are coordinate bins in ``[0, num_bins)``; channel 9 is
+        occupancy in ``{0, 1}``. The two are corrupted by different chains --
+        see `_corrupt_presence` -- and carried in one tensor so the process
+        keeps `BaseProcess`'s single-state contract and needs no `sample`
+        override.
 
         Sampled from the marginal q(x_t | x0) directly rather than by walking
         the chain. Under `uniform` the marginal is exactly "keep with
@@ -324,11 +350,16 @@ class DiscreteProcess(BaseProcess):
         to the boundary clamp -- exact in the interior, and the interior is
         where every coordinate that matters lives.
         """
+        coords, presence = x0[:, :9], x0[:, 9]
+        out_p = self._corrupt_presence(presence, t)
+
         if self.transition == "uniform":
-            keep = self._keep_prob(t, x0.shape)
-            redraw = torch.randint_like(x0, 0, self.num_bins)
-            stay = torch.rand(x0.shape, device=x0.device) < keep
-            return torch.where(stay, x0, redraw), None
+            keep = self._keep_prob(t, coords.shape)
+            redraw = torch.randint_like(coords, 0, self.num_bins)
+            stay = torch.rand(coords.shape, device=coords.device) < keep
+            return torch.cat([torch.where(stay, coords, redraw),
+                              out_p.unsqueeze(1)], dim=1), None
+        x0 = coords
 
         # Three-way mixture, and the weights are not arbitrary: the terminal
         # distribution has to BE the sampler's prior, or the reverse loop
@@ -350,7 +381,7 @@ class DiscreteProcess(BaseProcess):
         uniform = torch.randint_like(x0, 0, self.num_bins)
         out = torch.where(u < a, x0,
                           torch.where(u < a + p_uniform, uniform, shifted))
-        return out, None
+        return torch.cat([out, out_p.unsqueeze(1)], dim=1), None
 
     def target_for(self, x0, x_t, t, aux):
         return x0
@@ -358,6 +389,10 @@ class DiscreteProcess(BaseProcess):
     def step(self, x_t, t, t_prev, model_out):
         """Ancestral step: sample x0 from the predicted posterior, re-noise to
         ``t_prev``.
+
+        Presence is sampled from its own Bernoulli and re-noised on its own
+        chain, so occupancy is refined across the trajectory exactly as the
+        coordinates are.
 
         The exact reverse posterior for a uniform chain would weight q(s|t,x0)
         against the predicted p(x0); this samples x0 first and re-noises, which
@@ -369,31 +404,22 @@ class DiscreteProcess(BaseProcess):
         logits, presence_logits = model_out
         b, c, k, f = logits.shape
         probs = torch.softmax(logits, dim=2).permute(0, 1, 3, 2).reshape(-1, k)
-        x0 = torch.multinomial(probs, 1).reshape(b, c, f)
+        coords = torch.multinomial(probs, 1).reshape(b, c, f)
+        presence = torch.bernoulli(torch.sigmoid(presence_logits)).long()
+        x0 = torch.cat([coords, presence.unsqueeze(1)], dim=1)
         if t_prev <= 0.0:
-            return x0, presence_logits
+            return x0
         t_batch = torch.full((b,), t_prev, device=logits.device)
         x_prev, _ = self.corrupt(x0, t_batch)
-        return x_prev, presence_logits
+        return x_prev
 
     def prior(self, shape, device):
-        return torch.randint(0, self.num_bins, shape, device=device)
-
-    def sample(self, denoiser_fn, shape, device, n_steps=50, callback=None):
-        """As `BaseProcess.sample`, but the state is integer bins and the last
-        step's presence logits are carried out alongside them."""
-        x = self.prior(shape, device)
-        presence = None
-        for t, t_prev in self.timesteps(n_steps):
-            t_batch = torch.full((shape[0],), t, device=device)
-            with torch.no_grad():
-                out = denoiser_fn(x, t_batch)
-            x, presence = self.step(x, t, t_prev, out)
-            if callback is not None:
-                replaced = callback(t_prev, x)
-                if replaced is not None:
-                    x = replaced
-        return x, presence
+        """``[B, 10, F]``: coordinate bins uniform over the alphabet, occupancy
+        uniform over {0, 1} -- the terminal marginal of both chains."""
+        b, c, f = shape
+        coords = torch.randint(0, self.num_bins, (b, c - 1, f), device=device)
+        presence = torch.randint(0, 2, (b, 1, f), device=device)
+        return torch.cat([coords, presence], dim=1)
 
 
 def create_process(cfg):
