@@ -54,7 +54,7 @@ training:
   lr_scheduler: "none"
   early_stopping:
     enabled: true
-    monitor: val_gen_coord_mse
+    monitor: val_gen_chamfer_m
     patience: 5
     mode: min
   # Early stopping stays ON in the smoke: it is the cheapest check that the

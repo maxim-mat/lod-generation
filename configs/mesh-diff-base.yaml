@@ -121,25 +121,47 @@ training:
   lr_scheduler: "none"
   lr_decay_steps: 50
   lr_decay_rate: 0.5
-  # val_gen_coord_mse: the coordinate error of a FREE-RUNNING sample, not the
-  # single-step loss. The single-step loss is a Monte-Carlo estimate over t,
-  # only loosely coupled to sample quality, and in different units per arm --
-  # selecting a checkpoint on it selects for one-step denoising rather than for
-  # generation. NOT the geometric metrics either: those run only every
-  # every_n_epochs, and EarlyStopping(strict=True) raises on a missing metric.
-  # mode: min is correct for every arm by construction -- the monitor is an
-  # error for the regression arms and for the categorical ones alike.
+  # val_gen_chamfer_m: surface error in METRES of a free-running sample, taken
+  # through faces_to_mesh -- the same quantity tier 3 reports, at tier 2's
+  # sampling budget so it can run every validation epoch.
+  #
+  # NOT the single-step loss: that is a Monte-Carlo estimate over t, only
+  # loosely coupled to sample quality and in different units per arm, so
+  # selecting on it selects for one-step denoising rather than for generation.
+  #
+  # And NOT val_gen_coord_mse, which is what this used to be. That metric masks
+  # by the TARGET's face mask and never reads the predicted presence channel,
+  # so it cannot see face count at all -- measured, a model that marks every
+  # slot absent and generates NO MESH scores a perfect 0.0 on it. Selecting on
+  # a metric that ranks an empty building best is worse than not selecting.
+  # It is still logged, as a diagnostic.
+  #
+  # Chamfer was originally rejected here because it is nan on an empty sample.
+  # The fix is to define that case, not to avoid the metric: `monitor_chamfer`
+  # scores an empty sample as the LOD1 box diagonal, which is finite and
+  # strictly worse than any sample that produced a surface.
+  #
+  # Measured cost: ~2 s per epoch for 8 buildings at n_points 4096, against a
+  # ~58 s epoch on the a1 run. Cost was never what made this hard.
+  #
+  # It is the same quantity tier 3 logs as val_chamfer_m but NOT the same
+  # number: this runs at gen_eval_steps (20) and tier 3 at eval_steps (50), so
+  # the monitor reads worse for the same weights. Compare it to itself across
+  # epochs, and to tier 3 only within an arm.
+  #
+  # mode: min is correct for every arm -- it is an error in metres for the
+  # regression arms and the categorical ones alike.
   early_stopping:
     enabled: true
-    monitor: val_gen_coord_mse
+    monitor: val_gen_chamfer_m
     patience: 100
     mode: min
   checkpoint:
     enabled: true
-    monitor: val_gen_coord_mse
+    monitor: val_gen_chamfer_m
     mode: min
     save_top_k: 3
-    filename: "{epoch:02d}-{val_gen_coord_mse:.5f}"
+    filename: "{epoch:02d}-{val_gen_chamfer_m:.5f}"
 
 trainer:
   accelerator: auto

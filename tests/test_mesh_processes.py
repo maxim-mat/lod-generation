@@ -339,3 +339,44 @@ def test_flow_to_x0_honours_a_per_sample_t():
     t = torch.tensor([0.1, 0.4, 0.7, 0.95])
     x_t, noise = p.corrupt(x0, t)
     assert torch.allclose(p.to_x0(x_t, t, x0 - noise), x0, atol=1e-5)
+
+
+def test_the_reverse_trajectory_actually_finishes():
+    """A perfect denoiser must land ON the data, at every step count.
+
+    Two properties in one. The trajectory runs `n_steps` denoiser calls, not
+    one; and because DDIM is exact on any subsequence when the alphas are read
+    at the strided times, an oracle recovers x0 regardless of the stride.
+
+    The regression: `_abar(0.0)` indexes rung 0, where alpha_hat is
+    1 - beta_0 = 0.9999, not 1.0. The final step therefore re-noised the x0
+    estimate by one rung and returned that -- 1% of a unit normal, 1.27 bins on
+    a 128-bin grid, on every coordinate of every sample. A floor no amount of
+    training can get under, and 10x above the measured ground-truth mesh
+    ceiling. Reference DDIM prepends 1.0 to alphas_cumprod for this reason.
+    """
+    torch.manual_seed(0)
+    p = GaussianProcess(noise_steps=1000, target="noise")
+    x0 = (torch.rand(4, 10, 32) - 0.5) * 0.9      # inside the x0_clip box
+
+    for n_steps in (1, 5, 20, 50, 1000):
+        calls = []
+
+        def oracle(x_t, t):
+            calls.append(1)
+            a = p._abar(t, x_t.dim())
+            return (x_t - a.sqrt() * x0) / (1 - a).sqrt().clamp(min=1e-8)
+
+        out = p.sample(oracle, x0.shape, x0.device, n_steps=n_steps)
+        assert len(calls) == n_steps, "the sampler skipped steps"
+        assert (out - x0).abs().mean() < 1e-5, (
+            f"n_steps={n_steps}: oracle landed {(out - x0).abs().mean():.5f} "
+            "from the data")
+
+
+def test_the_last_step_lands_on_the_x0_estimate():
+    """The final DDIM step is x0 itself -- alpha_bar_prev is 1 by definition."""
+    p = GaussianProcess(noise_steps=1000, target="original")
+    x_t = torch.randn(2, 10, 8)
+    x0_hat = (torch.rand(2, 10, 8) - 0.5) * 0.8
+    assert torch.allclose(p.step(x_t, 0.02, 0.0, x0_hat), x0_hat, atol=1e-6)

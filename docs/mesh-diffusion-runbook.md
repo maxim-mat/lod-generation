@@ -38,7 +38,7 @@ Also check:
 ## 2. Cost, measured
 
 Batch 32, slot budget 200, 127 steps/epoch, `max_epochs: 1000`. Times are the
-ceiling — early stopping (`patience: 100` on `val_gen_coord_mse`) will usually
+ceiling — early stopping (`patience: 100` on `val_gen_chamfer_m`) will usually
 cut them short.
 
 | stage | arms | ms/step | hours |
@@ -122,10 +122,20 @@ After any edit: `SMOKE=1 ./run_experiments.sh --diff-stage N`.
 
 ## 5. What to watch
 
-**`val_gen_coord_mse`** — the monitor. Free-running reverse trajectory on 8
-fixed buildings at 20 steps, every validation epoch. Early stopping and
-checkpointing both read it, `mode: min`, and it is comparable across every arm.
-Sane range is O(0.1); it starts near 0.37 on an untrained model.
+**`val_gen_chamfer_m`** — the monitor. Free-running reverse trajectory on 8
+fixed buildings at 20 steps, taken through `faces_to_mesh` and scored in
+metres, every validation epoch. Early stopping and checkpointing both read it,
+`mode: min`, and it is comparable across every arm. A sample that generates no
+mesh scores the LOD1 box diagonal — tens of metres — rather than nan.
+
+Read it against `val_chamfer_m` (tier 3) only within an arm: this runs at 20
+reverse steps and tier 3 at 50, so the monitor is the pessimistic one.
+
+**`val_gen_coord_mse`** — a diagnostic, and *not* a selection metric. It masks
+by the target's face mask and never reads the predicted presence channel, so it
+cannot see face count: a model that marks every slot absent scores a perfect
+0.0. It was the monitor until that was measured. Useful for watching
+coordinate accuracy in isolation, useless for ranking checkpoints.
 
 **`val_gen_coord_mse_live`** — the same trajectory from the raw (non-EMA)
 weights. EMA never touches the gradients, so this *is* the no-EMA result at no

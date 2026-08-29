@@ -4,6 +4,8 @@ Synthetic on-disk data is out of scope here -- these tests build a
 `MeshDiffusionModule` directly and feed it a hand-made batch, which is the
 smallest thing that proves the four subsystems are wired to each other.
 """
+import math
+
 import pytest
 import torch
 from omegaconf import OmegaConf
@@ -652,3 +654,78 @@ def test_adaln_arm_trains_and_samples():
 
     out = m.eval().generate(_batch(), n_steps=3)
     assert out.shape == (2, 10, 16) and torch.isfinite(out).all()
+
+
+# --- the monitor has to be able to see an empty mesh --------------------------
+
+def _monitor_cfg():
+    cfg = _cfg()
+    cfg.mesh_data.max_faces = 32
+    cfg.mesh_diffusion.slot_budget = 32
+    cfg.mesh_diffusion.gen_eval_steps = 3
+    return cfg
+
+
+class _Fixed(torch.nn.Module):
+    """A model stub whose `generate` returns a chosen sample verbatim."""
+
+    def __init__(self, module, presence):
+        super().__init__()
+        self.m = module
+        self.presence = presence
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.m, name)
+
+    def generate(self, batch, n_steps=None, scaffold=None):
+        out = batch["x"].clone()          # exactly the target coordinates
+        out[:, 9] = self.presence
+        return out
+
+
+def test_monitor_scores_an_empty_mesh_as_the_worst_case_not_the_best():
+    """An all-absent sample generates NO MESH. It must not score better than a
+    correct one -- under `gen_coord_mse` alone it scored a perfect 0.0, because
+    that metric masks by the target and never reads the presence channel.
+    """
+    from src.eval.mesh_set_eval import run_generative_monitor
+
+    cfg = _monitor_cfg()
+    m = MeshDiffusionModule(cfg).eval()
+    ds = _gen_ds()
+
+    good = run_generative_monitor(_Fixed(m, 0.5), ds, [0, 1], cfg, seed=0)
+    empty = run_generative_monitor(_Fixed(m, -0.5), ds, [0, 1], cfg, seed=0)
+
+    assert math.isfinite(empty["gen_chamfer_m"]), "empty sample must not be nan"
+    assert empty["gen_chamfer_m"] > good["gen_chamfer_m"], (
+        f"empty mesh scored {empty['gen_chamfer_m']} against a correct "
+        f"sample's {good['gen_chamfer_m']}")
+    # And the old metric is exactly as blind as it was -- kept as a diagnostic,
+    # which is why it must not be what selects the checkpoint.
+    assert empty["gen_coord_mse"] == pytest.approx(good["gen_coord_mse"])
+
+
+def test_monitor_counts_buildings_not_batches():
+    """`n_eval` came from the number of CHUNKS, so it read 1 for 8 buildings
+    and clobbered tier 3's own `val_n_eval` of 16 in the same namespace."""
+    from src.eval.mesh_set_eval import run_generative_monitor
+
+    cfg = _monitor_cfg()
+    cfg.mesh_diffusion.eval_batch_size = 8     # both buildings in ONE chunk
+    m = MeshDiffusionModule(cfg).eval()
+    out = run_generative_monitor(m, _gen_ds(), [0, 1], cfg, seed=0)
+    assert out["n_eval"] == 2.0
+
+
+def test_the_shipped_monitor_is_the_geometric_one():
+    """Early stopping and checkpointing must select on the metric that can see
+    a face-count collapse, not on the one that cannot."""
+    from omegaconf import OmegaConf
+
+    base = OmegaConf.load("configs/mesh-diff-base.yaml")
+    assert base.training.early_stopping.monitor == "val_gen_chamfer_m"
+    assert base.training.checkpoint.monitor == "val_gen_chamfer_m"

@@ -196,12 +196,34 @@ class GaussianProcess(BaseProcess):
         return capped / snr.clamp(min=1e-8) if self.target == "noise" else capped
 
     def step(self, x_t, t, t_prev, model_out):
-        """Deterministic DDIM step (eta = 0)."""
+        """Deterministic DDIM step (eta = 0).
+
+        Valid at any stride: `_abar` reads the schedule at the actual ``t`` and
+        ``t_prev``, not at adjacent rungs, which is what lets 20 or 50 steps
+        stand in for 1000 without retraining.
+        """
         device = x_t.device
         n = x_t.shape[0]
         a_t = self._abar(torch.full((n,), t, device=device), x_t.dim())
-        a_p = self._abar(torch.full((n,), t_prev, device=device), x_t.dim())
         x0 = self.to_x0(x_t, t, model_out)
+        if t_prev <= 0.0:
+            # End of the chain: alpha_bar_prev is 1 by definition, so the
+            # trajectory lands on the x0 estimate itself.
+            #
+            # Indexing the schedule at t=0 instead gives alpha_hat[0] =
+            # 1 - beta_0 = 0.9999, which re-noises x0 by one rung and returns
+            # THAT -- 1% of a unit normal left in every returned sample. On a
+            # 128-bin grid that is 1.27 bins per coordinate, and on a 20 m
+            # building 0.20 m, against a measured ground-truth mesh ceiling of
+            # 0.020 m. A floor no amount of training can get under. Reference
+            # DDIM implementations prepend 1.0 to alphas_cumprod for exactly
+            # this reason.
+            #
+            # The categorical arms already dodged it by returning the last x0
+            # PREDICTION out of `generate` rather than the process state; the
+            # continuous arms took the process state and so ate the floor.
+            return x0
+        a_p = self._abar(torch.full((n,), t_prev, device=device), x_t.dim())
         eps = ((x_t - a_t.sqrt() * x0) / (1 - a_t).sqrt().clamp(min=1e-8))
         return a_p.sqrt() * x0 + (1 - a_p).sqrt() * eps
 

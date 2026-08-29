@@ -21,7 +21,7 @@ import torch
 
 from src.dataset.mesh_dataset import write_obj
 from src.dataset.mesh_set_dataset import mesh_set_collate_fn
-from src.eval.mesh_metrics import mesh_metrics
+from src.eval.mesh_metrics import chamfer_distance, mesh_metrics, surface_distances
 from src.models.mesh_set_postprocess import faces_to_mesh
 from src.post_process.post_process import mesh_to_cityjson, save_to_file
 
@@ -136,6 +136,32 @@ def generative_metrics(gen, batch, cfg):
     return out
 
 
+def monitor_chamfer(sample, batch, k, dataset, index, cfg, seed):
+    """Chamfer in metres for one sample, finite even when nothing was generated.
+
+    The empty case is the whole reason this exists. An all-absent sample has no
+    surface, so chamfer is genuinely undefined -- and leaving it undefined is
+    what let a model that generates NOTHING score a perfect `gen_coord_mse` of
+    0.0, because that metric masks by the target's face mask and never reads
+    the predicted presence channel at all. Scoring the empty sample as the LOD1
+    box diagonal is the standard finite stand-in: it is as wrong as the
+    building is large, comparable across buildings, and strictly worse than any
+    sample that produced a surface.
+    """
+    d = cfg.mesh_diffusion
+    centre = batch["center"][k].cpu().numpy()
+    scale = batch["scale"][k].cpu().numpy()
+    gen_v, gen_f, _ = faces_to_mesh(sample, cfg.mesh_data.num_bins,
+                                    snap=d.snap_before_weld,
+                                    min_area=d.min_face_area)
+    if not len(gen_f):
+        return float(np.linalg.norm(scale))
+    _, gt_raw = _resolve(dataset, index)
+    d_ab, d_ba = surface_distances((gen_v * scale + centre, gen_f), gt_raw,
+                                   n=d.n_points, seed=seed)
+    return float(chamfer_distance(d_ab, d_ba))
+
+
 def run_generative_monitor(model, dataset, indices, cfg, seed=1234, scaffold=None,
                            weights="ema"):
     """Tier 2: a free-running reverse trajectory, scored distributionally.
@@ -153,7 +179,10 @@ def run_generative_monitor(model, dataset, indices, cfg, seed=1234, scaffold=Non
             ablations that do exist (NCSNv2, EDM2) are on FID.
 
     Returns:
-        dict: mean of `generative_metrics` over the sampled buildings.
+        dict: mean of `generative_metrics` over the sampled buildings, plus
+        `gen_chamfer_m` -- the monitor early stopping and checkpointing read.
+        The coordinate metrics stay as diagnostics; they cannot select, because
+        none of them can see the presence channel.
     """
     if len(indices) == 0:
         return {}
@@ -161,7 +190,7 @@ def run_generative_monitor(model, dataset, indices, cfg, seed=1234, scaffold=Non
     was_training = model.training
     model.eval()
     device = next(model.parameters()).device
-    rows = []
+    rows, chamfers = [], []
     with fixed_seed(seed), model.using_weights(weights):
         for start in range(0, len(indices), d.eval_batch_size):
             chunk = indices[start:start + d.eval_batch_size]
@@ -174,9 +203,21 @@ def run_generative_monitor(model, dataset, indices, cfg, seed=1234, scaffold=Non
                 gen = model.generate(batch, n_steps=d.gen_eval_steps,
                                      scaffold=_scaffold_hook(batch, cfg, scaffold))
             rows.append(generative_metrics(gen, batch, cfg))
+            # Per BUILDING. The sampling above dominates the cost of this tier;
+            # what these add is one `faces_to_mesh` plus one point-sampled
+            # distance per building.
+            for k, i in enumerate(chunk):
+                chamfers.append(monitor_chamfer(gen[k], batch, k, dataset,
+                                                int(i), cfg, seed))
     if was_training:
         model.train()
-    return _aggregate(rows)
+    out = _aggregate(rows)
+    out["gen_chamfer_m"] = float(np.mean(chamfers)) if chamfers else float("nan")
+    # Buildings, not chunks. `_aggregate` counts rows, and a row is a batch --
+    # which read 1 for eight buildings and, sharing the `val_` namespace with
+    # tier 3, clobbered its own honest count of 16.
+    out["n_eval"] = float(len(chamfers))
+    return out
 
 
 def run_mesh_set_eval(model, dataset, indices, cfg, seed=1234, save_dir=None,
