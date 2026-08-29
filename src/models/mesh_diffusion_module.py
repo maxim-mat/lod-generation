@@ -22,6 +22,7 @@ from src.models.mesh_processes import create_process
 from src.models.mesh_set_losses import (
     discrete_ce_loss,
     hungarian_loss,
+    masked_mean_per_sample,
     masked_mse_loss,
 )
 from src.models.mesh_set_unet import ConditionalMeshUNet
@@ -55,7 +56,7 @@ def create_denoiser(cfg, in_ch=10, out_bins=None):
             in_ch=in_ch, d_model=d.d_model, n_head=d.n_head,
             num_layers=d.num_layers, dropout=d.dropout,
             pos_embed=d.pos_embed, time_dim=d.time_dim, out_bins=out_bins,
-            pos_scale=cfg.mesh_data.max_faces or 200)
+            pos_scale=cfg.mesh_data.max_faces or 200, time_cond=d.time_cond)
     raise ValueError(f"Unknown denoiser: {d.denoiser!r}.")
 
 
@@ -112,6 +113,7 @@ class MeshDiffusionModule(L.LightningModule):
         self.loss_name = d.loss
         self.presence_weight = d.presence_weight
         self.match_presence_weight = d.match_presence_weight
+        self.min_snr_gamma = d.min_snr_gamma
 
         # The readout decides the head, not the process: a Gaussian process
         # with loss: ce also needs bin logits (Task 11, plan D10).
@@ -261,13 +263,14 @@ class MeshDiffusionModule(L.LightningModule):
         """True once the EMA holds something other than the initialisation."""
         return self.ema is not None and int(self.ema.n_averaged) > 0
 
-    def _loss(self, pred, target, batch, x0=None):
+    def _loss(self, pred, target, batch, x0=None, weight=None):
         mask = batch["x_mask"]
         if self.loss_name == "mse":
-            return masked_mse_loss(pred, target, mask, self.presence_weight)
+            return masked_mse_loss(pred, target, mask, self.presence_weight,
+                                   weight)
         if self.loss_name == "hungarian":
             return hungarian_loss(pred, target, mask, self.presence_weight,
-                                  self.match_presence_weight)
+                                  self.match_presence_weight, weight)
         if self.loss_name == "ce":
             logits, presence_logits = pred
             return discrete_ce_loss(
@@ -294,13 +297,18 @@ class MeshDiffusionModule(L.LightningModule):
         # and face count came from the label rather than the model. The mask
         # still gates the COORDINATE loss below -- that is supervision.
         pred = self._denoise(self._model_input(x_t), t, cond, None, cond_mask)
+        # min-SNR: flatten the SNR weighting an epsilon objective applies for
+        # free. `validate_combination` has already ruled out the arms where the
+        # construction does not hold, so no capability check is needed here.
+        w = (self.process.snr_weight(t, self.min_snr_gamma)
+             if self.min_snr_gamma is not None else None)
         if self.categorical:
             # The CE label is `x_bins`, which the loss reads off the batch --
             # there is no regression target to build here.
             loss = self._loss(pred, None, batch)
         else:
             loss = self._loss(pred, self.process.target_for(x0, x_t, t, aux),
-                              batch, x0=x0)
+                              batch, x0=x0, weight=w)
 
         self.log(f"{stage}_loss", loss, on_step=(stage == "train"),
                  on_epoch=True, prog_bar=True, batch_size=x0.shape[0])
@@ -315,24 +323,50 @@ class MeshDiffusionModule(L.LightningModule):
                 # nothing at high t still average to a healthy-looking number,
                 # and the uniform-vs-gaussian transition A/B is precisely a
                 # question about the high-noise buckets.
-                bucket = int(min(float(t.mean()), 0.999) * 4)
+                per_sample = (correct * m).sum(dim=(1, 2)) / (
+                    m.sum(dim=(1, 2)) * 9).clamp(min=1)
             self.log(f"{stage}_bin_acc", acc, on_epoch=True,
                      batch_size=x0.shape[0])
-            self.log(f"{stage}_bin_acc_t{bucket}", acc, on_epoch=True,
-                     batch_size=x0.shape[0])
+            self._log_by_t(stage, "bin_acc", per_sample, t)
         # Coordinate error in bins, logged separately from the objective:
         # under target=noise the loss is in epsilon units and is not comparable
         # across timesteps, so it says nothing about geometry on its own.
         if self.loss_name != "ce":
             with torch.no_grad():
-                x0_hat = self.process.to_x0(x_t, float(t[0]), pred) \
+                # `t`, not `float(t[0])`: every row draws its own time, and
+                # converting the whole batch at row 0's noise level reads the
+                # other rows off the wrong point of the schedule entirely.
+                x0_hat = self.process.to_x0(x_t, t, pred) \
                     if hasattr(self.process, "to_x0") else pred
                 err = (x0_hat[:, :9] - x0[:, :9]).abs()
-                m = batch["x_mask"][:, None, :].float()
-                bins = (err * m).sum() / m.sum().clamp(min=1) * (self.num_bins - 1)
-            self.log(f"{stage}_coord_err_bins", bins, on_epoch=True,
+                # Per SAMPLE, so the buckets below can split it by that row's
+                # own t. `masked_mean_per_sample` divides by the nine coordinate
+                # channels as well as the face slots; doing that by hand here
+                # without the channel term is what made this metric read 9x
+                # high -- 378 bins on a 128-bin grid.
+                bins = masked_mean_per_sample(err, batch["x_mask"]) \
+                    * (self.num_bins - 1)
+            self.log(f"{stage}_coord_err_bins", bins.mean(), on_epoch=True,
                      batch_size=x0.shape[0])
+            self._log_by_t(stage, "coord_err_bins", bins, t)
         return loss
+
+    def _log_by_t(self, stage, name, per_sample, t):
+        """Log `per_sample` split into four buckets of each row's OWN t.
+
+        The aggregate is the one number that cannot answer the question this
+        branch keeps hitting: an x0 estimate that is sharp at low noise and
+        carries nothing at high noise averages to a healthy-looking figure,
+        while the reverse trajectory is decided in the bucket that carries
+        nothing. Four buckets is enough to see that and cheap enough to leave
+        on for every arm.
+        """
+        bucket = (t.clamp(0.0, 0.999) * 4).long()
+        for b in range(4):
+            sel = bucket == b
+            if sel.any():
+                self.log(f"{stage}_{name}_t{b}", per_sample[sel].mean(),
+                         on_epoch=True, batch_size=int(sel.sum()))
 
     def training_step(self, batch, batch_idx):
         return self._shared_step(batch, "train")

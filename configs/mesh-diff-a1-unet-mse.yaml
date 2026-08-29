@@ -2,5 +2,6 @@
 # The closest thing to the trace-denoiser architecture this branch is ported
 # from, and the reference every other arm is read against.
 mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: mse,
-                 denoiser: unet, state: continuous, process: ddpm, target: noise}
+                 denoiser: unet, state: continuous, process: ddpm,
+                 target: original, presence_weight: 0.383}
 logging: {run_name: mesh-diff-a1-unet-mse}

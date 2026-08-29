@@ -22,13 +22,36 @@ N_COORD = 9
 PRESENCE = 9
 
 
-def _masked_mean(per_element, mask):
-    """Mean of ``[B, C, F]`` over real faces only. ``clamp`` guards empty rows."""
+def _masked_mean(per_element, mask, weight=None):
+    """Mean of ``[B, C, F]`` over real faces only. ``clamp`` guards empty rows.
+
+    Args:
+        weight: optional ``[B]`` per-sample multiplier (min-SNR). It scales the
+            numerator and the denominator alike, so it REWEIGHTS the batch
+            without rescaling the gradient. That is a deliberate departure from
+            Hang et al.'s unnormalised form: their weight is <= 1 everywhere for
+            an epsilon target, so applying it raw also shrinks the step size,
+            and the arms in this grid are read against each other at a fixed lr.
+    """
     m = mask[:, None, :].to(per_element.dtype)
+    if weight is not None:
+        m = m * weight.view(-1, 1, 1).to(per_element.dtype)
     return (per_element * m).sum() / (m.sum() * per_element.shape[1]).clamp(min=1.0)
 
 
-def masked_mse_loss(pred, target, mask, presence_weight=1.0):
+def masked_mean_per_sample(per_element, mask):
+    """``[B, C, F]`` to ``[B]``: mean over real faces AND channels, per sample.
+
+    The channel divisor is the point. Averaging a nine-channel coordinate error
+    over face slots alone reports it nine times too large, which is how a
+    128-bin grid came to log an error of 378 bins.
+    """
+    m = mask[:, None, :].to(per_element.dtype)
+    return ((per_element * m).sum(dim=(1, 2))
+            / (m.sum(dim=(1, 2)) * per_element.shape[1]).clamp(min=1.0))
+
+
+def masked_mse_loss(pred, target, mask, presence_weight=1.0, weight=None):
     """Slot-to-slot squared error, coordinates masked, presence not.
 
     Args:
@@ -37,12 +60,18 @@ def masked_mse_loss(pred, target, mask, presence_weight=1.0):
         presence_weight: multiplier on the presence channel's contribution.
             Face count moves the geometric metrics far more than a fraction of
             a bin on one vertex does, so this is a real knob and not cosmetic.
+        weight: optional ``[B]`` per-sample loss weight; see `_masked_mean`.
 
     Returns:
         Tensor: scalar.
     """
-    coord = _masked_mean((pred[:, :N_COORD] - target[:, :N_COORD]) ** 2, mask)
-    presence = ((pred[:, PRESENCE] - target[:, PRESENCE]) ** 2).mean()
+    coord = _masked_mean((pred[:, :N_COORD] - target[:, :N_COORD]) ** 2, mask,
+                         weight)
+    # Presence is scored at every slot, so it goes through the same helper with
+    # an all-true mask rather than a second weighting code path.
+    presence = _masked_mean((pred[:, PRESENCE:PRESENCE + 1]
+                             - target[:, PRESENCE:PRESENCE + 1]) ** 2,
+                            torch.ones_like(mask), weight)
     return coord + presence_weight * presence
 
 
@@ -85,7 +114,7 @@ def hungarian_match(pred, target, mask, match_presence_weight=1.0):
 
 
 def hungarian_loss(pred, target, mask, presence_weight=1.0,
-                   match_presence_weight=1.0):
+                   match_presence_weight=1.0, weight=None):
     """Set loss: match first, then the same masked MSE on the matched pairs.
 
     The matcher runs under `no_grad` -- the assignment is a discrete decision
@@ -97,6 +126,9 @@ def hungarian_loss(pred, target, mask, presence_weight=1.0,
         mask: ``[B, F]`` bool, True at real *target* faces.
         presence_weight: as `masked_mse_loss`.
         match_presence_weight: presence weight inside the matching cost.
+        weight: optional ``[B]`` per-sample loss weight; see `_masked_mean`.
+            The matcher never sees it -- reweighting the objective must not
+            change which slots correspond to which.
 
     Returns:
         Tensor: scalar.
@@ -107,7 +139,7 @@ def hungarian_loss(pred, target, mask, presence_weight=1.0,
     # the masked mean below counts the same real faces it always did.
     target_m = torch.gather(target, 2, idx)
     mask_m = torch.gather(mask, 1, assignment)
-    return masked_mse_loss(pred, target_m, mask_m, presence_weight)
+    return masked_mse_loss(pred, target_m, mask_m, presence_weight, weight)
 
 
 def discrete_ce_loss(logits, target_bins, mask, presence_logits,

@@ -451,6 +451,35 @@ class MeshDiffusionConfig:
     # Hungarian only: relative weight of presence inside the matching cost.
     match_presence_weight: float = 1.0
 
+    # How the timestep reaches the transformer denoiser's blocks.
+    # "additive": one embedding added to every token. Cheap, and what the
+    # conv path's Down/Up do -- but the addition lands immediately before a
+    # pre-norm LayerNorm, which removes the per-token mean, so a constant added
+    # to every token is exactly what the normalisation attenuates.
+    # "adaln": DiT's adaLN-Zero (Peebles & Xie, arXiv:2212.09748 sec 3.2) --
+    # shift, scale and a zero-initialised residual gate per sub-layer.
+    # Costs parameters: measured at the base config's d_model 256 /
+    # num_layers 8, the transformer goes 6.68 M -> 9.58 M.
+    # Reaches `denoiser: transformer` only; the U-Net's GroupNorm conv stack is
+    # not what adaLN modulates, and `validate_combination` warns if it is set
+    # there.
+    time_cond: str = "additive"
+
+    # min-SNR-gamma loss weighting (Hang et al., arXiv:2303.09556). None is the
+    # unweighted objective.
+    #
+    # Not cosmetic here. An epsilon objective is an x0 objective weighted by the
+    # SNR, and on this schedule the SNR spans ~1e4 to ~4e-5, so the loss is
+    # almost entirely a statement about the low-noise end while a reverse
+    # trajectory is decided at the high-noise end. Measured on the linear
+    # schedule: 52% of uniform t draws land where simply echoing the input
+    # already scores below 0.01 epsilon-MSE, which is why `val_loss` can fall
+    # 5x below the echo baseline while chamfer does not move.
+    #
+    # 5.0 is the paper's value. Defined off `alpha_bar`, so it applies to the
+    # ddpm process only -- `validate_combination` rejects it elsewhere.
+    min_snr_gamma: Optional[float] = None
+
     # Slot budget: how many face slots the model is given, independent of how
     # many the building actually has. The surplus are DETR no-object slots --
     # the model must mark them absent, and that is the ONLY mechanism deciding
@@ -828,6 +857,32 @@ def validate_combination(cfg):
             f"state: onehot with loss: {d.loss!r} regresses {9} x num_bins "
             "indicator channels as if they were coordinates. Use loss: ce, or "
             "state: quantized for a regression readout on a snapped target.")
+    if d.time_cond not in ("additive", "adaln"):
+        raise ValueError(
+            f"mesh_diffusion.time_cond must be 'additive' or 'adaln', got "
+            f"{d.time_cond!r}.")
+    if d.time_cond == "adaln" and d.denoiser == "unet":
+        logger.warning(
+            "time_cond: adaln is ignored under denoiser: unet -- adaLN-Zero "
+            "modulates a transformer's LayerNorms and the U-Net has none on "
+            "its residual stream. The arm will train, with additive time.")
+
+    if d.min_snr_gamma is not None:
+        if d.min_snr_gamma <= 0:
+            raise ValueError(
+                f"mesh_diffusion.min_snr_gamma must be positive or null, got "
+                f"{d.min_snr_gamma!r}.")
+        if d.process != "ddpm":
+            raise ValueError(
+                f"mesh_diffusion.min_snr_gamma is defined off an alpha_bar "
+                f"schedule and process: {d.process!r} has none. It applies to "
+                "process: ddpm only.")
+        if d.loss == "ce":
+            raise ValueError(
+                "mesh_diffusion.min_snr_gamma reweights a Gaussian regression "
+                "objective; loss: ce is a categorical one, where the SNR "
+                "argument does not hold. Leave it null on the ce arms.")
+
     if d.x0_clamp not in ("hard", "soft"):
         raise ValueError(
             f"mesh_diffusion.x0_clamp must be 'hard' or 'soft', got {d.x0_clamp!r}.")

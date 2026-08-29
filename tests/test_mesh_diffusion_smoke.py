@@ -548,3 +548,107 @@ def test_optimizer_excludes_the_ema_copy():
     n_opt = sum(p.numel() for g in opt.param_groups for p in g["params"])
     assert n_opt == sum(p.numel() for p in m.denoiser.parameters())
     assert n_opt < sum(p.numel() for p in m.parameters())
+
+
+# --- the x0 diagnostic, and min-SNR weighting --------------------------------
+
+class _Const(torch.nn.Module):
+    """A denoiser that returns a fixed tensor, so x0 is exactly known."""
+
+    def __init__(self, out):
+        super().__init__()
+        self.out = out
+
+    def forward(self, x, t, cond, mask, cond_mask):
+        return self.out
+
+
+def _logged(module, batch, stage="train"):
+    """Run one _shared_step, capturing what it logs instead of a real logger."""
+    seen = {}
+    module.log = lambda name, value, **kw: seen.__setitem__(name, float(value))
+    module._shared_step(batch, stage)
+    return seen
+
+
+def test_coord_err_bins_is_a_per_channel_mean_on_the_bin_grid():
+    """A perfect x0 estimate reads 0 bins; a saturated one cannot exceed the grid.
+
+    The regression: the divisor omitted the nine coordinate channels, so the
+    number came out 9x too large -- 378 bins on a 128-bin grid, which is what
+    made it look like a broken metric rather than a diagnosis.
+    """
+    m = MeshDiffusionModule(_cfg(target="original"))
+    batch = _batch()
+    # target="original" means the denoiser's output IS the x0 estimate, so a
+    # stubbed identity denoiser gives an exactly-known answer.
+    m.denoiser = _Const(batch["x"].clone())
+    seen = _logged(m, batch)
+    assert seen["train_coord_err_bins"] == pytest.approx(0.0, abs=1e-4)
+
+    m.denoiser = _Const(-batch["x"].clone())
+    seen = _logged(m, batch)
+    # Worst case is the full clamped box (width 1.0) x (num_bins - 1).
+    assert 0.0 < seen["train_coord_err_bins"] <= 127.0
+
+
+def test_coord_err_bins_is_bucketed_by_per_sample_t():
+    """Four t buckets, and a batch must land in the bucket of its OWN t.
+
+    The regression: the bucket came from `t.mean()` over the batch and the x0
+    conversion from `float(t[0])`, so both stood in one row's noise level for
+    every row.
+    """
+    m = MeshDiffusionModule(_cfg())
+    torch.manual_seed(0)
+    seen = _logged(m, _batch(b=8))
+    buckets = [k for k in seen if k.startswith("train_coord_err_bins_t")]
+    assert buckets, "no per-t buckets logged"
+    assert all(k[-1] in "0123" for k in buckets)
+    assert len(buckets) > 1, "8 uniform draws collapsed into a single bucket"
+
+
+def test_min_snr_gamma_changes_the_loss_it_does_not_rescale_it():
+    torch.manual_seed(0)
+    batch = _batch()
+    plain = MeshDiffusionModule(_cfg())
+    torch.manual_seed(1)
+    a = float(plain._shared_step(batch, "val"))
+    weighted = MeshDiffusionModule(_cfg(min_snr_gamma=5.0))
+    weighted.load_state_dict(plain.state_dict())
+    torch.manual_seed(1)
+    b = float(weighted._shared_step(batch, "val"))
+    assert a != pytest.approx(b), "min_snr_gamma had no effect"
+    assert 0.1 * a < b < 10 * a, "reweighting turned into a rescaling"
+
+
+def test_min_snr_gamma_is_rejected_where_it_is_undefined():
+    """It is an alpha_bar construction: no flow matching, no categorical arms."""
+    from src.utils.config import validate_combination
+    with pytest.raises(ValueError, match="min_snr_gamma"):
+        validate_combination(_cfg(process="flow", target="velocity",
+                                  min_snr_gamma=5.0))
+
+
+def test_adaln_arm_trains_and_samples():
+    """c7's axes end to end: the module builds, steps and generates."""
+    m = MeshDiffusionModule(_cfg(denoiser="transformer", time_cond="adaln"))
+    loss = m.training_step(_batch(), 0)
+    assert loss.dim() == 0 and torch.isfinite(loss)
+    loss.backward()
+    # Step 0 reaches the head only: `outc` is zero-initialised, so nothing
+    # upstream of it has a gradient path yet. True of the additive arm too.
+    assert m.denoiser.outc.weight.grad.abs().sum() > 0
+    assert m.denoiser.blocks[0].emb[1].weight.grad.abs().sum() == 0
+
+    # Once the head opens, the zero-init modulation must start receiving
+    # gradient -- otherwise the gates never open and the network stays the
+    # identity forever, which is the one way adaLN-Zero can fail silently.
+    opt = torch.optim.AdamW(m.denoiser.parameters(), lr=1e-3)
+    opt.step()
+    opt.zero_grad()
+    m.training_step(_batch(), 0).backward()
+    assert m.denoiser.blocks[0].emb[1].weight.grad.abs().sum() > 0
+
+    out = m.eval().generate(_batch(), n_steps=3)
+    assert out.shape == (2, 10, 16) and torch.isfinite(out).all()

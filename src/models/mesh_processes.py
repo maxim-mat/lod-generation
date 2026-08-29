@@ -166,6 +166,35 @@ class GaussianProcess(BaseProcess):
         """Static thresholding. See the class docstring for why this is on."""
         return x0 if self.x0_clip is None else x0.clamp(-self.x0_clip, self.x0_clip)
 
+    def snr_weight(self, t, gamma):
+        """min-SNR-gamma loss weight (Hang et al., arXiv:2303.09556).
+
+        An epsilon objective is not an unweighted objective. Since
+        ``x0_err = sqrt((1 - abar) / abar) * eps_err``, a uniform epsilon MSE is
+        an x0 MSE weighted by the SNR ``abar / (1 - abar)`` -- which on the
+        linear schedule here spans about 1e4 at t=0 down to 4e-5 at t=1. Nearly
+        all the objective's mass therefore sits in the last fifth of the
+        schedule, and the high-noise steps that a reverse trajectory STARTS
+        from get almost none. Capping the effective weight at `gamma` is what
+        flattens that.
+
+        Args:
+            t: ``[B]`` float time in ``[0, 1]``.
+            gamma: the cap. 5.0 is the paper's value.
+
+        Returns:
+            Tensor: ``[B]`` per-sample weight. For `target: noise` this is
+            ``min(SNR, gamma) / SNR`` -- at most 1, so it only ever removes
+            low-noise emphasis. For `target: original` the objective is already
+            in x0 units, so the weight is the bare ``min(SNR, gamma)``.
+        """
+        if gamma <= 0:
+            raise ValueError(f"min_snr_gamma must be positive, got {gamma!r}.")
+        a = self._abar(t, 1)
+        snr = a / (1 - a).clamp(min=1e-8)
+        capped = snr.clamp(max=gamma)
+        return capped / snr.clamp(min=1e-8) if self.target == "noise" else capped
+
     def step(self, x_t, t, t_prev, model_out):
         """Deterministic DDIM step (eta = 0)."""
         device = x_t.device
@@ -230,8 +259,14 @@ class FlowMatchingProcess(BaseProcess):
 
         Exact on the straight path, and it is what makes the coordinate-error
         log in `MeshDiffusionModule` comparable across all three processes.
+
+        ``t`` is a scalar (the sampler's shared timestep) or ``[B]`` (training,
+        where every row draws its own). Reshaped like `_coef` does so both
+        broadcast; without it the per-sample form silently multiplied along the
+        face axis instead.
         """
         tt = torch.as_tensor(t, device=x_t.device, dtype=x_t.dtype)
+        tt = tt.reshape(-1, *([1] * (x_t.dim() - 1)))
         return x_t + (1.0 - tt) * model_out
 
     def step(self, x_t, t, t_prev, model_out):

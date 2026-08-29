@@ -185,12 +185,19 @@ eval (`n_test=4`, `eval_steps=5`). It answers "does this config run", never
 ## 7. The arms
 
 **Stage 1 — denoiser and loss regime.** Fixed: `state: continuous`,
-`process: ddpm`, `target: noise`.
+`process: ddpm`, `target: original`, `presence_weight: 0.383`.
+
+The objective here was `target: noise` until run `mesh-diff-a1-unet-mse`
+showed the epsilon loss decoupled from geometry — it fell 5–6x below the
+echo-the-input floor while chamfer sat at 0.93 m against a 0.020 m ceiling,
+because a uniform epsilon MSE is an x0 objective weighted by an SNR spanning
+~1e4 to 4e-5. `target: original` is in x0 units at every t. Epsilon is now
+ablated by `b1-eps` rather than assumed.
 
 | arm | order | pos_embed | loss | denoiser | question |
 |---|---|---|---|---|---|
 | a1-unet-mse | morton | sinusoidal | mse | unet | the reference every other arm is read against |
-| a2-tf-mse | morton | sinusoidal | mse | transformer | is the Morton sort's locality real, or was the convolution reading noise? |
+| a2-tf-mse | morton | sinusoidal | mse | transformer | convolution against attention at matched order — *not* a test of the sort, which is a1 vs a4 |
 | a3-tf-hungarian | none | none | hungarian | transformer | is the set formulation worth a Hungarian solve per sample? |
 | a4-unet-hungarian | none | none | hungarian | unet | what does the canonical sort buy, given file order already has 72.4% adjacency? |
 
@@ -198,7 +205,7 @@ eval (`n_test=4`, `eval_steps=5`). It answers "does this config run", never
 
 | arm | state | process | loss | target | on-grid | question |
 |---|---|---|---|---|---|---|
-| b1-x0 | continuous | ddpm | mse | original | no | is x0-prediction better conditioned than ε? |
+| b1-eps | continuous | ddpm | mse | **noise** | no | is ε-prediction worse conditioned than x0? (`presence_weight` 1.0, its regime's parity) |
 | b2-flow | continuous | flow | mse | velocity | no | do straight paths beat a strided DDPM at 50 NFE? |
 | b3-quant-mse | quantized | ddpm | mse | original | no | **control** — snapping the target alone, readout unchanged |
 | b4-quant-ce | quantized | ddpm | ce | original | **yes** | categorical head on 9 coordinate channels |

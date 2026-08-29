@@ -1,6 +1,18 @@
 # Stage 1, arm 2: same data, same loss, transformer instead of the U-Net.
-# Isolates the denoiser. If the U-Net wins, the Morton sort is carrying real
-# locality; if the transformer wins, the convolution was reading noise.
+#
+# Isolates the DENOISER, and only that. Both arms are order-aware -- a1 through
+# the convolution's locality over the Morton sort, a2 through sinusoidal face
+# positions over the same sort -- so the gap prices convolution against
+# attention at matched order, and says nothing about whether the sort itself
+# carries information. That question belongs to a1 vs a4 (Morton against file
+# order, denoiser fixed); do not read it off this pair.
+#
+# Capacity is close enough not to confound it: 8.12 M parameters for the U-Net
+# against 6.68 M here, measured at the base config's d_model 256 / num_layers 8.
+# Note `num_layers` reaches the transformer only -- `create_denoiser` sizes the
+# U-Net from `d_model` alone -- so changing it moves a2 and a3 and leaves a1
+# and a4 exactly where they were.
 mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: mse,
-                 denoiser: transformer, state: continuous, process: ddpm, target: noise}
+                 denoiser: transformer, state: continuous, process: ddpm,
+                 target: original, presence_weight: 0.383}
 logging: {run_name: mesh-diff-a2-tf-mse}

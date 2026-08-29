@@ -3,5 +3,5 @@
 # plausible meshes but not plausible answers to THIS LOD1. Needs
 # cond_dropout > 0, which the base config already sets.
 mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: mse, denoiser: unet,
-                 state: continuous, process: ddpm, target: noise, guidance: 3.0}
+                 state: continuous, process: ddpm, target: original, presence_weight: 0.383, guidance: 3.0}
 logging: {run_name: mesh-diff-c2-guidance}

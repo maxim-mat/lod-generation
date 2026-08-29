@@ -10,5 +10,5 @@
 # the configs" and moves DOWN as learning rate and model capacity rise -- we
 # run at 1e-3, which is high, so a shorter average is the plausible direction.
 mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: mse, denoiser: unet,
-                 state: continuous, process: ddpm, target: noise, ema_decay: 0.99}
+                 state: continuous, process: ddpm, target: original, presence_weight: 0.383, ema_decay: 0.99}
 logging: {run_name: mesh-diff-c4-ema-short}

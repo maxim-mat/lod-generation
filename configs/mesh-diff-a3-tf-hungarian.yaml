@@ -3,5 +3,6 @@
 # solve per sample. Against a2 it isolates order+loss with the denoiser fixed.
 # No U-Net counterpart exists: the convolution needs an order (plan D5).
 mesh_diffusion: {order: none, pos_embed: none, loss: hungarian,
-                 denoiser: transformer, state: continuous, process: ddpm, target: noise}
+                 denoiser: transformer, state: continuous, process: ddpm,
+                 target: original, presence_weight: 0.383}
 logging: {run_name: mesh-diff-a3-tf-hungarian}

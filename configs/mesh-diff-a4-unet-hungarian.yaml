@@ -15,8 +15,11 @@
 # already present. A large a1 win means canonicality matters; a small one means
 # the Morton sort is mostly redundant with how the data was already stored.
 #
-# presence_weight stays at the 1.0 default: hungarian_loss delegates to
-# masked_mse_loss, and under target: noise both terms start at 1.0 already.
+# presence_weight 0.383, the x0 regime's parity value: hungarian_loss delegates
+# to masked_mse_loss, whose coordinate term starts at E[x0^2] = 0.0958 against
+# the presence target's 0.25. Under the old target: noise default both terms
+# started at 1.0 and the plain default was correct; it is not any more.
 mesh_diffusion: {order: none, pos_embed: none, loss: hungarian,
-                 denoiser: unet, state: continuous, process: ddpm, target: noise}
+                 denoiser: unet, state: continuous, process: ddpm,
+                 target: original, presence_weight: 0.383}
 logging: {run_name: mesh-diff-a4-unet-hungarian}

@@ -1,0 +1,30 @@
+# Stage 2, arm 1: epsilon-prediction instead of x0. The direction of this arm
+# is REVERSED from the plan as originally written -- block A now defaults to
+# `target: original`, so the objective being ablated here is the epsilon one.
+#
+# Why the default moved. Since x0_err = sqrt((1 - abar) / abar) * eps_err, a
+# uniform epsilon MSE is an x0 objective weighted by the SNR, which on the base
+# config's linear schedule spans ~1e4 at t=0 down to 4.0e-5 at t=1. Measured on
+# that schedule: mean abar 0.28, and 52% of uniform t draws land where echoing
+# the input already scores below 0.01 eps-MSE. Run mesh-diff-a1-unet-mse reached
+# val_loss 0.0575 -- 5-6x below the echo-the-input floor of 0.29-0.36, so the
+# denoiser genuinely learned -- while test chamfer stayed at 0.93 m against a
+# 0.020 m ground-truth ceiling. `target: original` puts the loss in x0 units at
+# every t, which is why it is now the default rather than the ablation.
+#
+# This arm is what keeps that a measured claim rather than an assumed one: it is
+# a1's axes with the objective swapped back, so a1-vs-b1-eps prices the
+# parameterisation directly. c6-minsnr is the third point on the same line --
+# epsilon WITH the SNR weighting capped -- and differs from this arm by
+# `min_snr_gamma` alone.
+#
+# presence_weight is the 1.0 default here, and that is a regime change, not an
+# oversight: under `target: noise` the epsilon target is unit variance on all
+# ten channels, so both loss terms start at 1.0 and parity is 1.0. The x0 arms
+# need 0.383 (coord 0.0958 against the presence target's 0.25). See
+# MeshDiffusionConfig.presence_weight and
+# `test_shipped_configs_equalise_presence_weight`, which pins every arm to its
+# own regime's value -- a flat weight across arms makes face count incomparable.
+mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: mse, denoiser: unet,
+                 state: continuous, process: ddpm, target: noise}
+logging: {run_name: mesh-diff-b1-eps}

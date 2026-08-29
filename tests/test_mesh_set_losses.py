@@ -13,6 +13,7 @@ from src.models.mesh_set_losses import (
     discrete_ce_loss,
     hungarian_loss,
     hungarian_match,
+    masked_mean_per_sample,
     masked_mse_loss,
 )
 
@@ -103,3 +104,54 @@ def test_discrete_ce_ignores_padded_bins():
     logits[:, :, :, 3:] = 0.0                          # wreck the padded slots
     loss_b = discrete_ce_loss(logits, bins, mask, presence_logits, mask.float())
     assert loss_a.item() == pytest.approx(loss_b.item(), rel=1e-5)
+
+
+# --- per-sample means and min-SNR reweighting --------------------------------
+
+def test_masked_mean_per_sample_divides_by_channels_too():
+    """Mean over real faces AND the nine channels -> ones average to one.
+
+    The regression this pins: `_shared_step`'s inline coord_err_bins divided by
+    `mask.sum()` alone, so a nine-channel error read nine times too large (378
+    bins on a 128-bin grid).
+    """
+    _, mask = _batch(n_real=3, width=8, batch=2)
+    per_element = torch.ones(2, 9, 8)
+    out = masked_mean_per_sample(per_element, mask)
+    assert out.shape == (2,)
+    assert torch.allclose(out, torch.ones(2))
+
+
+def test_masked_mean_per_sample_ignores_padding():
+    _, mask = _batch(n_real=3, width=8, batch=2)
+    per_element = torch.zeros(2, 9, 8)
+    per_element[:, :, 3:] = 100.0                  # padding only
+    assert torch.allclose(masked_mean_per_sample(per_element, mask),
+                          torch.zeros(2))
+
+
+def test_uniform_min_snr_weight_leaves_the_loss_alone():
+    """The weight reweights the batch; it must not rescale the gradient.
+
+    A constant weight is a no-op, so flipping min_snr_gamma on cannot silently
+    change the effective learning rate.
+    """
+    target, mask = _batch()
+    pred = target + 0.1
+    base = masked_mse_loss(pred, target, mask)
+    for c in (0.5, 1.0, 7.0):
+        w = torch.full((target.shape[0],), c)
+        assert torch.isclose(masked_mse_loss(pred, target, mask, weight=w), base,
+                             rtol=1e-5)
+
+
+def test_min_snr_weight_selects_between_samples():
+    """Weight [1, 0] must give exactly the loss of sample 0 alone."""
+    target, mask = _batch(batch=2)
+    pred = target.clone()
+    pred[0] += 0.3
+    pred[1] += 2.0
+    only_first = masked_mse_loss(pred[:1], target[:1], mask[:1])
+    weighted = masked_mse_loss(pred, target, mask,
+                               weight=torch.tensor([1.0, 0.0]))
+    assert torch.isclose(weighted, only_first, rtol=1e-5)

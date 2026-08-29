@@ -202,3 +202,74 @@ def test_transformer_discrete_head_shapes():
     logits, presence = _tf(out_bins=128)(x, t, cond, mask, cond_mask)
     assert logits.shape == (2, 9, 128, 16)
     assert presence.shape == (2, 16)
+
+
+# --- adaLN-Zero time conditioning --------------------------------------------
+
+def _tf_adaln(**kw):
+    from src.models.mesh_set_transformer import MeshSetTransformer
+    net = MeshSetTransformer(d_model=64, n_head=4, num_layers=3, time_dim=32,
+                             dropout=0.0, **kw)
+    return net.eval()
+
+
+def test_adaln_blocks_start_as_the_identity():
+    """Zero-init modulation means every gate is 0, so no block contributes.
+
+    That is the "Zero" in adaLN-Zero (Peebles & Xie, arXiv:2212.09748 sec 3.2):
+    the residual stream reaches the head untouched at step 0.
+    """
+    net = _tf_adaln(time_cond="adaln", pos_embed="none")
+    torch.nn.init.normal_(net.outc.weight, std=0.1)   # undo the head zero-init
+    x = torch.randn(2, 10, 16)
+    t = torch.rand(2)
+    with torch.no_grad():
+        got = net(x, t, None, None, None)
+        h = net.inp(x)
+        want = net.outc(net.norm(h.permute(0, 2, 1)).permute(0, 2, 1))
+    assert torch.allclose(got, want, atol=1e-6)
+
+
+def test_adaln_carries_the_timestep_once_the_gates_are_open():
+    net = _tf_adaln(time_cond="adaln", pos_embed="none")
+    torch.nn.init.normal_(net.outc.weight, std=0.1)
+    for blk in net.blocks:                            # open the zero-init gates
+        torch.nn.init.normal_(blk.emb[1].weight, std=0.05)
+    x = torch.randn(2, 10, 16)
+    with torch.no_grad():
+        lo = net(x, torch.zeros(2), None, None, None)
+        hi = net(x, torch.ones(2), None, None, None)
+    assert (lo - hi).abs().max() > 1e-3, "adaLN block ignores t"
+
+
+def test_additive_time_conditioning_is_untouched():
+    """The default path must be bit-identical -- the U-Net shares these blocks."""
+    torch.manual_seed(0)
+    a = _tf_adaln(time_cond="additive", pos_embed="none")
+    torch.manual_seed(0)
+    b = _tf_adaln(pos_embed="none")
+    # Seed each head separately: the two init calls would otherwise draw from
+    # different RNG states and the comparison would fail on the head alone.
+    torch.manual_seed(1)
+    torch.nn.init.normal_(a.outc.weight, std=0.1)
+    torch.manual_seed(1)
+    torch.nn.init.normal_(b.outc.weight, std=0.1)
+    x = torch.randn(2, 10, 16)
+    t = torch.rand(2)
+    with torch.no_grad():
+        assert torch.equal(a(x, t, None, None, None), b(x, t, None, None, None))
+
+
+def test_adaln_keeps_permutation_equivariance():
+    """Modulation is per-sample, not per-face, so a3's premise must survive."""
+    net = _tf_adaln(time_cond="adaln", pos_embed="none")
+    torch.nn.init.normal_(net.outc.weight, std=0.1)
+    for blk in net.blocks:
+        torch.nn.init.normal_(blk.emb[1].weight, std=0.05)
+    x = torch.randn(1, 10, 16)
+    t = torch.rand(1)
+    perm = torch.randperm(16)
+    with torch.no_grad():
+        a = net(x, t, None, None, None)[:, :, perm]
+        b = net(x[:, :, perm], t, None, None, None)
+    assert (a - b).abs().max() < 1e-5

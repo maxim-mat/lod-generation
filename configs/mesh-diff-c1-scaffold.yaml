@@ -8,6 +8,7 @@ mesh_diffusion:
   denoiser: unet
   state: continuous
   process: ddpm
-  target: noise
+  target: original
+  presence_weight: 0.383
   scaffold: {enabled: true, dilate: 3, apply_below_t: 0.5}
 logging: {run_name: mesh-diff-c1-scaffold}

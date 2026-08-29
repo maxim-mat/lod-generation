@@ -1,0 +1,31 @@
+# Stage 3, arm 6: a1 with min-SNR-gamma loss weighting. Nothing else moves.
+#
+# Why this arm exists. Under `target: noise` the objective is not unweighted:
+# since x0_err = sqrt((1 - abar) / abar) * eps_err, a uniform epsilon MSE IS an
+# x0 objective weighted by the SNR. On the linear schedule in the base config
+# that SNR spans ~1e4 at t=0 down to 4.0e-5 at t=1 (amplification 157x), so the
+# objective is almost entirely a statement about the low-noise end -- while a
+# reverse trajectory is decided at the high-noise end it starts from.
+#
+# Measured on this exact schedule, uniform t:
+#   * mean abar 0.28
+#   * 52% of draws land where echoing the input already scores < 0.01 eps-MSE
+#   * 74% of draws sit where an eps error is amplified >= 1x into x0
+# which is how run mesh-diff-a1-unet-mse reached val_loss 0.0575 -- 5-6x below
+# the echo-the-input floor of 0.29-0.36, so real learning -- while test chamfer
+# stayed at 0.93 m against a 0.020 m ground-truth ceiling.
+#
+# min-SNR-gamma (Hang et al., arXiv:2303.09556) caps that implicit weight at
+# gamma. 5.0 is the paper's value. For an epsilon target the weight is
+# min(SNR, gamma) / SNR, which is <= 1 everywhere -- it only ever REMOVES
+# low-noise emphasis, it cannot add high-noise emphasis of its own.
+#
+# Read against b1-eps, NOT against a1. Block A now defaults to target: original,
+# so a1 differs from this arm by the parameterisation as well as the weighting;
+# b1-eps differs by min_snr_gamma alone, which is the pair that isolates it.
+# The implementation normalises the weight across the batch (see `_masked_mean`),
+# so both arms train at the same effective lr and the gap is the weighting only.
+mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: mse,
+                 denoiser: unet, state: continuous, process: ddpm, target: noise,
+                 min_snr_gamma: 5.0}
+logging: {run_name: mesh-diff-c6-minsnr}

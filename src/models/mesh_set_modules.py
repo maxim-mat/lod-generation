@@ -77,6 +77,32 @@ def _mha_mask(key_padding_mask):
     return None if key_padding_mask is None else ~key_padding_mask
 
 
+def _modulate(h, shift, scale):
+    """FiLM a normalised ``[B, F, C]`` activation (DiT, arXiv:2212.09748 sec 3.2).
+
+    ``scale`` is the *residual* around 1, so a zero-initialised projection
+    leaves the normalised activation exactly as it found it. Both terms are
+    ``[B, C]`` -- one modulation per SAMPLE, broadcast across faces, which is
+    what keeps a modulated block permutation equivariant.
+    """
+    return h * (1.0 + scale[:, None, :]) + shift[:, None, :]
+
+
+def _run_ff(ff, h, mod=None):
+    """Run a ``Sequential(LayerNorm, Linear, GELU, Linear)`` with optional FiLM.
+
+    Indexes into the Sequential rather than splitting it into two attributes so
+    the parameter names -- and therefore every existing checkpoint -- survive
+    the addition of modulation.
+    """
+    hn = ff[0](h)
+    if mod is not None:
+        hn = _modulate(hn, *mod)
+    for layer in ff[1:]:
+        hn = layer(hn)
+    return hn
+
+
 class SelfAttention1d(nn.Module):
     """Pre-norm multi-head self-attention over the face axis, channels-first."""
 
@@ -89,14 +115,25 @@ class SelfAttention1d(nn.Module):
             nn.LayerNorm(channels), nn.Linear(channels, channels),
             nn.GELU(), nn.Linear(channels, channels))
 
-    def forward(self, x, key_padding_mask=None):
-        """``[B, C, F] -> [B, C, F]``. ``key_padding_mask`` is [B, F], True = real."""
+    def forward(self, x, key_padding_mask=None, mod=None):
+        """``[B, C, F] -> [B, C, F]``. ``key_padding_mask`` is [B, F], True = real.
+
+        Args:
+            mod: optional adaLN-Zero modulation, six ``[B, C]`` tensors
+                ``(shift, scale, gate)`` for the attention branch then the same
+                for the feed-forward one. ``None`` is the plain pre-norm block
+                the U-Net uses, and is bit-identical to the unmodulated form.
+        """
         h = x.permute(0, 2, 1)
+        sh_a, sc_a, g_a, sh_f, sc_f, g_f = mod if mod is not None else (None,) * 6
         hn = self.ln(h)
+        if mod is not None:
+            hn = _modulate(hn, sh_a, sc_a)
         attn, _ = self.mha(hn, hn, hn, key_padding_mask=_mha_mask(key_padding_mask),
                            need_weights=False)
-        h = h + attn
-        h = h + self.ff(h)
+        h = h + (attn if mod is None else g_a[:, None, :] * attn)
+        ff = _run_ff(self.ff, h, None if mod is None else (sh_f, sc_f))
+        h = h + (ff if mod is None else g_f[:, None, :] * ff)
         return h.permute(0, 2, 1)
 
 
@@ -119,17 +156,28 @@ class CrossAttention1d(nn.Module):
             nn.LayerNorm(channels), nn.Linear(channels, channels),
             nn.GELU(), nn.Linear(channels, channels))
 
-    def forward(self, x, cond, cond_mask=None):
-        """``x [B,C,F]``, ``cond [B,D,Fc]`` -> ``[B,C,F]``. ``cond=None`` is a no-op."""
+    def forward(self, x, cond, cond_mask=None, mod=None):
+        """``x [B,C,F]``, ``cond [B,D,Fc]`` -> ``[B,C,F]``. ``cond=None`` is a no-op.
+
+        Args:
+            mod: optional adaLN-Zero modulation, as `SelfAttention1d`. Only the
+                QUERY norm is modulated; `ln_kv` normalises the condition, which
+                is not on the residual stream the timestep is steering.
+        """
         if cond is None:
             return x
         h = x.permute(0, 2, 1)
+        sh_a, sc_a, g_a, sh_f, sc_f, g_f = mod if mod is not None else (None,) * 6
         kv = self.ln_kv(cond.permute(0, 2, 1))
-        attn, _ = self.mha(self.ln_q(h), kv, kv,
+        q = self.ln_q(h)
+        if mod is not None:
+            q = _modulate(q, sh_a, sc_a)
+        attn, _ = self.mha(q, kv, kv,
                            key_padding_mask=_mha_mask(cond_mask),
                            need_weights=False)
-        h = h + attn
-        h = h + self.ff(h)
+        h = h + (attn if mod is None else g_a[:, None, :] * attn)
+        ff = _run_ff(self.ff, h, None if mod is None else (sh_f, sc_f))
+        h = h + (ff if mod is None else g_f[:, None, :] * ff)
         return h.permute(0, 2, 1)
 
 

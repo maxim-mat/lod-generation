@@ -9,5 +9,5 @@
 # Read c4 / base / c5 as a three-point sweep, with each run's own
 # `val_gen_*_live` curve as the zero-length end of the same axis.
 mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: mse, denoiser: unet,
-                 state: continuous, process: ddpm, target: noise, ema_decay: 0.9999}
+                 state: continuous, process: ddpm, target: original, presence_weight: 0.383, ema_decay: 0.9999}
 logging: {run_name: mesh-diff-c5-ema-long}

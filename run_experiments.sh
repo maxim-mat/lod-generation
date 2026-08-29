@@ -42,7 +42,7 @@ DIFF_STAGE1=(
 # the long runs. Within stage 2 that means the continuous arms before the
 # 1153-channel one-hot arm.
 DIFF_STAGE2=(
-  configs/mesh-diff-b1-x0.yaml
+  configs/mesh-diff-b1-eps.yaml
   configs/mesh-diff-b2-flow.yaml
   configs/mesh-diff-b3-quant-mse.yaml
   configs/mesh-diff-b4-quant-ce.yaml
@@ -57,6 +57,8 @@ DIFF_STAGE3=(
   configs/mesh-diff-c3-clamp-soft.yaml
   configs/mesh-diff-c4-ema-short.yaml
   configs/mesh-diff-c5-ema-long.yaml
+  configs/mesh-diff-c6-minsnr.yaml
+  configs/mesh-diff-c7-adaln.yaml
 )
 # The revisit pass. The grid is greedy -- stage 1 ranks denoiser and loss under
 # ONE objective and stage 2 assumes that ranking transfers to six others -- and

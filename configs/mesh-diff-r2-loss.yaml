@@ -11,11 +11,13 @@
 # and the order axis simply does not reach those objectives -- which is a real
 # limitation of the grid, not an oversight to route around. Record it and skip.
 #
-# Ships at b1's objective. Before launching: set the objective to stage 2's
+# Ships at b1-eps's objective. Before launching: set the objective to stage 2's
 # winner, having first confirmed its loss is `mse`.
-# presence_weight 0.383: parity at init for target: original. hungarian_loss
-# delegates to masked_mse_loss, so it shares the mse regime exactly.
+#
+# presence_weight is the 1.0 default, which is parity for target: noise;
+# hungarian_loss delegates to masked_mse_loss so it shares the mse regime
+# exactly. Retarget the weight along with the objective -- x0 needs 0.383.
 mesh_diffusion: {order: none, pos_embed: none, loss: hungarian,
                  denoiser: transformer, state: continuous, process: ddpm,
-                 target: original, presence_weight: 0.383}
+                 target: noise}
 logging: {run_name: mesh-diff-r2-loss}

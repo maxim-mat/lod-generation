@@ -1,8 +1,0 @@
-# Stage 2, arm 1: x0-prediction instead of epsilon. Better conditioned at low
-# noise, and the parameterisation every set-based generative model uses.
-# presence_weight 0.383: parity at init for this arm's regime
-# (target: original -> coord 0.0958 vs presence 0.2500). See MeshDiffusionConfig.presence_weight -- a flat 1.0
-# makes arms with different targets/readouts incomparable on face count.
-mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: mse, denoiser: unet,
-                 state: continuous, process: ddpm, target: original, presence_weight: 0.383}
-logging: {run_name: mesh-diff-b1-x0}

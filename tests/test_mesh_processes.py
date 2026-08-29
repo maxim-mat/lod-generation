@@ -286,3 +286,56 @@ def test_x0_clip_leaves_in_range_predictions_untouched():
 def test_x0_clip_rejects_a_nonpositive_bound():
     with pytest.raises(ValueError, match="positive or None"):
         GaussianProcess(x0_clip=0.0)
+
+
+# --- per-sample t, and min-SNR weighting -------------------------------------
+
+def test_to_x0_honours_a_per_sample_t():
+    """Each row of a batch draws its own t, so to_x0 must use its own abar.
+
+    The regression this pins: `_shared_step` used to hand `float(t[0])` to
+    to_x0, converting every row of the batch at row 0's noise level.
+    """
+    p = GaussianProcess(noise_steps=1000)
+    x0 = torch.randn(4, 10, 8) * 0.3
+    t = torch.tensor([0.05, 0.3, 0.6, 0.95])
+    x_t, eps = p.corrupt(x0, t)
+    # target="noise", so the true epsilon is the perfect model output.
+    assert torch.allclose(p.to_x0(x_t, t, eps), x0.clamp(-0.5, 0.5), atol=1e-4)
+    # The scalar form is what the bug did: rows 1..3 come back wrong.
+    scalar = p.to_x0(x_t, float(t[0]), eps)
+    assert not torch.allclose(scalar[1:], x0[1:].clamp(-0.5, 0.5), atol=1e-3)
+
+
+def test_min_snr_weight_caps_the_epsilon_objectives_snr_weighting():
+    """eps-MSE is an SNR-weighted x0 objective; min-SNR caps that weight at gamma."""
+    p = GaussianProcess(noise_steps=1000, target="noise")
+    t = torch.tensor([0.02, 0.25, 0.5, 0.9])
+    a = p._abar(t, 1)
+    snr = a / (1 - a)
+    w = p.snr_weight(t, gamma=5.0)
+    assert torch.allclose(w * snr, snr.clamp(max=5.0), rtol=1e-5)
+    assert (w <= 1.0 + 1e-6).all()               # never upweights
+    assert w[-1].item() == pytest.approx(1.0)    # high noise: already below gamma
+
+
+def test_min_snr_weight_for_an_x0_target_is_the_bare_cap():
+    p = GaussianProcess(noise_steps=1000, target="original")
+    t = torch.tensor([0.02, 0.5, 0.9])
+    a = p._abar(t, 1)
+    assert torch.allclose(p.snr_weight(t, gamma=5.0),
+                          (a / (1 - a)).clamp(max=5.0), rtol=1e-5)
+
+
+def test_flow_process_has_no_snr_weight():
+    """min-SNR is defined off an alpha_bar schedule; flow matching has none."""
+    assert not hasattr(FlowMatchingProcess(), "snr_weight")
+
+
+def test_flow_to_x0_honours_a_per_sample_t():
+    """Same scalar-t assumption the Gaussian process never had."""
+    p = FlowMatchingProcess()
+    x0 = torch.randn(4, 10, 8)
+    t = torch.tensor([0.1, 0.4, 0.7, 0.95])
+    x_t, noise = p.corrupt(x0, t)
+    assert torch.allclose(p.to_x0(x_t, t, x0 - noise), x0, atol=1e-5)
