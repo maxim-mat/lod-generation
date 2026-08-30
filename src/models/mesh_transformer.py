@@ -765,6 +765,7 @@ class MeshTransformerModule(L.LightningModule):
     def __init__(self, num_bins=NUM_BINS, d_model=256, n_head=8, num_layers=6,
                  dropout=0.1, max_seq_len=4096, lr=1e-4,
                  lr_scheduler="none", lr_decay_steps=50, lr_decay_rate=0.5,
+                 warmup_steps=0, weight_decay=0.01,
                  vqvae=None, backbone="scratch", opt_name="facebook/opt-350m",
                  opt_pretrained=True, opt_config=None,
                  tokenization="coord", mask_invalid=False, pos_embed="learned",
@@ -798,6 +799,8 @@ class MeshTransformerModule(L.LightningModule):
         self.lr_scheduler = lr_scheduler
         self.lr_decay_steps = lr_decay_steps
         self.lr_decay_rate = lr_decay_rate
+        self.warmup_steps = warmup_steps
+        self.weight_decay = weight_decay
 
         # Adjacent Mesh Tokenization (MeshAnything V2, arXiv:2408.02555). Only
         # meaningful on the coordinate path: under the VQ-VAE the sequence is
@@ -1216,35 +1219,109 @@ class MeshTransformerModule(L.LightningModule):
     def test_step(self, batch, batch_idx):
         return self._eval_step(batch, "test", batch_idx)
 
-    def configure_optimizers(self):
-        # requires_grad filter, not self.parameters(): a frozen VQ-VAE handed to
-        # AdamW would still accumulate optimizer state for every codebook entry.
-        optimizer = torch.optim.AdamW(
-            [p for p in self.parameters() if p.requires_grad], lr=self.lr)
+    def _param_groups(self):
+        """Two groups: weight matrices decay, everything else does not.
 
-        if self.lr_scheduler == "cosine":
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=self.trainer.max_epochs if self.trainer else 100,
-                eta_min=1e-6,
-            )
-        elif self.lr_scheduler == "step":
-            scheduler = torch.optim.lr_scheduler.StepLR(
-                optimizer, step_size=self.lr_decay_steps, gamma=self.lr_decay_rate)
-        elif self.lr_scheduler == "none":
-            return optimizer
-        else:
+        Split by MODULE TYPE, not by tensor shape. The `p.dim() >= 2` heuristic
+        common in LLM codebases is borrowed from settings where every 2-D tensor
+        really is a large matrix; here it would decay `segment_embed` (2 rows)
+        and `role_embed` (10 rows), which are learned offsets added to a very
+        large number of tokens -- biases wearing a 2-D shape. Shrinking those
+        toward zero has the same wrong meaning it has for a LayerNorm gain.
+
+        `requires_grad`, not `self.parameters()`: a frozen VQ-VAE handed to
+        AdamW would still accumulate optimizer state for every codebook entry.
+
+        Returns:
+            list: AdamW param groups. The undecayed group is omitted when it is
+            empty, and the decayed one when `weight_decay` is 0, so the
+            optimizer never receives a group with no parameters.
+        """
+        no_decay_ids = set()
+        for mod in self.modules():
+            if isinstance(mod, (nn.Embedding, nn.LayerNorm, nn.GroupNorm,
+                                nn.BatchNorm1d, nn.BatchNorm2d)):
+                no_decay_ids |= {id(p) for p in mod.parameters(recurse=False)}
+
+        decay, no_decay, seen = [], [], set()
+        for p in self.parameters():
+            # Dedup by identity: a tied weight appears under two names, and a
+            # parameter handed to AdamW twice is stepped twice.
+            if not p.requires_grad or id(p) in seen:
+                continue
+            seen.add(id(p))
+            # dim() < 2 catches every bias and every norm gain, including those
+            # belonging to module types not listed above.
+            (no_decay if id(p) in no_decay_ids or p.dim() < 2 else decay).append(p)
+
+        groups = []
+        if decay:
+            groups.append({"params": decay, "weight_decay": float(self.weight_decay)})
+        if no_decay:
+            groups.append({"params": no_decay, "weight_decay": 0.0})
+        return groups
+
+    def configure_optimizers(self):
+        """AdamW, with optional linear warmup composed over any schedule.
+
+        Deliberately the same shape as `MeshDiffusionModule.configure_optimizers`
+        so the two branches anneal identically and a cross-branch comparison is
+        not confounded by the schedule.
+
+        Warmup runs on the STEP interval, never the epoch one. Lightning
+        defaults `interval` to "epoch", so a 2000-step warmup left on the
+        default would ramp over 2000 *epochs*. It trains, badly and silently.
+        """
+        import torch.optim.lr_scheduler as S
+
+        optimizer = torch.optim.AdamW(self._param_groups(), lr=self.lr)
+        warmup = int(self.warmup_steps)
+
+        if self.lr_scheduler not in ("none", "cosine", "step"):
             raise ValueError(f"Unknown lr_scheduler: {self.lr_scheduler}")
 
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "val_loss",
-                "interval": "epoch",
-                "frequency": 1,
-            },
-        }
+        if self.lr_scheduler == "none":
+            if warmup <= 0:
+                return optimizer
+            # Ramp, then flat.
+            scheduler = S.LambdaLR(optimizer,
+                                   lambda step: min(1.0, (step + 1) / warmup))
+            return {"optimizer": optimizer,
+                    "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
+
+        if self.lr_scheduler == "step":
+            if warmup > 0:
+                raise ValueError(
+                    "warmup_steps > 0 with lr_scheduler: step mixes a "
+                    "step-interval ramp with an epoch-interval decay. Use "
+                    "'none' or 'cosine'.")
+            scheduler = S.StepLR(optimizer, step_size=self.lr_decay_steps,
+                                 gamma=self.lr_decay_rate)
+            return {"optimizer": optimizer,
+                    "lr_scheduler": {"scheduler": scheduler,
+                                     "interval": "epoch", "frequency": 1}}
+
+        # Cosine. T_max in STEPS, from Lightning's own estimate, which accounts
+        # for max_epochs, accumulation and devices. The previous version used
+        # `max_epochs` on the epoch interval, which silently disagrees with a
+        # step-interval warmup -- and on the full corpus, where one epoch is
+        # ~13k optimizer steps, annealing over `max_epochs` points is a staircase.
+        # `_trainer`, not `trainer`: the property raises when detached, which a
+        # unit test calling this directly always is.
+        trainer = getattr(self, "_trainer", None)
+        total = int(trainer.estimated_stepping_batches) if trainer else 1000
+        if warmup <= 0:
+            scheduler = S.CosineAnnealingLR(optimizer, T_max=total,
+                                            eta_min=0.01 * self.lr)
+        else:
+            scheduler = S.SequentialLR(
+                optimizer,
+                [S.LinearLR(optimizer, start_factor=1e-3, total_iters=warmup),
+                 S.CosineAnnealingLR(optimizer, T_max=max(total - warmup, 1),
+                                     eta_min=0.01 * self.lr)],
+                milestones=[warmup])
+        return {"optimizer": optimizer,
+                "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
 
     def _step_logits(self, cond, tgt, cond_pad_mask, cache=None):
         """Next-token logits for each row of `tgt`, with invalid ones masked.

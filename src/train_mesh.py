@@ -135,6 +135,8 @@ def train_mesh(cfg: Config):
         lr_scheduler=cfg.training.lr_scheduler,
         lr_decay_steps=cfg.training.lr_decay_steps,
         lr_decay_rate=cfg.training.lr_decay_rate,
+        warmup_steps=cfg.training.warmup_steps,
+        weight_decay=cfg.training.weight_decay,
         vqvae=vqvae,
         backbone=cfg.mesh_model.backbone,
         opt_name=cfg.mesh_model.opt_name,

@@ -601,6 +601,20 @@ class TrainingConfig:
     # mesh_vqvae and diffusion branches ignore it, so setting it there is a
     # silent no-op rather than an error.
     warmup_steps: int = 0
+    # AdamW's own default, so leaving this unset reproduces every run trained
+    # before it was exposed. It applies ONLY to weight matrices: embeddings,
+    # norm gains and biases are put in a second, undecayed param group.
+    # Decay shrinks a parameter toward zero, which is a sensible prior for a
+    # weight matrix and a wrong one for a LayerNorm gain (whose meaningful
+    # default is 1) or a bias (one parameter per unit, no capacity to
+    # regularize). Decoupled decay is applied every step independently of the
+    # gradient, so its strength scales with lr x steps -- at the v3 arms' flat
+    # 5e-5 it was a 5% nudge, at 1e-3 with cosine over 30 full-corpus epochs it
+    # is a ~7x pull, which is what made the exclusion worth doing.
+    #
+    # Read by the mesh transformer only. `MeshDiffusionModule` still uses
+    # AdamW's default on a single group.
+    weight_decay: float = 0.01
     lr_decay_steps: int = 50
     lr_decay_rate: float = 0.5
     early_stopping: EarlyStoppingConfig = field(default_factory=EarlyStoppingConfig)

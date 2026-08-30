@@ -445,3 +445,154 @@ def test_condition_that_fills_the_budget_is_rejected_not_silently_empty():
                                    opt_config=_tiny_opt_cfg(8)).eval()
     with torch.no_grad(), pytest.raises(ValueError, match="no room"):
         module.generate(torch.randint(0, NUM_BINS, (1, 18)), temperature=0.0)
+
+
+# ----------------------------------------------------------------------
+# Warmup + cosine (training.warmup_steps)
+# ----------------------------------------------------------------------
+
+def _sched_module(**kw):
+    return MeshTransformerModule(num_bins=NUM_BINS, d_model=16, n_head=2,
+                                 num_layers=1, dropout=0.0, max_seq_len=64, **kw)
+
+
+def _lrs(out, n):
+    """The lr this config would use over its first ``n`` optimizer steps."""
+    opt = out["optimizer"]
+    sched = out["lr_scheduler"]["scheduler"]
+    seen = []
+    for _ in range(n):
+        seen.append(opt.param_groups[0]["lr"])
+        opt.step()
+        sched.step()
+    return seen
+
+
+def test_no_warmup_and_no_schedule_still_returns_a_bare_optimizer():
+    """The v3 arms ran this way; the new knob must not change them."""
+    import torch as _t
+    assert isinstance(_sched_module(lr_scheduler="none").configure_optimizers(),
+                      _t.optim.Optimizer)
+
+
+def test_warmup_ramps_on_the_step_interval_not_the_epoch_one():
+    """Left on Lightning's default `interval: epoch`, a 50-step warmup ramps
+    over 50 EPOCHS -- tens of thousands of steps of ramp. It trains, badly and
+    silently, which is the whole reason this is asserted."""
+    out = _sched_module(lr=1e-3, lr_scheduler="cosine",
+                        warmup_steps=50).configure_optimizers()
+    assert isinstance(out, dict)
+    assert out["lr_scheduler"]["interval"] == "step"
+
+    lrs = _lrs(out, 60)
+    assert lrs[0] < 1e-4, "warmup must start far below the peak"
+    assert lrs[:50] == sorted(lrs[:50]), "warmup must be monotonically rising"
+    # Peak is the configured lr, reached at the end of the ramp.
+    assert abs(max(lrs) - 1e-3) < 1e-5
+
+
+def test_cosine_anneals_down_from_the_peak_after_the_ramp():
+    """Stepped over the WHOLE horizon, which is 1000 when the module is
+    detached from a trainer -- annealing is only complete at T_max, so a
+    partial walk reads as "no anneal" and says nothing."""
+    out = _sched_module(lr=1e-3, lr_scheduler="cosine",
+                        warmup_steps=20).configure_optimizers()
+    lrs = _lrs(out, 1000)
+    peak = max(lrs)
+    assert lrs.index(peak) <= 21, "peak must be at the end of warmup, not later"
+    assert lrs[-1] < 0.05 * peak, "cosine must anneal to near eta_min"
+    # eta_min is 1% of the peak, not zero: a schedule that reaches exactly 0
+    # stops training rather than finishing it.
+    assert lrs[-1] > 0
+
+
+def test_warmup_with_a_step_schedule_is_rejected_rather_than_silently_wrong():
+    """A step-interval ramp composed with an epoch-interval decay is not a
+    schedule anyone chose; refuse it instead of running it."""
+    import pytest as _p
+    with _p.raises(ValueError, match="warmup"):
+        _sched_module(lr_scheduler="step", warmup_steps=50).configure_optimizers()
+
+
+def test_warmup_is_saved_as_a_hyperparameter():
+    """It has to survive the checkpoint, or a resumed run silently re-ramps."""
+    m = _sched_module(lr_scheduler="cosine", warmup_steps=123)
+    assert m.hparams.warmup_steps == 123
+
+
+# ----------------------------------------------------------------------
+# Weight decay grouping (training.weight_decay)
+# ----------------------------------------------------------------------
+
+def _groups(m):
+    """(decayed, undecayed) param-id sets from configure_optimizers."""
+    out = m.configure_optimizers()
+    opt = out["optimizer"] if isinstance(out, dict) else out
+    decayed, undecayed = set(), set()
+    for g in opt.param_groups:
+        (decayed if g["weight_decay"] > 0 else undecayed).update(id(p) for p in g["params"])
+    return decayed, undecayed
+
+
+def test_weight_decay_defaults_to_adamws_own_default():
+    """0.01, so leaving it unset reproduces what every run so far actually used."""
+    m = _sched_module()
+    assert m.hparams.weight_decay == 0.01
+
+
+def test_embeddings_norms_and_biases_are_excluded_from_decay():
+    """Decay shrinks toward zero, which is only a sensible prior for a weight
+    matrix. A LayerNorm gain's meaningful default is 1, a bias carries one
+    parameter per unit, and an embedding row here is a hot lookup in a
+    131-symbol vocabulary with no cold rows to regularize."""
+    import torch.nn as nn
+    m = _sched_module(lr_scheduler="none", weight_decay=0.01)
+    decayed, undecayed = _groups(m)
+
+    excluded = set()
+    for mod in m.modules():
+        if isinstance(mod, (nn.Embedding, nn.LayerNorm)):
+            excluded |= {id(p) for p in mod.parameters(recurse=False)}
+    for p in m.parameters():
+        if p.dim() < 2:                      # every bias, and every norm gain
+            excluded.add(id(p))
+
+    assert excluded, "fixture built no embeddings or norms -- test is vacuous"
+    assert excluded <= undecayed, "an embedding, norm or bias is being decayed"
+    assert not (excluded & decayed)
+
+
+def test_every_linear_weight_is_still_decayed():
+    """The exclusion must not turn weight decay off altogether -- Linear weights
+    are the whole point of the knob.
+
+    Asserted per tensor, not as a share of parameters: at this fixture's
+    d_model=16 the embedding table is a third of the model, so a ratio test
+    would only be measuring the fixture's width. At the configs' real widths the
+    decayed share is 99.43% (scratch) and 99.62% (opt-125m).
+    """
+    import torch.nn as nn
+    m = _sched_module(lr_scheduler="none", weight_decay=0.01)
+    decayed, _ = _groups(m)
+    linears = [(n, mod.weight) for n, mod in m.named_modules()
+               if isinstance(mod, nn.Linear) and mod.weight.requires_grad]
+    assert linears, "fixture built no Linear layers -- test is vacuous"
+    missing = [n for n, w in linears if id(w) not in decayed]
+    assert not missing, f"Linear weights excluded from decay: {missing}"
+
+
+def test_every_trainable_parameter_lands_in_exactly_one_group():
+    """A split that drops a parameter stops training it, silently."""
+    m = _sched_module(lr_scheduler="none", weight_decay=0.01)
+    decayed, undecayed = _groups(m)
+    assert not (decayed & undecayed), "a parameter is in both groups"
+    trainable = {id(p) for p in m.parameters() if p.requires_grad}
+    assert decayed | undecayed == trainable, "a trainable parameter was dropped"
+
+
+def test_zero_weight_decay_still_yields_a_usable_optimizer():
+    """Turning the knob off must not depend on the grouping code path."""
+    m = _sched_module(lr_scheduler="none", weight_decay=0.0)
+    decayed, undecayed = _groups(m)
+    assert not decayed
+    assert undecayed == {id(p) for p in m.parameters() if p.requires_grad}
