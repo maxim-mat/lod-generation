@@ -729,3 +729,71 @@ def test_the_shipped_monitor_is_the_geometric_one():
     base = OmegaConf.load("configs/mesh-diff-base.yaml")
     assert base.training.early_stopping.monitor == "val_gen_chamfer_m"
     assert base.training.checkpoint.monitor == "val_gen_chamfer_m"
+
+
+def test_a_real_fit_binds_early_stopping_and_checkpointing_to_the_monitor(tmp_path):
+    """End to end: the shipped config's monitor must exist in a real fit.
+
+    `EarlyStopping(strict=True)` raises when its metric is missing, and
+    ModelCheckpoint's filename template interpolates it -- so a monitor that is
+    named in the config but never logged kills the run on epoch 1 rather than
+    degrading quietly. Unit-testing `run_generative_monitor` does not cover the
+    wiring; this does.
+    """
+    import lightning as L
+    from omegaconf import OmegaConf
+    from src.eval.mesh_set_eval import MeshSetEvalCallback
+    from src.utils.setup_utils import create_callbacks
+
+    base = OmegaConf.load("configs/mesh-diff-base.yaml")
+    monitor = base.training.early_stopping.monitor
+
+    cfg = _cfg()
+    cfg.mesh_data.max_faces = 32
+    cfg.mesh_diffusion.slot_budget = 32
+    cfg.mesh_diffusion.gen_eval_steps = 3
+    cfg.mesh_diffusion.n_val_gen = 2
+    cfg.mesh_diffusion.every_n_epochs = 0          # tier 3 off; tier 2 must survive
+    cfg.training.early_stopping.enabled = True
+    cfg.training.early_stopping.monitor = monitor
+    cfg.training.early_stopping.mode = "min"
+    cfg.training.checkpoint.enabled = True
+    cfg.training.checkpoint.monitor = monitor
+    cfg.training.checkpoint.mode = "min"
+    cfg.training.checkpoint.filename = "{epoch:02d}-{" + monitor + ":.5f}"
+
+    ds = _gen_ds()
+
+    class _DM(L.LightningDataModule):
+        train_dataset = val_dataset = test_dataset = ds
+
+        def _dl(self):
+            from src.dataset.mesh_set_dataset import mesh_set_collate_fn
+            from functools import partial
+            return torch.utils.data.DataLoader(
+                ds, batch_size=2, collate_fn=partial(
+                    mesh_set_collate_fn, multiple_of=8,
+                    width=cfg.mesh_diffusion.slot_budget,
+                    num_bins=cfg.mesh_data.num_bins))
+
+        train_dataloader = val_dataloader = test_dataloader = _dl
+
+    from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
+    # Only the two under test: the progress bar and the lr monitor need a
+    # logger/progress-bar-enabled Trainer and are irrelevant here.
+    callbacks = [c for c in create_callbacks(cfg, tmp_path)
+                 if isinstance(c, (EarlyStopping, ModelCheckpoint))]
+    assert len(callbacks) == 2, f"config did not build both callbacks: {callbacks}"
+    callbacks.append(MeshSetEvalCallback(cfg, tmp_path, seed=0))
+    trainer = L.Trainer(max_epochs=2, accelerator="cpu", devices=1,
+                        callbacks=callbacks, logger=False,
+                        enable_progress_bar=False, enable_model_summary=False)
+    trainer.fit(MeshDiffusionModule(cfg), datamodule=_DM())
+
+    assert monitor in trainer.callback_metrics, (
+        f"{monitor} never reached callback_metrics; early stopping would raise. "
+        f"Logged: {sorted(trainer.callback_metrics)}")
+    assert math.isfinite(float(trainer.callback_metrics[monitor]))
+    written = list(tmp_path.rglob("*.ckpt"))
+    assert written, "no checkpoint was written"
+    assert monitor.split("_", 1)[1][:3] in written[0].name or "epoch" in written[0].name
