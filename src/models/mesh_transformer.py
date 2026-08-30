@@ -42,7 +42,12 @@ from src.dataset.mesh_dataset import (
     specials,
     vocab_size,
 )
-from src.eval.mesh_metrics import chamfer_distance, surface_distances
+from src.eval.mesh_metrics import (
+    chamfer_distance,
+    chamfer_floor,
+    chamfer_ratio,
+    surface_distances,
+)
 from src.models.embeddings import SinusoidalPositionEmbedding
 
 logger = logging.getLogger(__name__)
@@ -1150,11 +1155,39 @@ class MeshTransformerModule(L.LightningModule):
         if len(gen[1]) == 0 or len(ref[1]) == 0:
             return
 
-        d_ab, d_ba = surface_distances((gen[0] * scale + center, gen[1]),
-                                       (ref[0] * scale + center, ref[1]), n=1024)
+        gen_m = (gen[0] * scale + center, gen[1])
+        ref_m = (ref[0] * scale + center, ref[1])
+        d_ab, d_ba = surface_distances(gen_m, ref_m, n=1024)
         value = chamfer_distance(d_ab, d_ba)
         if np.isfinite(value):
             self.log(f"{prefix}_tf_chamfer_m", value, on_epoch=True,
+                     batch_size=logits.shape[0])
+
+        # The do-nothing floor for THIS sample: the LOD1 condition handed back
+        # unchanged, scored against the same reference at the same 1024 points.
+        # It is logged as its own series rather than annotated on the chart
+        # because W&B has no horizontal-reference primitive on a run panel -- a
+        # constant series drawn in the same panel is the reference line.
+        #
+        # The condition is dataset tokens whatever the model speaks, so it
+        # decodes with the dataset's inverse and not with `decode_tokens`. Costs
+        # a second `surface_distances` per logged sample (~44 ms), which is why
+        # it rides the existing stride rather than getting its own.
+        inverse = amt_detokenize if self.tokenization == "amt" else detokenize
+        lod1 = inverse(batch["cond"][i].detach().cpu().numpy(), self.num_bins)
+        floor = chamfer_floor((lod1[0] * scale + center, lod1[1]), ref_m,
+                              n_points=1024)
+        if np.isfinite(floor):
+            self.log(f"{prefix}_tf_chamfer_floor_m", floor, on_epoch=True,
+                     batch_size=logits.shape[0])
+        # Below 1.0 the model is beating the identity; at 1.0 it has learned
+        # nothing its input did not already say. Logged as well as the two raw
+        # series because it needs no y-axis rescaling to be readable, and
+        # because a mean of per-building ratios is size-normalized where a
+        # ratio of two means is dominated by the largest building in the split.
+        rel = chamfer_ratio(value, floor)
+        if np.isfinite(rel):
+            self.log(f"{prefix}_tf_chamfer_rel", rel, on_epoch=True,
                      batch_size=logits.shape[0])
 
     def training_step(self, batch, batch_idx):

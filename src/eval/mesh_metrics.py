@@ -139,6 +139,57 @@ def chamfer_distance(d_ab, d_ba):
     return 0.5 * (float(d_ab.mean()) + float(d_ba.mean()))
 
 
+def chamfer_floor(lod1, ref, n_points, seed=0):
+    """Chamfer in metres of the do-nothing prediction: LOD1 handed back as-is.
+
+    The reference line every logged chamfer needs. A distance in metres cannot
+    be read on its own -- 0.2 m is excellent on a cathedral and worse than
+    useless on a shed -- and the honest comparison is not the corpus mean in
+    `src/eval/lod1_baseline.py` but this: the *same* buildings, scored against
+    the *same* reference at the *same* point budget as the model's own number.
+    A run that sits above its floor has not yet learned anything its input did
+    not already say.
+
+    Args:
+        lod1: ``(verts [V,3] metres, faces)`` -- the condition, decoded exactly
+            the way the model's own output is decoded, so the two numbers are
+            the same quantity.
+        ref: the mesh `lod1` is scored against. Must be whatever the generated
+            mesh is scored against, or the ratio compares two different things.
+        n_points, seed: passed to `surface_distances`. Must match the call that
+            produced the number this is a floor for.
+
+    Returns:
+        float: ``nan`` when either side has no surface, matching
+        `chamfer_distance`.
+    """
+    if not len(np.asarray(lod1[1])) or not len(np.asarray(ref[1])):
+        return float("nan")
+    d_ab, d_ba = surface_distances(lod1, ref, n=n_points, seed=seed)
+    return float(chamfer_distance(d_ab, d_ba))
+
+
+def chamfer_ratio(value, floor, min_floor=1e-3):
+    """``value / floor``, or nan where the ratio is not defined.
+
+    Split out because every call site has the same two traps: a nan on either
+    side, and a floor at zero -- LOD1 and LOD2 being the same mesh, so doing
+    nothing is already a perfect answer. Either one, left in the series,
+    poisons the epoch mean for every other building in the split.
+
+    `min_floor` is a length in metres, not an epsilon guarding division. The
+    zero case does not arrive as an exact zero: point-sampled distances between
+    two copies of one mesh come out around 1e-16, which divides to 1e16 rather
+    than raising. Below a millimetre of surface difference the condition simply
+    IS the target -- the building has no LOD2 detail to predict -- and the
+    ratio carries noise instead of information, so the sample is dropped from
+    this series. It still appears in the two raw series it was computed from.
+    """
+    if not np.isfinite(value) or not np.isfinite(floor) or floor < min_floor:
+        return float("nan")
+    return float(value / floor)
+
+
 def f_score(d_ab, d_ba, tau):
     """Precision / recall / F1 of surface points falling within ``tau`` metres.
 

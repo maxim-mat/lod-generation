@@ -131,6 +131,31 @@ mesh scores the LOD1 box diagonal — tens of metres — rather than nan.
 Read it against `val_chamfer_m` (tier 3) only within an arm: this runs at 20
 reverse steps and tier 3 at 50, so the monitor is the pessimistic one.
 
+**`val_gen_chamfer_floor_m`** — the do-nothing reference, logged at the same
+steps so it draws as a flat line in the same panel (W&B has no horizontal
+annotation on a run panel; a constant series is the reference line). It is the
+LOD1 condition handed back as the sample, through the same `faces_to_mesh` and
+scored against the same raw LOD2 at the same point budget, so it is the same
+quantity as the metric above. **Above this line the run has learned nothing its
+input did not already say.** Constant for a fixed split and seed, so
+`MeshSetEvalCallback` computes it once and reuses it for every later epoch and
+for both weight sets.
+
+**`val_gen_chamfer_rel`** — the same thing as a ratio, which is the one to put
+on the dashboard: 1.0 is the floor, below 1.0 the model is earning its weights,
+and it needs no y-axis rescaling to read. It is a mean of *per-building*
+ratios, not a ratio of the two means — chamfer scales with building size, so
+the latter is decided by whichever building in the split happens to be largest,
+and the two will not agree. Buildings whose floor is under 1 mm (LOD1 already
+is LOD2, so there was no detail to predict) are dropped from this series only;
+they still appear in the two raw ones.
+
+Tier 3 carries `val_chamfer_floor_m` / `val_chamfer_rel` on the same terms, and
+the autoregressive branch logs `{train,val}_tf_chamfer_floor_m` /
+`_tf_chamfer_rel` beside its teacher-forced chamfer plus
+`val_gen_chamfer_floor_m` beside the free-running one, so the two branches can
+be read against the same reference.
+
 **`val_gen_coord_mse`** — a diagnostic, and *not* a selection metric. It masks
 by the target's face mask and never reads the predicted presence channel, so it
 cannot see face count: a model that marks every slot absent scores a perfect
@@ -156,6 +181,13 @@ ordinality argument is wrong for this data, which is a result.
 `val_watertight_gen`, and the **`val_gt_*` ceiling** — the ground truth pushed
 through the same snap/weld pipeline. `gt_chamfer_m` is ~0.016 m and is **not
 zero**: read every generated number against that row, never against 0.
+
+With the floor logged as well, a run's position is bracketed on both sides: the
+`gt_` ceiling is the best this representation can score and the floor is what
+doing nothing scores. A useful run sits between them. Note that when LOD1 and
+LOD2 are the same building the floor lands *on* the ceiling rather than at
+zero — both pass through the bin grid while the raw LOD2 they are scored
+against does not.
 
 ---
 

@@ -21,7 +21,9 @@ import torch
 
 from src.dataset.mesh_dataset import write_obj
 from src.dataset.mesh_set_dataset import mesh_set_collate_fn
-from src.eval.mesh_metrics import chamfer_distance, mesh_metrics, surface_distances
+from src.eval.mesh_metrics import (chamfer_distance, chamfer_floor,
+                                   chamfer_ratio, mesh_metrics,
+                                   surface_distances)
 from src.models.mesh_set_postprocess import faces_to_mesh
 from src.post_process.post_process import mesh_to_cityjson, save_to_file
 
@@ -162,8 +164,43 @@ def monitor_chamfer(sample, batch, k, dataset, index, cfg, seed):
     return float(chamfer_distance(d_ab, d_ba))
 
 
+def monitor_floor(batch, k, dataset, index, cfg, seed):
+    """The do-nothing chamfer for one building: LOD1 handed back as the sample.
+
+    What makes `monitor_chamfer` readable. That metric is an absolute distance
+    in metres and chamfer scales with building size, so it cannot say on its
+    own whether a run has learned anything -- only whether it beats echoing its
+    own input can.
+
+    The condition goes through the same `faces_to_mesh` the sample does and is
+    scored against the same raw LOD2 at the same point budget, so the two
+    numbers are the same quantity and their ratio means something.
+
+    Depends only on the data and the index -- never on the weights -- so
+    `run_generative_monitor` caches it rather than paying for it every
+    validation epoch, twice over once EMA and live weights are both scored.
+    """
+    d = cfg.mesh_diffusion
+    centre = batch["center"][k].cpu().numpy()
+    scale = batch["scale"][k].cpu().numpy()
+    v, f, _ = faces_to_mesh(batch["cond"][k], cfg.mesh_data.num_bins,
+                            snap=d.snap_before_weld, min_area=d.min_face_area)
+    _, gt_raw = _resolve(dataset, index)
+    # No box-diagonal stand-in here, unlike the empty *sample* case: a
+    # condition that decodes to nothing is a broken input, not a model failure,
+    # and scoring it as "very bad" would quietly flatter every ratio it feeds.
+    return chamfer_floor((v * scale + centre, f), gt_raw, n_points=d.n_points,
+                         seed=seed)
+
+
+def _nanmean(values):
+    """Mean over the defined entries; nan when there are none."""
+    vals = [v for v in values if np.isfinite(v)]
+    return float(np.mean(vals)) if vals else float("nan")
+
+
 def run_generative_monitor(model, dataset, indices, cfg, seed=1234, scaffold=None,
-                           weights="ema"):
+                           weights="ema", floors=None):
     """Tier 2: a free-running reverse trajectory, scored distributionally.
 
     Runs every validation epoch, so it is sized to be cheap: `n_val_gen`
@@ -177,6 +214,10 @@ def run_generative_monitor(model, dataset, indices, cfg, seed=1234, scaffold=Non
             is which of the two wins on a paired distortion metric: SR3 and
             Palette both use EMA throughout without ablating it, and the
             ablations that do exist (NCSNv2, EDM2) are on FID.
+        floors: cache of ``{index: do-nothing chamfer}``, filled in place. The
+            floor is a property of the data, so a caller that holds one dict
+            across epochs pays for it once instead of every validation epoch.
+            None computes it fresh each call.
 
     Returns:
         dict: mean of `generative_metrics` over the sampled buildings, plus
@@ -190,7 +231,8 @@ def run_generative_monitor(model, dataset, indices, cfg, seed=1234, scaffold=Non
     was_training = model.training
     model.eval()
     device = next(model.parameters()).device
-    rows, chamfers = [], []
+    floors = {} if floors is None else floors
+    rows, chamfers, floor_vals = [], [], []
     with fixed_seed(seed), model.using_weights(weights):
         for start in range(0, len(indices), d.eval_batch_size):
             chunk = indices[start:start + d.eval_batch_size]
@@ -209,10 +251,22 @@ def run_generative_monitor(model, dataset, indices, cfg, seed=1234, scaffold=Non
             for k, i in enumerate(chunk):
                 chamfers.append(monitor_chamfer(gen[k], batch, k, dataset,
                                                 int(i), cfg, seed))
+                if int(i) not in floors:
+                    floors[int(i)] = monitor_floor(batch, k, dataset, int(i),
+                                                   cfg, seed)
+                floor_vals.append(floors[int(i)])
     if was_training:
         model.train()
     out = _aggregate(rows)
     out["gen_chamfer_m"] = float(np.mean(chamfers)) if chamfers else float("nan")
+    # The reference line for the metric above, and the ratio that makes the gap
+    # readable without rescaling the panel: 1.0 is "no better than echoing the
+    # LOD1 input". Mean of per-building ratios rather than a ratio of the two
+    # means, which chamfer's dependence on building size would let the largest
+    # building in the split decide.
+    out["gen_chamfer_floor_m"] = _nanmean(floor_vals)
+    out["gen_chamfer_rel"] = _nanmean(
+        [chamfer_ratio(c, f) for c, f in zip(chamfers, floor_vals)])
     # Buildings, not chunks. `_aggregate` counts rows, and a row is a batch --
     # which read 1 for eight buildings and, sharing the `val_` namespace with
     # tier 3, clobbered its own honest count of 16.
@@ -287,6 +341,19 @@ def run_mesh_set_eval(model, dataset, indices, cfg, seed=1234, save_dir=None,
                     # An all-absent sample is a real failure mode of a presence
                     # channel, and silently dropping it would flatter the average.
                     row["chamfer_m"] = float("nan")
+                # The do-nothing floor, the companion to the `gt_` ceiling
+                # below: the LOD1 condition through the same `faces_to_mesh`,
+                # scored against the same raw LOD2. A run's real position is
+                # between the two, and above the floor it has learned nothing
+                # its input did not already say.
+                cond_v, cond_f, _ = faces_to_mesh(
+                    batch["cond"][k], num_bins, snap=d.snap_before_weld,
+                    min_area=d.min_face_area)
+                row["chamfer_floor_m"] = chamfer_floor(
+                    (cond_v * scale + centre, cond_f), gt_raw,
+                    n_points=d.n_points, seed=seed)
+                row["chamfer_rel"] = chamfer_ratio(row["chamfer_m"],
+                                                   row["chamfer_floor_m"])
                 row["n_faces"] = float(stats["n_faces"])
                 row["n_verts"] = float(stats["n_verts"])
                 row["empty"] = float(len(gen_f) == 0)
@@ -353,6 +420,11 @@ class MeshSetEvalCallback(L.Callback):
         # None means "let run_mesh_set_eval build one per batch from that
         # batch's LOD1", which is the only place the condition is known.
         self._scaffold = None
+        # {index: do-nothing chamfer} for the val split. `eval_indices` is a
+        # pure function of the split length and the seed, so the same buildings
+        # are scored every epoch and their floor never changes -- computing it
+        # once turns a per-epoch cost into a one-off.
+        self._floors = {}
 
     def _due(self, epoch):
         n = self.d.every_n_epochs
@@ -390,12 +462,12 @@ class MeshSetEvalCallback(L.Callback):
         logs = {}
         metrics = run_generative_monitor(pl_module, dataset, indices, self.cfg,
                                          seed=self.seed, scaffold=self._scaffold,
-                                         weights="ema")
+                                         weights="ema", floors=self._floors)
         logs.update({f"val_{k}": v for k, v in metrics.items()})
         if pl_module.ema_active:
             live = run_generative_monitor(pl_module, dataset, indices, self.cfg,
                                           seed=self.seed, scaffold=self._scaffold,
-                                          weights="live")
+                                          weights="live", floors=self._floors)
             logs.update({f"val_{k}_live": v for k, v in live.items()})
         else:
             # Before ema_start_step the two are the same weights; a second pass

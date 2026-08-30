@@ -22,8 +22,10 @@ import lightning as L
 import numpy as np
 import torch
 
-from src.dataset.mesh_dataset import mesh_collate_fn, specials, write_obj
-from src.eval.mesh_metrics import mesh_metrics, surface_distances, chamfer_distance
+from src.dataset.mesh_dataset import (amt_detokenize, detokenize, mesh_collate_fn,
+                                      specials, write_obj)
+from src.eval.mesh_metrics import (chamfer_distance, chamfer_floor, chamfer_ratio,
+                                   mesh_metrics, surface_distances)
 from src.post_process.post_process import mesh_to_cityjson, save_to_file
 
 logger = logging.getLogger(__name__)
@@ -133,6 +135,26 @@ def run_mesh_eval(model, dataset, indices, cfg, max_new_tokens, seed=1234,
 
             row = mesh_metrics(gen, ref, taus=tuple(cfg.taus),
                                n_points=cfg.n_points, voxel_m=cfg.voxel_m)
+
+            # The do-nothing floor, beside the ceiling this function already
+            # reports: hand the LOD1 condition back as the prediction and score
+            # it against the same `ref` at the same point budget. `chamfer_m`
+            # alone says nothing -- a run's real position is between this and
+            # `gt_rt_chamfer_m`, and above the floor it has learned nothing its
+            # input did not already say. The condition is dataset tokens
+            # whatever vocabulary the model speaks, so it decodes with the
+            # dataset's inverse rather than through `decode_tokens`.
+            inverse = (amt_detokenize if model.tokenization == "amt"
+                       else detokenize)
+            lod1 = inverse(batch["cond"][k].cpu().numpy(), model.num_bins)
+            row["chamfer_floor_m"] = chamfer_floor(
+                (lod1[0] * scale + centre, lod1[1]), ref, n_points=cfg.n_points)
+            # Mean of per-building ratios, not a ratio of the two means: chamfer
+            # scales with building size, so the latter is decided by whichever
+            # building in the split is largest.
+            row["chamfer_rel"] = chamfer_ratio(row["chamfer_m"],
+                                               row["chamfer_floor_m"])
+
             row["decode_rate"] = float(len(gen[1]) > 0)
             row["eos_rate"] = float((tokens == eos).any())
 
