@@ -14,15 +14,25 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 from omegaconf import OmegaConf
 
-from src.utils.config import PosthocEvalConfig
+from src.analysis.exact_volume import exact_pair_volumes
+from src.eval.mesh_metrics import (chamfer_distance, hausdorff_max, hausdorff_p95,
+                                   is_watertight_mesh, roof_submesh,
+                                   surface_distances)
+from src.eval.sinkhorn import mesh_sinkhorn
+from src.utils.config import PosthocEvalConfig, SinkhornConfig
 
 logger = logging.getLogger(__name__)
 
 METRICS = ("chamfer", "hausdorff", "vol_symdiff", "sinkhorn", "roof_chamfer")
 REFERENCES = ("lod1", "lod2")
 SPLITS = ("train", "val", "test")
+
+# Per-reference numeric columns that summaries average. Order is CSV order.
+METRIC_COLUMNS = ("chamfer_m", "hausdorff_p95_m", "hausdorff_max_m", "symdiff_m3",
+                  "rel_symdiff", "sinkhorn_m", "roof_chamfer_m")
 
 # Which StrategyConfig fields each kind reads, in run-name order.
 STRATEGY_PARAMS = {
@@ -131,3 +141,56 @@ def load_posthoc_config(path, overrides):
                              OmegaConf.load(path),
                              OmegaConf.from_dotlist(list(overrides)))
     return OmegaConf.to_object(merged)
+
+
+def score_object(gen, refs, metrics, n_points=4096, sinkhorn_cfg=None, seed=0,
+                 device="cpu"):
+    """Every selected metric of one generated mesh against every reference.
+
+    Args:
+        gen: ``(verts [V, 3] metres, faces [F, 3])``.
+        refs: reference name -> mesh; columns get the suffix ``_vs_<name>``.
+        metrics: subset of `METRICS`.
+        n_points: surface samples for chamfer, Hausdorff and roof chamfer.
+        sinkhorn_cfg: `SinkhornConfig`; None uses its defaults.
+        seed: surface-sampling seed shared by every sampled metric.
+        device: torch device for the Sinkhorn solve.
+
+    Returns:
+        dict: column -> value. Undefined metrics are ``nan``, never an
+        exception: a free-running generation is often empty or open.
+    """
+    sink = sinkhorn_cfg or SinkhornConfig()
+    row = {"n_faces_gen": int(len(np.asarray(gen[1]).reshape(-1, 3))),
+           "watertight_gen": float(is_watertight_mesh(gen[1]))}
+    nan = float("nan")
+
+    for name, ref in refs.items():
+        sfx = f"_vs_{name}"
+        if "chamfer" in metrics or "hausdorff" in metrics:
+            d_ab, d_ba = surface_distances(gen, ref, n=n_points, seed=seed)
+            if "chamfer" in metrics:
+                row["chamfer_m" + sfx] = chamfer_distance(d_ab, d_ba)
+            if "hausdorff" in metrics:
+                row["hausdorff_p95_m" + sfx] = hausdorff_p95(d_ab, d_ba)
+                row["hausdorff_max_m" + sfx] = hausdorff_max(d_ab, d_ba)
+        if "vol_symdiff" in metrics:
+            # Exact CSG; `ok` is False unless both are closed, outward solids.
+            vol = exact_pair_volumes(gen, ref)
+            ok = bool(vol["ok"])
+            row["symdiff_m3" + sfx] = float(vol["symdiff_m3"]) if ok else nan
+            row["rel_symdiff" + sfx] = float(vol["rel_symdiff"]) if ok else nan
+            row["vol_ok" + sfx] = ok
+            row["vol_note" + sfx] = vol["note"]
+        if "sinkhorn" in metrics:
+            row["sinkhorn_m" + sfx] = mesh_sinkhorn(
+                gen, ref, n_points=sink.n_points, blur=sink.blur_m,
+                max_iters=sink.max_iters, tol=sink.tol, seed=seed, device=device)
+        if "roof_chamfer" in metrics:
+            roof_gen, roof_ref = roof_submesh(*gen), roof_submesh(*ref)
+            if len(roof_gen[1]) and len(roof_ref[1]):
+                row["roof_chamfer_m" + sfx] = chamfer_distance(
+                    *surface_distances(roof_gen, roof_ref, n=n_points, seed=seed))
+            else:
+                row["roof_chamfer_m" + sfx] = nan
+    return row

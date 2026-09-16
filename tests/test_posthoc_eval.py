@@ -103,3 +103,71 @@ def test_loading_requires_a_checkpoint(tmp_path):
 def test_the_shipped_config_is_valid():
     cfg = load_posthoc_config(ROOT / "configs" / "posthoc-eval.yaml", [])
     assert len(validate_posthoc_config(cfg)) == 7
+
+
+# ---------------------------------------------------------------- Task 5
+
+import trimesh
+
+from src.eval.posthoc_eval import METRICS, score_object
+from src.utils.config import SinkhornConfig
+
+SINK = SinkhornConfig(n_points=256, blur_m=0.05, max_iters=2000, tol=1e-9)
+
+
+def _box(dz=0.0):
+    b = trimesh.creation.box(extents=(2.0, 2.0, 2.0))
+    return (np.asarray(b.vertices, dtype=float) + np.array([0.0, 0.0, dz]),
+            np.asarray(b.faces, dtype=np.int64))
+
+
+def _score(gen, ref, metrics=METRICS):
+    return score_object(gen, {"gt": ref}, metrics, n_points=1024, sinkhorn_cfg=SINK)
+
+
+def test_a_box_against_itself_scores_zero_everywhere():
+    row = _score(_box(), _box())
+    for key in ("chamfer_m", "hausdorff_p95_m", "hausdorff_max_m", "sinkhorn_m",
+                "roof_chamfer_m"):
+        assert row[f"{key}_vs_gt"] < 1e-9, key
+    assert row["vol_ok_vs_gt"] is True
+    assert row["rel_symdiff_vs_gt"] < 1e-9
+    assert row["watertight_gen"] == 1.0 and row["n_faces_gen"] == 12
+
+
+def test_a_lifted_box_scores_the_known_geometry():
+    """2 m cube lifted 0.5 m: overlap 2x2x1.5 = 6 m^3, so the symmetric
+    difference is 8 + 8 - 2*6 = 4 m^3 and the union 10 m^3. The roofs are
+    parallel 2x2 squares 0.5 m apart, so their chamfer is exactly 0.5 m."""
+    row = _score(_box(0.5), _box())
+    assert row["symdiff_m3_vs_gt"] == pytest.approx(4.0, abs=1e-9)
+    assert row["rel_symdiff_vs_gt"] == pytest.approx(0.4, abs=1e-9)
+    assert row["roof_chamfer_m_vs_gt"] == pytest.approx(0.5, abs=1e-6)
+    assert row["sinkhorn_m_vs_gt"] == pytest.approx(0.5, abs=0.02)
+    assert row["chamfer_m_vs_gt"] > 0
+    assert row["hausdorff_max_m_vs_gt"] >= row["hausdorff_p95_m_vs_gt"]
+
+
+def test_an_open_mesh_has_no_volume_but_still_has_distances():
+    v, f = _box()
+    row = _score((v, f[:-2]), _box())
+    assert row["vol_ok_vs_gt"] is False and np.isnan(row["symdiff_m3_vs_gt"])
+    assert row["vol_note_vs_gt"]
+    assert row["watertight_gen"] == 0.0
+    assert np.isfinite(row["chamfer_m_vs_gt"])
+
+
+def test_an_empty_generation_is_nan_not_an_exception():
+    empty = (np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64))
+    row = _score(empty, _box())
+    for key in ("chamfer_m", "hausdorff_max_m", "sinkhorn_m", "roof_chamfer_m",
+                "symdiff_m3"):
+        assert np.isnan(row[f"{key}_vs_gt"]), key
+    assert row["n_faces_gen"] == 0 and row["watertight_gen"] == 0.0
+
+
+def test_only_requested_metrics_and_references_produce_columns():
+    row = score_object(_box(), {"lod1": _box(), "lod2": _box(0.5)}, ["chamfer"],
+                       n_points=256)
+    metric_cols = sorted(k for k in row if "_vs_" in k)
+    assert metric_cols == ["chamfer_m_vs_lod1", "chamfer_m_vs_lod2"]
