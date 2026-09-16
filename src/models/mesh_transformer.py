@@ -206,6 +206,70 @@ def invalid_logits_mask(tgt, vocab, num_bins, tokenization="coord", pad=None):
     return mask
 
 
+
+def filter_logits(logits, temperature, top_p=None, min_p=None):
+    """Temperature, then nucleus and/or min-p truncation, for one decoding step.
+
+    Temperature is applied first and the filter reads the tempered
+    probabilities -- the HuggingFace logits-warper order -- so a higher
+    temperature widens what the filter admits.
+
+    * top-p (Holtzman et al., arXiv:1904.09751): keep the smallest
+      highest-probability set whose cumulative mass reaches ``top_p``.
+    * min-p (Nguyen et al., arXiv:2407.01082): keep tokens with
+      ``p >= min_p * max(p)``.
+
+    Given both, a token must pass both. The most likely token always survives,
+    so combined with `invalid_logits_mask` a row can never be left with nothing
+    to sample.
+
+    Args:
+        logits: [B, V], already masked with ``-inf`` where illegal.
+        temperature (float): > 0. Greedy decoding never calls this.
+        top_p (float, optional): in (0, 1].
+        min_p (float, optional): in [0, 1].
+
+    Returns:
+        Tensor: [B, V] tempered logits, ``-inf`` where filtered out.
+    """
+    if temperature <= 0:
+        raise ValueError(f"filter_logits needs temperature > 0, got {temperature}.")
+    if top_p is not None and not 0.0 < top_p <= 1.0:
+        raise ValueError(f"top_p must be in (0, 1], got {top_p}.")
+    if min_p is not None and not 0.0 <= min_p <= 1.0:
+        raise ValueError(f"min_p must be in [0, 1], got {min_p}.")
+
+    scaled = logits.float() / temperature
+    probs = torch.softmax(scaled, dim=-1)
+    keep = torch.ones_like(probs, dtype=torch.bool)
+    if top_p is not None:
+        sorted_p, order = probs.sort(dim=-1, descending=True)
+        # Mass strictly before each token: a token stays while the set so far
+        # has not yet reached top_p, which keeps the token that crosses it.
+        before = sorted_p.cumsum(dim=-1) - sorted_p
+        keep &= torch.zeros_like(keep).scatter(-1, order, before < top_p)
+    if min_p is not None:
+        keep &= probs >= min_p * probs.max(dim=-1, keepdim=True).values
+    keep.scatter_(-1, probs.argmax(dim=-1, keepdim=True), True)
+    return scaled.masked_fill(~keep, float("-inf"))
+
+
+def _gumbel_argmax(logits, generators):
+    """One categorical draw per row, each from that row's own generator.
+
+    Gumbel-max: ``argmax(logits + G)`` with ``G = -log(-log(U))`` is an exact
+    sample from ``softmax(logits)``. Drawing ``U`` per row, rather than one
+    ``torch.multinomial`` over the batch, is what makes a row's sample depend on
+    its own seed only -- not on which buildings share its batch or their order.
+    """
+    u = torch.stack([torch.rand(logits.shape[-1], generator=g, device=logits.device)
+                     for g in generators])
+    # rand is in [0, 1): clamp the 0 end so the double log stays finite.
+    gumbel = -torch.log(-torch.log(u.clamp_min(torch.finfo(u.dtype).tiny)))
+    return (logits.float() + gumbel).argmax(dim=-1)
+
+
+
 # AMT token roles, laid out exactly as MeshAnything V2's `OPTLoopEmbedding`
 # (arXiv:2408.02555; MeshAnything/models/shape_opt.py, a 10-row table):
 #
@@ -1419,7 +1483,7 @@ class MeshTransformerModule(L.LightningModule):
     @torch.no_grad()
     def generate(self, cond, cond_pad_mask=None, max_new_tokens=None,
                  temperature=1.0, beam_size=1, length_penalty=1.0,
-                 use_cache=True):
+                 use_cache=True, top_p=None, min_p=None, seeds=None):
         """Decode an LOD2 token sequence from LOD1 tokens.
 
         Args:
@@ -1443,6 +1507,12 @@ class MeshTransformerModule(L.LightningModule):
                 biased toward short sequences -- and short here means a mesh
                 with fewer triangles, so the default is 1.0 (mean log-prob
                 per token) rather than the usual 0.
+            top_p, min_p: truncate the sampling distribution; see
+                `filter_logits`. Need ``temperature > 0`` and ``beam_size == 1``.
+            seeds: one int per row. Each row then samples from its own
+                generator, so its tokens do not depend on its batch neighbours.
+                Ignored by greedy and beam decoding. None samples from the
+                global RNG exactly as before these arguments existed.
 
         Returns:
             Tensor: [B, L] generated tokens, BOS-led, EOS-terminated where the
@@ -1458,6 +1528,18 @@ class MeshTransformerModule(L.LightningModule):
                 "deterministic argmax over sequences and a random draw at the "
                 "same time. Use temperature<=0 with beams, or beam_size=1 to "
                 "sample.")
+        filtered = top_p is not None or min_p is not None
+        if filtered and beam_size > 1:
+            raise ValueError(
+                f"top_p/min_p truncate a sampling distribution, but beam_size="
+                f"{beam_size} runs a deterministic beam search that never samples.")
+        if filtered and temperature <= 0:
+            raise ValueError(
+                f"top_p/min_p need temperature > 0 to sample, got {temperature}; "
+                "temperature <= 0 is greedy argmax, which no filter can change.")
+        if seeds is not None and len(seeds) != cond.shape[0]:
+            raise ValueError(f"seeds has {len(seeds)} entries for a batch of "
+                             f"{cond.shape[0]} rows; pass one seed per row.")
         budget = self.network.generation_budget(cond.shape[1])
         if budget < 1:
             raise ValueError(
@@ -1478,15 +1560,26 @@ class MeshTransformerModule(L.LightningModule):
         tgt = torch.full((cond.shape[0], 1), bos, dtype=torch.long, device=cond.device)
         done = torch.zeros(cond.shape[0], dtype=torch.bool, device=cond.device)
         cache = self.network.new_cache(cond, cond_pad_mask) if use_cache else None
+        generators = None
+        if seeds is not None and temperature > 0:
+            generators = [torch.Generator(device=cond.device).manual_seed(int(s))
+                          for s in seeds]
 
         for _ in range(max_new_tokens):
             logits = self._step_logits(cond, tgt, cond_pad_mask, cache)
 
             if temperature <= 0:
                 nxt = logits.argmax(dim=-1)
-            else:
+            elif not filtered and generators is None:
                 nxt = torch.multinomial(
                     torch.softmax(logits / temperature, dim=-1), num_samples=1).squeeze(-1)
+            else:
+                warped = filter_logits(logits, temperature, top_p=top_p, min_p=min_p)
+                if generators is None:
+                    nxt = torch.multinomial(torch.softmax(warped, dim=-1),
+                                            num_samples=1).squeeze(-1)
+                else:
+                    nxt = _gumbel_argmax(warped, generators)
             nxt = torch.where(done, torch.full_like(nxt, self.pad), nxt)
             tgt = torch.cat([tgt, nxt[:, None]], dim=1)
             done |= nxt == eos
