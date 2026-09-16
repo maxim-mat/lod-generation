@@ -683,6 +683,69 @@ class GenerativeEvalConfig:
     ref_max_samples: int = 2000
 
 @dataclass
+class StrategyConfig:
+    """One decoding strategy for `src.eval.posthoc_eval`.
+
+    Every param is a list, and lists expand as a cartesian product within the
+    strategy. Params that do not belong to `kind` must stay null:
+      greedy -- none
+      beam   -- beam_size, length_penalty (defaults to [1.0])
+      top_p  -- top_p, temperature
+      min_p  -- min_p, temperature
+    """
+    kind: str = MISSING
+    beam_size: Optional[List[int]] = None
+    length_penalty: Optional[List[float]] = None
+    top_p: Optional[List[float]] = None
+    min_p: Optional[List[float]] = None
+    temperature: Optional[List[float]] = None
+
+
+@dataclass
+class SinkhornConfig:
+    """Debiased Sinkhorn divergence settings (`src.eval.sinkhorn`)."""
+    n_points: int = 2048      # surface samples per mesh, same seed both sides
+    blur_m: float = 0.1       # entropic length scale; eps = blur_m ** 2
+    max_iters: int = 500      # cap at the final epsilon
+    tol: float = 1e-6         # dual-potential change, m^2
+
+
+def _default_strategies():
+    return [StrategyConfig(kind="greedy"),
+            StrategyConfig(kind="beam", beam_size=[3, 5], length_penalty=[1.0]),
+            StrategyConfig(kind="top_p", top_p=[0.95], temperature=[0.6, 1.2]),
+            StrategyConfig(kind="min_p", min_p=[0.05], temperature=[0.6, 1.2])]
+
+
+@dataclass
+class PosthocEvalConfig:
+    """Post-hoc scoring of one mesh-transformer checkpoint under many decoders.
+
+    Holds only eval settings. Data, split seed, tokenizer and model shape all
+    come from `reference_config`, the run's own training config, so the split
+    and the vocabulary cannot drift from what the checkpoint was trained on.
+    """
+    reference_config: str = MISSING
+    checkpoint: str = MISSING
+    # Dot-list applied to the reference, e.g. a relocated dataset_dir.
+    reference_overrides: List[str] = field(default_factory=list)
+    split: str = "val"
+    # None scores the whole split; else a seeded subsample via eval_indices.
+    max_objects: Optional[int] = None
+    batch_size: int = 8
+    seed: int = 1234
+    device: str = "auto"
+    # None -> <save_dir>/<experiment_name>/<run_name>/posthoc_eval
+    output_dir: Optional[str] = None
+    strategies: List[StrategyConfig] = field(default_factory=_default_strategies)
+    metrics: List[str] = field(default_factory=lambda: [
+        "chamfer", "hausdorff", "vol_symdiff", "sinkhorn", "roof_chamfer"])
+    references: List[str] = field(default_factory=lambda: ["lod1", "lod2"])
+    n_points: int = 4096      # surface samples for the chamfer family
+    sinkhorn: SinkhornConfig = field(default_factory=SinkhornConfig)
+
+
+@dataclass
 class Config:
     """Root configuration class."""
     mode: str = "train"  # "train" or "inference"

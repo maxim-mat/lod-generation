@@ -1,0 +1,32 @@
+# Post-hoc evaluation across decoding strategies.
+# Usage: python -m src.eval.posthoc_eval --config configs/posthoc-eval.yaml [dot.overrides]
+#
+# Holds only eval settings. Data, split seed, tokenizer and model shape come from
+# `reference_config`, the run's own training config.
+
+reference_config: configs/mesh-v5-full-coord.yaml
+checkpoint: outputs/initial-runs/mesh-v5-full-coord/checkpoints/last.ckpt
+# Dot-list applied to the reference, e.g.
+#   ["mesh_data.dataset_dir=data/The Hague/mini_remote"]
+reference_overrides: []
+
+split: val
+# null scores the whole split (~26k objects on cleaner). Set e.g. 256 for a
+# first pass; the subsample is seeded, so it is the same buildings every time.
+max_objects: null
+batch_size: 8
+seed: 1234
+device: auto
+output_dir: null      # null -> <save_dir>/<experiment_name>/<run_name>/posthoc_eval
+
+# List-valued params expand as a cartesian product within each strategy.
+strategies:
+  - {kind: greedy}
+  - {kind: beam,  beam_size: [3, 5], length_penalty: [1.0]}
+  - {kind: top_p, top_p: [0.95], temperature: [0.6, 1.2]}
+  - {kind: min_p, min_p: [0.05], temperature: [0.6, 1.2]}
+
+metrics: [chamfer, hausdorff, vol_symdiff, sinkhorn, roof_chamfer]
+references: [lod1, lod2]
+n_points: 4096
+sinkhorn: {n_points: 2048, blur_m: 0.1, max_iters: 500, tol: 1.0e-6}
