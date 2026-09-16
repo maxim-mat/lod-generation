@@ -241,10 +241,16 @@ Real-data sanity and baseline check (`tests/test_metric_sanity_real.py`):
 - LOD1 vs its LOD2: every defined value is finite and non-negative and at least
   its self-score; `hausdorff_max_m >= hausdorff_p95_m`;
   `chamfer_m <= hausdorff_max_m`.
-- Swapping the arguments: `symdiff_m3` agrees to 1e-6 relative (exact CSG);
+- Swapping the arguments: `symdiff_m3` agrees to 1e-3 relative -- exact CSG,
+  but measured: manifold3d is bit-commutative on 7 of 8 pairs in the first
+  `cleaner` tile and 5.2e-5 off on one, cancellation-amplified from 7e-6 of
+  the volume;
   `sinkhorn_m` to 2% (same sampling seed both sides); `chamfer_m` to 5% or 1 cm
-  and `hausdorff_p95_m` to 10% or 2 cm, because `surface_distances` draws the
+  and `hausdorff_p95_m` to 25% or 2 cm, because `surface_distances` draws the
   two sides with seeds `seed` and `seed + 1`, so a swap resamples both clouds.
+  The p95 bound is measured, not chosen: re-running one direction under four
+  seeds moves p95 by up to 13.9% on the first `cleaner` tile, against a largest
+  observed swap gap of 13.3%; chamfer moves at most 10% the same way.
   `hausdorff_max_m` is not compared: a max over samples is not stable under
   resampling.
 - Zero is allowed for LOD1 vs LOD2: 31.8% of `cleaner` pairs are effectively

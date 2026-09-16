@@ -1482,14 +1482,18 @@ def test_swapping_the_arguments(scores):
     for r in scores:
         a, b = r["lod1_lod2"], r["lod2_lod1"]
         if a["vol_ok_vs_x"] and b["vol_ok_vs_x"]:
+            # 1e-3, measured: manifold3d is bit-commutative on 7 of 8 pairs in
+            # this tile and 5.2e-5 off on one (cancellation-amplified).
             assert a["symdiff_m3_vs_x"] == pytest.approx(b["symdiff_m3_vs_x"],
-                                                          rel=1e-6, abs=1e-6)
+                                                          rel=1e-3, abs=1e-6)
         assert a["sinkhorn_m_vs_x"] == pytest.approx(b["sinkhorn_m_vs_x"],
                                                       rel=0.02, abs=0.01)
         assert a["chamfer_m_vs_x"] == pytest.approx(b["chamfer_m_vs_x"],
                                                      rel=0.05, abs=0.01)
+        # 25%, from measurement rather than taste: re-running the SAME
+        # direction under four seeds moves p95 by up to 13.9% on this tile.
         assert a["hausdorff_p95_m_vs_x"] == pytest.approx(b["hausdorff_p95_m_vs_x"],
-                                                           rel=0.10, abs=0.02)
+                                                           rel=0.25, abs=0.02)
 
 
 def test_print_the_do_nothing_baseline(scores):
