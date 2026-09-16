@@ -171,3 +171,141 @@ def test_only_requested_metrics_and_references_produce_columns():
                        n_points=256)
     metric_cols = sorted(k for k in row if "_vs_" in k)
     assert metric_cols == ["chamfer_m_vs_lod1", "chamfer_m_vs_lod2"]
+
+
+# ---------------------------------------------------------------- Task 7
+
+import json
+
+import pandas as pd
+import torch
+
+from src.dataset.mesh_dataset import specials
+from src.eval.posthoc_eval import checkpoint_info, object_seed, run_posthoc_eval
+from src.models.mesh_transformer import MeshTransformerModule
+from src.utils.config import Config
+
+NUM_BINS = 32
+BOS, EOS, PAD = specials(NUM_BINS)
+
+
+class _Dataset:
+    """Two random-token (cond, tgt) pairs. Same stub as tests/test_mesh_eval.py:
+    the meshes are noise, which is the point -- scoring must survive noise."""
+
+    def __init__(self):
+        self.ids = ["a", "b"]
+        rng = np.random.default_rng(0)
+        self.items = []
+        for k in range(2):
+            n_faces = 4 + k
+            self.items.append({
+                "cond": torch.from_numpy(rng.integers(0, NUM_BINS, 9 * n_faces)),
+                "tgt": torch.cat([torch.tensor([BOS]),
+                                  torch.from_numpy(rng.integers(0, NUM_BINS, 9 * n_faces)),
+                                  torch.tensor([EOS])]),
+                "id": self.ids[k],
+                "center": torch.zeros(3),
+                "scale": torch.ones(3) * 10.0,
+            })
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, i):
+        return self.items[i]
+
+
+def _model():
+    torch.manual_seed(1)
+    return MeshTransformerModule(num_bins=NUM_BINS, d_model=16, n_head=2,
+                                 num_layers=1, dropout=0.0, max_seq_len=128)
+
+
+def _small_cfg(**kw):
+    kw.setdefault("batch_size", 2)
+    kw.setdefault("n_points", 256)
+    kw.setdefault("sinkhorn", SinkhornConfig(n_points=128, max_iters=50))
+    return _cfg(**kw)
+
+
+OBJECT_COLUMNS = [
+    "object_id", "seed", "n_faces_lod1", "n_faces_lod2", "eos_emitted", "decode_ok",
+    "gen_seconds", "n_faces_gen", "watertight_gen",
+] + [f"{m}_vs_{ref}" for ref in ("lod1", "lod2")
+     for m in ("chamfer_m", "hausdorff_p95_m", "hausdorff_max_m", "symdiff_m3",
+               "rel_symdiff", "vol_ok", "vol_note", "sinkhorn_m", "roof_chamfer_m")]
+
+
+def test_object_seed_is_stable_and_distinct():
+    assert object_seed(1234, "a") == object_seed(1234, "a")
+    assert object_seed(1234, "a") != object_seed(1234, "b")
+    assert object_seed(1234, "a") != object_seed(7, "a")
+    assert object_seed(1234, "a") == 2078608377   # zlib.crc32(b"1234:a"), unsalted
+
+
+def test_checkpoint_info_hashes_and_reads_metadata(tmp_path):
+    path = tmp_path / "x.ckpt"
+    torch.save({"epoch": 3, "global_step": 99,
+                "hyper_parameters": {"tokenization": "coord"}}, path)
+    info = checkpoint_info(path)
+    assert info["epoch"] == 3 and info["global_step"] == 99
+    assert info["hyper_parameters"] == {"tokenization": "coord"}
+    assert len(info["sha256"]) == 64
+
+
+def test_end_to_end_writes_one_row_per_object_per_run(tmp_path):
+    ckpt = tmp_path / "x.ckpt"
+    torch.save({"epoch": 0, "global_step": 0, "hyper_parameters": {}}, ckpt)
+    cfg = _small_cfg()
+    out = tmp_path / "eval"
+    summary = run_posthoc_eval(cfg, Config(), _model(), _Dataset(), out,
+                               checkpoint=checkpoint_info(ckpt),
+                               split_sizes={"train": 0, "val": 2, "test": 0})
+
+    names = [r.name for r in expand_strategies(cfg.strategies)]
+    assert [row["run"] for row in summary] == names
+    for name in names:
+        df = pd.read_csv(out / name / "objects.csv")
+        assert df["object_id"].tolist() == ["a", "b"]
+        assert list(df.columns) == OBJECT_COLUMNS
+        run = json.loads((out / name / "run.json").read_text())
+        assert run["name"] == name and run["batch_size"] == 2
+
+    for artifact in ("eval_config.yaml", "reference_config.yaml", "environment.json",
+                     "checkpoint.json", "split.json", "summary.csv"):
+        assert (out / artifact).is_file(), artifact
+    table = pd.read_csv(out / "summary.csv")
+    assert len(table) == 7
+    assert {"watertight_pct", "decode_rate", "eos_rate", "chamfer_m_vs_lod2_mean",
+            "chamfer_m_vs_lod2_median", "vol_defined_pct_vs_lod1",
+            "roof_defined_pct_vs_lod2"} <= set(table.columns)
+    split = json.loads((out / "split.json").read_text())
+    assert split["n_evaluated"] == 2 and split["split_sizes"]["val"] == 2
+
+
+def test_a_rerun_reproduces_every_row(tmp_path):
+    cfg = _small_cfg(strategies=[
+        StrategyConfig(kind="top_p", top_p=[0.95], temperature=[1.2]),
+        StrategyConfig(kind="beam", beam_size=[3])])
+    for sub in ("a", "b"):
+        run_posthoc_eval(cfg, Config(), _model(), _Dataset(), tmp_path / sub)
+    for name in ("top_p_p0.95_t1.2", "beam_k3_lp1.0"):
+        a = pd.read_csv(tmp_path / "a" / name / "objects.csv").drop(columns="gen_seconds")
+        b = pd.read_csv(tmp_path / "b" / name / "objects.csv").drop(columns="gen_seconds")
+        pd.testing.assert_frame_equal(a, b)
+
+
+def test_max_objects_takes_a_seeded_subsample(tmp_path):
+    cfg = _small_cfg(max_objects=1, strategies=[StrategyConfig(kind="greedy")],
+                     metrics=["chamfer"])
+    run_posthoc_eval(cfg, Config(), _model(), _Dataset(), tmp_path / "e")
+    assert len(pd.read_csv(tmp_path / "e" / "greedy" / "objects.csv")) == 1
+
+
+def test_an_empty_selection_is_rejected(tmp_path):
+    class _Empty(_Dataset):
+        def __len__(self):
+            return 0
+    with pytest.raises(ValueError, match="no objects"):
+        run_posthoc_eval(_small_cfg(), Config(), _model(), _Empty(), tmp_path / "e")

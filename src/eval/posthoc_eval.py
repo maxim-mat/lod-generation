@@ -9,15 +9,29 @@ of strategies, one CSV row per object, and writes everything needed to
 reproduce any row: resolved configs, checkpoint hash, git state, versions,
 per-object seeds.
 """
+import csv
+import hashlib
 import itertools
+import json
 import logging
-from dataclasses import dataclass
+import platform
+import subprocess
+import sys
+import time
+import zlib
+from dataclasses import asdict, dataclass
+from importlib import metadata
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
+import torch
 from omegaconf import OmegaConf
 
 from src.analysis.exact_volume import exact_pair_volumes
+from src.dataset.mesh_dataset import (amt_detokenize, detokenize, mesh_collate_fn,
+                                      specials)
+from src.eval.mesh_eval import _resolve, _to_metres, eval_indices
 from src.eval.mesh_metrics import (chamfer_distance, hausdorff_max, hausdorff_p95,
                                    is_watertight_mesh, roof_submesh,
                                    surface_distances)
@@ -25,6 +39,10 @@ from src.eval.sinkhorn import mesh_sinkhorn
 from src.utils.config import PosthocEvalConfig, SinkhornConfig
 
 logger = logging.getLogger(__name__)
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+# Surface-sampling seed for every metric, as in `run_mesh_eval`. Recorded in run.json.
+SURFACE_SEED = 0
 
 METRICS = ("chamfer", "hausdorff", "vol_symdiff", "sinkhorn", "roof_chamfer")
 REFERENCES = ("lod1", "lod2")
@@ -194,3 +212,223 @@ def score_object(gen, refs, metrics, n_points=4096, sinkhorn_cfg=None, seed=0,
             else:
                 row["roof_chamfer_m" + sfx] = nan
     return row
+
+
+def object_seed(seed, object_id):
+    """Sampling seed for one object: ``crc32("<seed>:<object_id>")``.
+
+    The same for every strategy, so strategies are compared on common random
+    numbers, and independent of batch position. crc32 rather than `hash()`,
+    which Python salts per process.
+    """
+    return zlib.crc32(f"{seed}:{object_id}".encode())
+
+
+def generation_budget(ref_cfg):
+    """Tokens to allow per object: the `MeshEvalCallback` rule, 9 per face + EOS.
+
+    `generate` clamps this to what the position scheme allows.
+    """
+    faces = ref_cfg.mesh_model.n_max_triangles or ref_cfg.mesh_data.max_faces or 200
+    return 9 * int(faces) + 1
+
+
+def checkpoint_info(path):
+    """Path, sha256 and Lightning metadata of a checkpoint, for checkpoint.json."""
+    path = Path(path)
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(block)
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    return {"path": str(path.resolve()), "sha256": digest.hexdigest(),
+            "epoch": ckpt.get("epoch"), "global_step": ckpt.get("global_step"),
+            "hyper_parameters": dict(ckpt.get("hyper_parameters") or {})}
+
+
+def _git_state():
+    """``(info, diff)``: commit, dirty flag and status lines, plus ``git diff HEAD``."""
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=REPO_ROOT, capture_output=True,
+                              text=True, check=True).stdout
+    try:
+        status = git("status", "--porcelain")
+        info = {"commit": git("rev-parse", "HEAD").strip(),
+                "dirty": bool(status.strip()), "status": status.splitlines()}
+        return info, git("diff", "HEAD")
+    except (OSError, subprocess.CalledProcessError) as exc:
+        logger.warning("git state unavailable: %s", exc)
+        return {"commit": None, "error": str(exc)}, ""
+
+
+def _versions():
+    out = {"python": sys.version, "torch": torch.__version__, "cuda": torch.version.cuda,
+           "cuda_available": torch.cuda.is_available()}
+    for pkg in ("numpy", "pandas", "trimesh", "manifold3d", "lightning", "omegaconf"):
+        try:
+            out[pkg] = metadata.version(pkg)
+        except metadata.PackageNotFoundError:
+            out[pkg] = None
+    return out
+
+
+def _write_json(path, obj):
+    path.write_text(json.dumps(obj, indent=2, default=str), encoding="utf-8")
+
+
+def _write_artifacts(out_dir, cfg, ref_cfg, ids, n_split, checkpoint, split_sizes,
+                     device):
+    """Everything besides the per-run CSVs that a reproduction needs."""
+    (out_dir / "eval_config.yaml").write_text(
+        OmegaConf.to_yaml(OmegaConf.structured(cfg)), encoding="utf-8")
+    (out_dir / "reference_config.yaml").write_text(
+        OmegaConf.to_yaml(OmegaConf.structured(ref_cfg)), encoding="utf-8")
+
+    git, diff = _git_state()
+    _write_json(out_dir / "environment.json", {
+        "git": git, "versions": _versions(), "device": str(device),
+        "hostname": platform.node(), "platform": platform.platform(), "argv": sys.argv,
+        "note": "Untracked files are listed under git.status but are not "
+                "captured in git_diff.patch."})
+    if diff:
+        (out_dir / "git_diff.patch").write_text(diff, encoding="utf-8")
+    if checkpoint is not None:
+        _write_json(out_dir / "checkpoint.json", checkpoint)
+    _write_json(out_dir / "split.json", {
+        "split": cfg.split, "dataset_dir": ref_cfg.mesh_data.dataset_dir,
+        "split_sizes": split_sizes, "n_split": n_split,
+        "max_objects": cfg.max_objects, "n_evaluated": len(ids),
+        "ids_sha256": hashlib.sha256("\n".join(ids).encode()).hexdigest()})
+
+
+def _append_csv(path, rows):
+    """Append rows, writing the header only when the file is new."""
+    new = not path.exists()
+    with open(path, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(rows[0]))
+        if new:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+def _summarize(run, rows, cfg):
+    """One summary.csv row: rates, nanmean/nanmedian of each metric, defined %."""
+    df = pd.DataFrame(rows)
+    out = {"run": run.name, "kind": run.kind,
+           **{f"param_{k}": v for k, v in run.params.items()},
+           "n_objects": len(df),
+           "watertight_pct": 100.0 * df["watertight_gen"].mean(),
+           "decode_rate": df["decode_ok"].mean(), "eos_rate": df["eos_emitted"].mean()}
+    for ref in cfg.references:
+        for col in METRIC_COLUMNS:
+            name = f"{col}_vs_{ref}"
+            if name in df:
+                out[f"{name}_mean"] = df[name].mean()
+                out[f"{name}_median"] = df[name].median()
+        if "vol_symdiff" in cfg.metrics:
+            out[f"vol_defined_pct_vs_{ref}"] = 100.0 * df[f"vol_ok_vs_{ref}"].mean()
+        if "roof_chamfer" in cfg.metrics:
+            out[f"roof_defined_pct_vs_{ref}"] = (
+                100.0 * np.isfinite(df[f"roof_chamfer_m_vs_{ref}"].astype(float)).mean())
+    return out
+
+
+def _score_batch(model, batch, out, cond, tgt, cond_pad, cfg, seeds, seconds, device):
+    """Decode each generated sequence and score it against its references."""
+    inverse = amt_detokenize if model.tokenization == "amt" else detokenize
+    rows = []
+    for k, oid in enumerate(batch["ids"]):
+        centre = batch["center"][k].cpu().numpy()
+        scale = batch["scale"][k].cpu().numpy()
+        item_cond = model._item_cond((cond, cond_pad), k)
+        gen = _to_metres(model, out[k].cpu(), centre, scale, item_cond)
+        # Both references go through the tokenizer round trip, as in run_mesh_eval.
+        lod2 = _to_metres(model, tgt[k].cpu(), centre, scale, item_cond)
+        v1, f1 = inverse(batch["cond"][k].cpu().numpy(), model.num_bins)
+        lod1 = (v1 * scale + centre, f1)
+        refs = {"lod1": lod1, "lod2": lod2}
+
+        row = {"object_id": str(oid), "seed": seeds[k],
+               "n_faces_lod1": len(lod1[1]), "n_faces_lod2": len(lod2[1]),
+               "eos_emitted": bool((out[k] == model.eos).any()),
+               "decode_ok": bool(len(gen[1]) > 0), "gen_seconds": seconds}
+        row.update(score_object(gen, {name: refs[name] for name in cfg.references},
+                                cfg.metrics, n_points=cfg.n_points,
+                                sinkhorn_cfg=cfg.sinkhorn, seed=SURFACE_SEED,
+                                device=device))
+        rows.append(row)
+    return rows
+
+
+def run_posthoc_eval(cfg, ref_cfg, model, dataset, out_dir, checkpoint=None,
+                     split_sizes=None, device="cpu"):
+    """Generate and score every selected object under every expanded strategy.
+
+    Args:
+        cfg: `PosthocEvalConfig`.
+        ref_cfg: the resolved training `Config` the checkpoint belongs to.
+        model: a `MeshTransformerModule`, already on ``device``.
+        dataset: `MeshDataset`, a `Subset` of one, or anything with the same
+            item contract.
+        out_dir: this evaluation's directory; created if missing.
+        checkpoint: `checkpoint_info` dict, written to checkpoint.json.
+        split_sizes: split name -> size, recorded in split.json.
+        device: torch device for generation and the Sinkhorn solve.
+
+    Returns:
+        list[dict]: one summary row per run, as written to summary.csv.
+    """
+    runs = validate_posthoc_config(cfg)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    indices = (np.arange(len(dataset)) if cfg.max_objects is None
+               else eval_indices(len(dataset), cfg.max_objects, cfg.seed))
+    if len(indices) == 0:
+        raise ValueError(f"The {cfg.split} split selected no objects to evaluate.")
+    ids = []
+    for i in indices:
+        full, orig = _resolve(dataset, int(i))
+        ids.append(str(full.ids[orig]))
+    _write_artifacts(out_dir, cfg, ref_cfg, ids, len(dataset), checkpoint,
+                     split_sizes, device)
+
+    max_new_tokens = generation_budget(ref_cfg)
+    pad = specials(model.num_bins)[2]
+    model.eval()
+    summary = []
+    for run in runs:
+        run_dir = out_dir / run.name
+        run_dir.mkdir(exist_ok=True)
+        kwargs = run.generate_kwargs()
+        _write_json(run_dir / "run.json", {
+            **asdict(run), "generate_kwargs": kwargs, "max_new_tokens": max_new_tokens,
+            "batch_size": cfg.batch_size, "seed": cfg.seed,
+            "seed_rule": "zlib.crc32(f'{seed}:{object_id}'), same for every strategy",
+            "surface_seed": SURFACE_SEED})
+        logger.info("[posthoc] %s: %d objects", run.name, len(indices))
+
+        rows = []
+        for start in range(0, len(indices), cfg.batch_size):
+            chunk = indices[start:start + cfg.batch_size]
+            batch = mesh_collate_fn([dataset[int(i)] for i in chunk], pad=pad)
+            batch = {k: v.to(device) if torch.is_tensor(v) else v
+                     for k, v in batch.items()}
+            seeds = [object_seed(cfg.seed, oid) for oid in batch["ids"]]
+
+            started = time.perf_counter()
+            with torch.no_grad():
+                cond, tgt, cond_pad, _ = model._prepare(batch)
+                out = model.generate(cond, cond_pad, max_new_tokens=max_new_tokens,
+                                     seeds=seeds, **kwargs)
+            seconds = (time.perf_counter() - started) / len(chunk)
+
+            batch_rows = _score_batch(model, batch, out, cond, tgt, cond_pad, cfg,
+                                      seeds, seconds, device)
+            # Flushed per batch: a crash keeps every finished object.
+            _append_csv(run_dir / "objects.csv", batch_rows)
+            rows.extend(batch_rows)
+
+        summary.append(_summarize(run, rows, cfg))
+        pd.DataFrame(summary).to_csv(out_dir / "summary.csv", index=False)
+    return summary
