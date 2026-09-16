@@ -1,0 +1,59 @@
+# Post-hoc eval of the V5 OPT-backed coordinate arm.
+#
+#   python -m src.eval.posthoc_eval --config configs/posthoc-eval-mesh-v5-opt-coord.yaml
+#
+# Guide: docs/posthoc-eval-runbook.md
+#
+# Only eval settings live here. The corpus, the split seed, the tokenizer and
+# the model shape all come from `reference_config`, so this file cannot
+# silently describe a different dataset than the checkpoint was trained on.
+
+reference_config: configs/mesh-v5-full-opt-coord.yaml
+
+# `save_last: True` is set in setup_utils, so every run has a last.ckpt.
+# For the SELECTED model use the best-scoring file instead --
+# `{epoch:02d}-{val_gen_chamfer_m:.4f}.ckpt` in the same directory -- since
+# this run's checkpoint monitor is val_gen_chamfer_m, not the last epoch.
+# NOTE (2026-09-16): no mesh-v5-* run directory exists locally yet, so this
+# path is where the run WILL write, not a file on disk today.
+checkpoint: outputs/initial-runs/mesh-v5-full-opt-coord/checkpoints/last.ckpt
+
+# Dot-list applied to the reference config. Use it when the corpus has moved --
+# e.g. ["mesh_data.dataset_dir=data/The Hague/mini_remote"] -- rather than
+# editing the training config, which would change what the run means.
+reference_overrides: []
+
+split: val
+
+# 256 of the ~25,892 val objects (the reference config's own arithmetic: train
+# 207,138 = 80% of 258,923). The subsample is seeded, so every strategy and
+# every re-run scores the SAME buildings -- that is what makes two rows
+# comparable. null scores the whole split: 7 strategies x 25.9k objects, one of
+# them beam-5, which is a multi-day job. Calibrate with max_objects=8 first and
+# read `gen_seconds` out of the CSV before raising this.
+max_objects: 256
+
+# OPT-125m generating up to 1801 tokens per object (9 x max_faces 200, + EOS).
+# Beam 5 holds 5 of those sequences at once, so lower this if VRAM is tight.
+batch_size: 8
+
+seed: 1234
+device: auto
+output_dir: null   # -> outputs/initial-runs/mesh-v5-full-opt-coord/posthoc_eval
+
+# The default grid: greedy, two beam widths, top-p and min-p at two
+# temperatures. Sampled runs draw one generation per object, seeded from
+# (seed, object_id) and identical across strategies.
+strategies:
+  - {kind: greedy}
+  - {kind: beam,  beam_size: [3, 5], length_penalty: [1.0]}
+  - {kind: top_p, top_p: [0.95], temperature: [0.6, 1.2]}
+  - {kind: min_p, min_p: [0.05], temperature: [0.6, 1.2]}
+
+metrics: [chamfer, hausdorff, vol_symdiff, sinkhorn, roof_chamfer]
+references: [lod1, lod2]
+n_points: 4096
+
+# Three n x n log-domain solves per reference per object. Fine on a GPU; drop
+# n_points to 1024 when `device: cpu`, where it dominates the metric time.
+sinkhorn: {n_points: 2048, blur_m: 0.1, max_iters: 500, tol: 1.0e-6}
