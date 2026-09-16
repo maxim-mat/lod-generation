@@ -9,6 +9,7 @@ of strategies, one CSV row per object, and writes everything needed to
 reproduce any row: resolved configs, checkpoint hash, git state, versions,
 per-object seeds.
 """
+import argparse
 import csv
 import hashlib
 import itertools
@@ -20,9 +21,11 @@ import sys
 import time
 import zlib
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from importlib import metadata
 from pathlib import Path
 
+import lightning as L
 import numpy as np
 import pandas as pd
 import torch
@@ -37,6 +40,7 @@ from src.eval.mesh_metrics import (chamfer_distance, hausdorff_max, hausdorff_p9
                                    surface_distances)
 from src.eval.sinkhorn import mesh_sinkhorn
 from src.utils.config import PosthocEvalConfig, SinkhornConfig
+from src.utils.initialization import load_config
 
 logger = logging.getLogger(__name__)
 
@@ -432,3 +436,112 @@ def run_posthoc_eval(cfg, ref_cfg, model, dataset, out_dir, checkpoint=None,
         summary.append(_summarize(run, rows, cfg))
         pd.DataFrame(summary).to_csv(out_dir / "summary.csv", index=False)
     return summary
+
+
+def check_tokenization(hparams, ref_cfg):
+    """Refuse a checkpoint whose token spelling differs from the reference config.
+
+    Nothing downstream reconciles the two, and a mismatch does not raise by
+    itself: a coordinate sequence decoded as AMT keeps its vertices and silently
+    re-triangulates them into ~1.8x the faces (see notebooks/test-mesh-normal.ipynb).
+    A checkpoint without the key predates AMT, so it is a coordinate run.
+    """
+    saved = hparams.get("tokenization", "coord")
+    wanted = ref_cfg.mesh_data.tokenization
+    if saved != wanted:
+        raise ValueError(
+            f"Checkpoint was trained with tokenization={saved!r} but the reference "
+            f"config sets mesh_data.tokenization={wanted!r}. Point reference_config "
+            "at the config this checkpoint was trained with.")
+
+
+def resolve_device(name):
+    """``"auto"`` -> cuda when available, else cpu; anything else unchanged."""
+    if name == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return name
+
+
+def build_split(ref_cfg, split):
+    """The requested split, rebuilt exactly as `train_mesh` built it.
+
+    Same arguments and seed as training, so `random_split` reproduces the
+    partition the checkpoint was trained against.
+
+    Returns:
+        tuple: (dataset, {split name: size}).
+    """
+    from src.dataset.mesh_datamodule import MeshDataModule
+
+    m = ref_cfg.mesh_data
+    if not m.dataset_dir:
+        raise ValueError("reference config has no mesh_data.dataset_dir.")
+    datamodule = MeshDataModule(
+        dataset_dir=m.dataset_dir, lod_in=m.lod_in, lod_out=m.lod_out,
+        num_bins=m.num_bins, margin_lo=list(m.margin_lo), margin_hi=list(m.margin_hi),
+        max_faces=m.max_faces, max_files=m.max_files, tokenization=m.tokenization,
+        batch_size=ref_cfg.training.batch_size,
+        train_val_test_split=tuple(ref_cfg.training.train_val_test_split),
+        num_workers=0, seed=ref_cfg.seed)
+    datamodule.setup()
+    sizes = {name: len(getattr(datamodule, f"{name}_dataset")) for name in SPLITS}
+    return getattr(datamodule, f"{split}_dataset"), sizes
+
+
+def load_model(ref_cfg, checkpoint, device):
+    """The checkpoint's module, with its frozen VQ-VAE when the run used one."""
+    from src.models.mesh_transformer import MeshTransformerModule
+    from src.train_mesh import _load_vqvae
+
+    vqvae = _load_vqvae(ref_cfg)
+    extra = {} if vqvae is None else {"vqvae": vqvae}
+    model = MeshTransformerModule.load_from_checkpoint(str(checkpoint),
+                                                      map_location="cpu", **extra)
+    return model.to(device).eval()
+
+
+def main(argv=None):
+    """CLI entry point. Returns the evaluation directory."""
+    parser = argparse.ArgumentParser(
+        description="Score a mesh-transformer checkpoint under several decoding "
+                    "strategies.")
+    parser.add_argument("--config", "-c", type=Path, required=True,
+                        help="Post-hoc eval YAML, e.g. configs/posthoc-eval.yaml")
+    parser.add_argument("overrides", nargs="*",
+                        help="Dot-list overrides, e.g. max_objects=256")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+    # Cheapest checks first: nothing below touches data until all of these pass.
+    cfg = load_posthoc_config(args.config, args.overrides)
+    validate_posthoc_config(cfg)
+    ref_cfg = load_config(Path(cfg.reference_config), list(cfg.reference_overrides))
+    if ref_cfg.config_set != "mesh":
+        raise ValueError(f"reference config has config_set={ref_cfg.config_set!r}; "
+                         "post-hoc eval scores mesh-transformer runs (config_set: mesh).")
+    ckpt = Path(cfg.checkpoint)
+    if not ckpt.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
+    info = checkpoint_info(ckpt)
+    check_tokenization(info["hyper_parameters"], ref_cfg)
+
+    L.seed_everything(cfg.seed, workers=True)
+    device = resolve_device(cfg.device)
+    dataset, sizes = build_split(ref_cfg, cfg.split)
+    model = load_model(ref_cfg, ckpt, device)
+
+    base = (Path(cfg.output_dir) if cfg.output_dir else
+            Path(ref_cfg.logging.save_dir, ref_cfg.logging.experiment_name,
+                 ref_cfg.logging.run_name, "posthoc_eval"))
+    out_dir = base / ckpt.stem / datetime.now().strftime("%Y%m%d-%H%M%S")
+    logger.info("[posthoc] %s, %s split (%d objects) -> %s",
+                ckpt.name, cfg.split, len(dataset), out_dir)
+    run_posthoc_eval(cfg, ref_cfg, model, dataset, out_dir, checkpoint=info,
+                     split_sizes=sizes, device=device)
+    logger.info("[posthoc] done: %s", out_dir)
+    return out_dir
+
+
+if __name__ == "__main__":
+    main()

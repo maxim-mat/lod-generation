@@ -309,3 +309,67 @@ def test_an_empty_selection_is_rejected(tmp_path):
             return 0
     with pytest.raises(ValueError, match="no objects"):
         run_posthoc_eval(_small_cfg(), Config(), _model(), _Empty(), tmp_path / "e")
+
+
+# ---------------------------------------------------------------- Task 8
+
+import src.eval.posthoc_eval as posthoc
+from src.eval.posthoc_eval import check_tokenization, main, resolve_device
+
+
+def test_a_tokenization_mismatch_is_refused():
+    ref = Config()
+    ref.mesh_data.tokenization = "coord"
+    check_tokenization({"tokenization": "coord"}, ref)
+    # Checkpoints from before AMT existed carry no key and were coordinate runs.
+    check_tokenization({}, ref)
+    with pytest.raises(ValueError, match="tokenization"):
+        check_tokenization({"tokenization": "amt"}, ref)
+
+
+def test_resolve_device():
+    assert resolve_device("cpu") == "cpu"
+    assert resolve_device("auto") in ("cpu", "cuda")
+
+
+def _write(tmp_path, text):
+    path = tmp_path / "eval.yaml"
+    path.write_text(text)
+    return path
+
+
+def test_main_rejects_a_bad_metric_before_reading_anything(tmp_path):
+    path = _write(tmp_path, "reference_config: does/not/exist.yaml\n"
+                            "checkpoint: nope.ckpt\nmetrics: [emd]\n")
+    with pytest.raises(ValueError, match="metric"):
+        main(["--config", str(path)])
+
+
+def test_main_rejects_a_non_mesh_reference(tmp_path):
+    ref = tmp_path / "ref.yaml"
+    ref.write_text("config_set: diffusion\ndata:\n  dataset_dir: x\n")
+    path = _write(tmp_path, f"reference_config: {ref.as_posix()}\ncheckpoint: nope.ckpt\n")
+    with pytest.raises(ValueError, match="config_set"):
+        main(["--config", str(path)])
+
+
+def test_main_checks_the_checkpoint_before_loading_data(tmp_path, monkeypatch):
+    ref = (ROOT / "configs" / "mesh-v5-full-coord.yaml").as_posix()
+    missing = (tmp_path / "nope.ckpt").as_posix()
+    path = _write(tmp_path, f"reference_config: {ref}\ncheckpoint: {missing}\n")
+    monkeypatch.setattr(posthoc, "build_split", lambda *a, **k: pytest.fail(
+        "the dataset was loaded before the checkpoint was checked"))
+    with pytest.raises(FileNotFoundError, match="nope.ckpt"):
+        main(["--config", str(path)])
+
+
+def test_main_checks_tokenization_before_loading_data(tmp_path, monkeypatch):
+    ckpt = tmp_path / "amt.ckpt"
+    torch.save({"epoch": 0, "global_step": 0,
+                "hyper_parameters": {"tokenization": "amt"}}, ckpt)
+    ref = (ROOT / "configs" / "mesh-v5-full-coord.yaml").as_posix()   # coord run
+    path = _write(tmp_path, f"reference_config: {ref}\ncheckpoint: {ckpt.as_posix()}\n")
+    monkeypatch.setattr(posthoc, "build_split", lambda *a, **k: pytest.fail(
+        "the dataset was loaded before tokenization was checked"))
+    with pytest.raises(ValueError, match="tokenization"):
+        main(["--config", str(path)])
