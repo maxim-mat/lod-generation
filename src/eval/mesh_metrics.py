@@ -217,6 +217,18 @@ def hausdorff_p95(d_ab, d_ba):
     return float(max(np.percentile(d_ab, 95), np.percentile(d_ba, 95)))
 
 
+def hausdorff_max(d_ab, d_ba):
+    """Textbook Hausdorff distance: the worst deviation in either direction, metres.
+
+    Reported next to `hausdorff_p95`, which exists because one stray vertex
+    decides this number. With both, the gap between them shows how much of the
+    worst case is a single outlier.
+    """
+    if len(d_ab) == 0 or len(d_ba) == 0:
+        return float("nan")
+    return float(max(d_ab.max(), d_ba.max()))
+
+
 # ----------------------------------------------------------------------
 # Voxel grid: volumetric IoU and footprint IoU
 # ----------------------------------------------------------------------
@@ -360,6 +372,38 @@ def _mean_roof_z(verts, faces):
     if not up.any():
         return float("nan")
     return float(np.average((a[up, 2] + b[up, 2] + c[up, 2]) / 3.0, weights=area[up]))
+
+
+def roof_submesh(verts, faces, up=_UP):
+    """The upward-facing triangles of a mesh, compacted to their own vertices.
+
+    Roof means a winding-derived unit normal with ``z > up``: the same cut
+    `mesh_to_cityjson` uses to label RoofSurface and `_mean_roof_z` uses here.
+    Winding decides it, so a triangle wound backwards reads as ground and a
+    backwards floor reads as roof -- exactly as in the CityJSON write-back.
+
+    Returns:
+        tuple: (verts [V', 3], faces [F', 3] int64) with unreferenced vertices
+        dropped; both empty when nothing faces up.
+    """
+    empty = (np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64))
+    v = np.asarray(verts, dtype=float).reshape(-1, 3)
+    f = np.asarray(faces, dtype=np.int64).reshape(-1, 3)
+    if len(f) == 0:
+        return empty
+
+    a, b, c = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
+    cross = np.cross(b - a, c - a)
+    norm = np.linalg.norm(cross, axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        nz = np.where(norm > 0, cross[:, 2] / norm, 0.0)
+
+    roof = f[nz > up]
+    if len(roof) == 0:
+        return empty
+    used, inverse = np.unique(roof, return_inverse=True)
+    # reshape: numpy 2.0.0 returned `inverse` in the input's shape, others flat.
+    return v[used], inverse.reshape(-1, 3).astype(np.int64)
 
 
 def roof_height_error(gen, gt):
