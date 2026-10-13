@@ -18,7 +18,26 @@ def train(cfg: Config):
     """
     Main training pipeline.
     Sets up Datamodule, Model, Logger, Callbacks and runs the Lightning Trainer.
+
+    `cfg.config_set` selects which set of config objects is built: "diffusion"
+    (default) and "mini" both run the Levi-graph diffusion below -- "mini" is
+    the same objects pointed at the mini dataset -- while "mesh" hands off to
+    the LOD1-conditioned mesh transformer.
     """
+    if cfg.config_set == "mesh":
+        from src.train_mesh import train_mesh
+        return train_mesh(cfg)
+    if cfg.config_set == "mesh_vqvae":
+        from src.train_mesh_vqvae import train_mesh_vqvae
+        return train_mesh_vqvae(cfg)
+    if cfg.config_set == "mesh_diffusion":
+        from src.train_mesh_diffusion import train_mesh_diffusion
+        return train_mesh_diffusion(cfg)
+    if cfg.config_set not in ("diffusion", "mini"):
+        raise ValueError(f"Unknown config_set: {cfg.config_set!r}. Expected "
+                         "'diffusion', 'mini', 'mesh', 'mesh_vqvae' or "
+                         "'mesh_diffusion'.")
+
     # Seed everything for reproducibility
     L.seed_everything(cfg.seed, workers=True)
     start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -81,6 +100,7 @@ def train(cfg: Config):
         devices=cfg.trainer.devices,
         precision=cfg.trainer.precision,
         gradient_clip_val=cfg.training.gradient_clip_val,
+        accumulate_grad_batches=cfg.training.accumulate_grad_batches,
         callbacks=callbacks,
         logger=exp_loggers if exp_loggers else False,
         log_every_n_steps=cfg.trainer.log_every_n_steps,

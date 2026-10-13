@@ -141,7 +141,28 @@ def surface_class_from_normal(ring_coords):
 
 
 def _iter_faces(geom):
-    """Yield (outer_ring, semantic_type_or_None) for each surface of a geometry."""
+    """Yield (outer_ring, semantic_type_or_None) for each surface of a geometry.
+
+    The *outer* ring only. Kept deliberately: a Levi face node is one ring --
+    it carries that ring's centroid and an EDGE_VF to each of its vertices --
+    so a surface with holes has no representation here without deciding what a
+    hole node is. `parse_cityjson_file_to_graphs` counts the interior rings it
+    skips into `inner_rings` so the omission stays visible.
+
+    Anything that triangulates wants `_iter_surfaces` instead, which yields the
+    whole surface: dropping the holes there fills in real courtyards.
+    """
+    for rings, stype in _iter_surfaces(geom):
+        yield rings[0], stype
+
+
+def _iter_surfaces(geom):
+    """Yield (rings, semantic_type_or_None) for each surface of a geometry.
+
+    ``rings`` is the surface as CityJSON stores it -- exterior first, interior
+    rings after (spec 2.0.1). Only Solid / MultiSurface / CompositeSurface
+    contribute; anything else warns rather than yielding nothing quietly.
+    """
     boundaries = geom.get("boundaries", [])
     gtype = geom.get("type")
     sem = geom.get("semantics") or {}
@@ -165,7 +186,7 @@ def _iter_faces(geom):
         if i < len(vals) and vals[i] is not None and vals[i] < len(surfaces):
             s = surfaces[vals[i]]
             stype = s.get("type") if s else None
-        yield face[0], stype
+        yield face, stype
 
 
 def parse_cityjson_file_to_graphs(filepath, normalize_coords=False):

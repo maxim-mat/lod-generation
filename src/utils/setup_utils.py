@@ -149,8 +149,15 @@ def create_callbacks(cfg: Config, save_dir: Path) -> list:
             verbose=True,
         ))
         
-    # LR Monitor
-    callbacks.append(LearningRateMonitor(logging_interval="step"))
+    # LR Monitor -- only when there is somewhere to write it. Lightning does not
+    # ignore a logger-less LearningRateMonitor, it refuses the run:
+    #   MisconfigurationException: Cannot use `LearningRateMonitor` callback
+    #   with `Trainer` that has no logger.
+    # `logging.loggers: []` is a legitimate configuration (the pipeline's smoke
+    # mode uses it so a throwaway run creates no wandb run), and create_loggers
+    # returns [] for it, which train() passes to the Trainer as logger=False.
+    if cfg.logging.loggers:
+        callbacks.append(LearningRateMonitor(logging_interval="step"))
     
     # Rich Progress Bar
     try:
@@ -158,9 +165,17 @@ def create_callbacks(cfg: Config, save_dir: Path) -> list:
     except Exception:
         pass
 
-    # Generative Eval
+    # Generative Eval. Not for any mesh path: it samples unconditionally via
+    # model.sample(), which none of those modules has, and unconditional
+    # distribution metrics are meaningless when every input has one right
+    # answer -- the VQ-VAE is not even generative, it reconstructs its own
+    # input, and mesh_diffusion samples conditioned on an LOD1 through
+    # MeshSetEvalCallback instead. Gated on config_set rather than trusting the
+    # yaml so a stale file cannot resurrect a callback that would crash on the
+    # first test batch.
     ge_cfg = cfg.generative_eval
-    if ge_cfg.enabled:
+    if ge_cfg.enabled and cfg.config_set not in ("mesh", "mesh_vqvae",
+                                                 "mesh_diffusion"):
         from src.eval.callback import GenerativeEvalCallback
         callbacks.append(GenerativeEvalCallback(ge_cfg, save_dir, cfg.seed))
 

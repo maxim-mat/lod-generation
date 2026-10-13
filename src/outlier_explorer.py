@@ -22,7 +22,8 @@ from src.analysis.cityobject_analysis import (                       # noqa: E40
 from src.visualize_cityjson import cityjson_figure, load_cityjson    # noqa: E402
 
 DEFAULT_CSV = REPO / "outputs" / "cityobject_analysis" / "outliers.csv"
-DEFAULT_DATA = REPO / "data" / "The Hague"
+# The LOD1/LOD1_synth/LOD2 folders live under a variant dir, not the city root.
+DEFAULT_DATA = REPO / "data" / "The Hague" / "full"
 
 st.set_page_config(page_title="CityObject outliers", layout="wide")
 

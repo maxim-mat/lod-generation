@@ -1,0 +1,493 @@
+"""Free-running whole-mesh generation, scored against the paired LOD2.
+
+A sibling of `src/eval/mesh_eval.py`, not a refactor of it: that module is
+built around a token sequence and `decode_tokens`, and this branch produces a
+face array. Everything downstream of "we have a mesh in metres" is shared --
+`mesh_metrics`, the CityJSON write-back, the ground-truth ceiling.
+
+The ceiling row is not optional. A chamfer of 0.04 m says nothing until you
+know whether the tokenizer's own round-trip floor at this bin count is 0.01 or
+0.15, and here there is a second floor on top of it: `faces_to_mesh` snaps to
+the same grid, so the ground truth through the same snap is the best this
+branch could possibly score.
+"""
+import contextlib
+import logging
+from pathlib import Path
+
+import lightning as L
+import numpy as np
+import torch
+
+from src.dataset.mesh_dataset import write_obj
+from src.dataset.mesh_set_dataset import mesh_set_collate_fn
+from src.eval.mesh_metrics import (chamfer_distance, chamfer_floor,
+                                   chamfer_ratio, mesh_metrics,
+                                   surface_distances)
+from src.models.mesh_set_postprocess import faces_to_mesh
+from src.post_process.post_process import mesh_to_cityjson, save_to_file
+
+logger = logging.getLogger(__name__)
+
+
+def eval_indices(n, count, seed):
+    """``count`` positions drawn without replacement, reproducibly."""
+    rng = np.random.default_rng(seed)
+    return sorted(rng.choice(n, size=min(count, n), replace=False).tolist())
+
+
+def _aggregate(rows):
+    """Mean of each key over rows, ignoring NaN, plus the sample count."""
+    if not rows:
+        return {}
+    keys = {k for row in rows for k in row}
+    out = {}
+    for k in sorted(keys):
+        vals = [row[k] for row in rows if k in row and np.isfinite(row[k])]
+        out[k] = float(np.mean(vals)) if vals else float("nan")
+    out["n_eval"] = float(len(rows))
+    return out
+
+
+@contextlib.contextmanager
+def fixed_seed(seed):
+    """Run a block under a fixed RNG, then put the caller's RNG back.
+
+    Both eval tiers must be deterministic across epochs -- otherwise the
+    monitor moves on prior noise and early stopping fires on that. But seeding
+    globally inside a training loop would also reset the TRAINING RNG, and with
+    the monitor running every epoch that would correlate dropout and shuffling
+    across the whole run. Save, seed, restore.
+    """
+    cpu = torch.get_rng_state()
+    cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    torch.manual_seed(seed)
+    try:
+        yield
+    finally:
+        torch.set_rng_state(cpu)
+        if cuda is not None:
+            torch.cuda.set_rng_state_all(cuda)
+
+
+def _scaffold_hook(batch, cfg, supplied=None):
+    """The per-batch scaffold callback, or whatever the caller supplied."""
+    d = cfg.mesh_diffusion
+    if supplied is not None or not d.scaffold.enabled:
+        return supplied
+    from src.models.mesh_scaffold import (
+        lod1_scaffold, make_bin_masker, make_projector)
+    grid = lod1_scaffold(batch["cond"], batch["cond_mask"],
+                         voxel=d.scaffold.voxel, dilate=d.scaffold.dilate)
+    return (make_bin_masker(grid, cfg.mesh_data.num_bins, d.scaffold.apply_below_t)
+            if d.process == "d3pm"
+            else make_projector(grid, d.scaffold.apply_below_t))
+
+
+def generative_metrics(gen, batch, cfg):
+    """Score a free-running sample against its target, with no mesh conversion.
+
+    This is the early-stopping tier. It deliberately stops short of
+    `faces_to_mesh` + `mesh_metrics`: those cost several times as much, and
+    chamfer is `nan` on an empty sample -- which is a real failure mode of a
+    presence channel, so the monitor would break exactly when the model is
+    worst.
+
+    Args:
+        gen: ``[B, 10, F]`` sample in the normalized box.
+        batch: the collated batch it was generated from.
+        cfg: the root `Config`.
+
+    Returns:
+        dict: `gen_coord_mse` is the monitor -- lower is better for every arm,
+        so `mode: min` is always right. The rest are diagnostics: coordinate
+        error can look healthy while face count collapses, and on an untrained
+        categorical arm it does exactly that.
+    """
+    d = cfg.mesh_diffusion
+    tgt, mask = batch["x"], batch["x_mask"]
+    if d.order == "none":
+        # Only when the arm is unordered. On an ordered arm the identity
+        # assignment is the one the model was trained against, and letting the
+        # matcher find a better one would report a flattered number that no
+        # longer corresponds to the objective.
+        from src.models.mesh_set_losses import hungarian_match
+        assign = hungarian_match(gen, tgt, mask, d.match_presence_weight)
+        tgt = torch.gather(tgt, 2, assign[:, None, :].expand(-1, tgt.shape[1], -1))
+        mask = torch.gather(mask, 1, assign)
+
+    m = mask[:, None, :].to(gen.dtype)
+    denom = (m.sum() * 9).clamp(min=1.0)
+    out = {
+        "gen_coord_mse": float((((gen[:, :9] - tgt[:, :9]) ** 2) * m).sum() / denom),
+        "gen_presence_acc": float(((gen[:, 9] > 0) == mask).to(gen.dtype).mean()),
+        "gen_n_faces": float((gen[:, 9] > 0).sum(dim=1).to(gen.dtype).mean()),
+        "gen_n_faces_target": float(mask.sum(dim=1).to(gen.dtype).mean()),
+    }
+    if d.state != "continuous":
+        # Both sides sit on the grid for these arms -- the target because
+        # `_pack` snapped it, the sample because the readout is categorical --
+        # so quantizing the (possibly reordered) target recovers its bins
+        # exactly, and no second gather is needed.
+        from src.dataset.mesh_dataset import quantize
+        k = cfg.mesh_data.num_bins
+        gb = quantize(gen[:, :9].detach().cpu().numpy(), k)
+        tb = quantize(tgt[:, :9].detach().cpu().numpy(), k)
+        agree = torch.from_numpy((gb == tb).astype("float32"))
+        out["gen_bin_acc"] = float((agree * m.detach().cpu()).sum() / denom.cpu())
+    return out
+
+
+def monitor_chamfer(sample, batch, k, dataset, index, cfg, seed):
+    """Chamfer in metres for one sample, finite even when nothing was generated.
+
+    The empty case is the whole reason this exists. An all-absent sample has no
+    surface, so chamfer is genuinely undefined -- and leaving it undefined is
+    what let a model that generates NOTHING score a perfect `gen_coord_mse` of
+    0.0, because that metric masks by the target's face mask and never reads
+    the predicted presence channel at all. Scoring the empty sample as the LOD1
+    box diagonal is the standard finite stand-in: it is as wrong as the
+    building is large, comparable across buildings, and strictly worse than any
+    sample that produced a surface.
+    """
+    d = cfg.mesh_diffusion
+    centre = batch["center"][k].cpu().numpy()
+    scale = batch["scale"][k].cpu().numpy()
+    gen_v, gen_f, _ = faces_to_mesh(sample, cfg.mesh_data.num_bins,
+                                    snap=d.snap_before_weld,
+                                    min_area=d.min_face_area)
+    if not len(gen_f):
+        return float(np.linalg.norm(scale))
+    _, gt_raw = _resolve(dataset, index)
+    d_ab, d_ba = surface_distances((gen_v * scale + centre, gen_f), gt_raw,
+                                   n=d.n_points, seed=seed)
+    return float(chamfer_distance(d_ab, d_ba))
+
+
+def monitor_floor(batch, k, dataset, index, cfg, seed):
+    """The do-nothing chamfer for one building: LOD1 handed back as the sample.
+
+    What makes `monitor_chamfer` readable. That metric is an absolute distance
+    in metres and chamfer scales with building size, so it cannot say on its
+    own whether a run has learned anything -- only whether it beats echoing its
+    own input can.
+
+    The condition goes through the same `faces_to_mesh` the sample does and is
+    scored against the same raw LOD2 at the same point budget, so the two
+    numbers are the same quantity and their ratio means something.
+
+    Depends only on the data and the index -- never on the weights -- so
+    `run_generative_monitor` caches it rather than paying for it every
+    validation epoch, twice over once EMA and live weights are both scored.
+    """
+    d = cfg.mesh_diffusion
+    centre = batch["center"][k].cpu().numpy()
+    scale = batch["scale"][k].cpu().numpy()
+    v, f, _ = faces_to_mesh(batch["cond"][k], cfg.mesh_data.num_bins,
+                            snap=d.snap_before_weld, min_area=d.min_face_area)
+    _, gt_raw = _resolve(dataset, index)
+    # No box-diagonal stand-in here, unlike the empty *sample* case: a
+    # condition that decodes to nothing is a broken input, not a model failure,
+    # and scoring it as "very bad" would quietly flatter every ratio it feeds.
+    return chamfer_floor((v * scale + centre, f), gt_raw, n_points=d.n_points,
+                         seed=seed)
+
+
+def _nanmean(values):
+    """Mean over the defined entries; nan when there are none."""
+    vals = [v for v in values if np.isfinite(v)]
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+def run_generative_monitor(model, dataset, indices, cfg, seed=1234, scaffold=None,
+                           weights="ema", floors=None):
+    """Tier 2: a free-running reverse trajectory, scored distributionally.
+
+    Runs every validation epoch, so it is sized to be cheap: `n_val_gen`
+    buildings at `gen_eval_steps` steps, ~10% of a training epoch as measured.
+
+    Args:
+        weights: "ema" or "live". EMA never touches the gradients, so the
+            live-weight score of an EMA run is exactly the no-EMA result --
+            which is why both are logged every epoch rather than costing a
+            separate arm. What the paired-diffusion literature does NOT report
+            is which of the two wins on a paired distortion metric: SR3 and
+            Palette both use EMA throughout without ablating it, and the
+            ablations that do exist (NCSNv2, EDM2) are on FID.
+        floors: cache of ``{index: do-nothing chamfer}``, filled in place. The
+            floor is a property of the data, so a caller that holds one dict
+            across epochs pays for it once instead of every validation epoch.
+            None computes it fresh each call.
+
+    Returns:
+        dict: mean of `generative_metrics` over the sampled buildings, plus
+        `gen_chamfer_m` -- the monitor early stopping and checkpointing read.
+        The coordinate metrics stay as diagnostics; they cannot select, because
+        none of them can see the presence channel.
+    """
+    if len(indices) == 0:
+        return {}
+    d = cfg.mesh_diffusion
+    was_training = model.training
+    model.eval()
+    device = next(model.parameters()).device
+    floors = {} if floors is None else floors
+    rows, chamfers, floor_vals = [], [], []
+    with fixed_seed(seed), model.using_weights(weights):
+        for start in range(0, len(indices), d.eval_batch_size):
+            chunk = indices[start:start + d.eval_batch_size]
+            batch = mesh_set_collate_fn([dataset[int(i)] for i in chunk],
+                                        multiple_of=8, width=d.slot_budget,
+                                        num_bins=cfg.mesh_data.num_bins)
+            batch = {k: v.to(device) if torch.is_tensor(v) else v
+                     for k, v in batch.items()}
+            with torch.no_grad():
+                gen = model.generate(batch, n_steps=d.gen_eval_steps,
+                                     scaffold=_scaffold_hook(batch, cfg, scaffold))
+            rows.append(generative_metrics(gen, batch, cfg))
+            # Per BUILDING. The sampling above dominates the cost of this tier;
+            # what these add is one `faces_to_mesh` plus one point-sampled
+            # distance per building.
+            for k, i in enumerate(chunk):
+                chamfers.append(monitor_chamfer(gen[k], batch, k, dataset,
+                                                int(i), cfg, seed))
+                if int(i) not in floors:
+                    floors[int(i)] = monitor_floor(batch, k, dataset, int(i),
+                                                   cfg, seed)
+                floor_vals.append(floors[int(i)])
+    if was_training:
+        model.train()
+    out = _aggregate(rows)
+    out["gen_chamfer_m"] = float(np.mean(chamfers)) if chamfers else float("nan")
+    # The reference line for the metric above, and the ratio that makes the gap
+    # readable without rescaling the panel: 1.0 is "no better than echoing the
+    # LOD1 input". Mean of per-building ratios rather than a ratio of the two
+    # means, which chamfer's dependence on building size would let the largest
+    # building in the split decide.
+    out["gen_chamfer_floor_m"] = _nanmean(floor_vals)
+    out["gen_chamfer_rel"] = _nanmean(
+        [chamfer_ratio(c, f) for c, f in zip(chamfers, floor_vals)])
+    # Buildings, not chunks. `_aggregate` counts rows, and a row is a batch --
+    # which read 1 for eight buildings and, sharing the `val_` namespace with
+    # tier 3, clobbered its own honest count of 16.
+    out["n_eval"] = float(len(chamfers))
+    return out
+
+
+def run_mesh_set_eval(model, dataset, indices, cfg, seed=1234, save_dir=None,
+                      scaffold=None, gt_ceiling=True):
+    """Sample a mesh per LOD1 condition and score it against its true LOD2.
+
+    Args:
+        model: a `MeshDiffusionModule`.
+        dataset: `MeshSetDataset` or a `Subset` of one.
+        indices: positions within `dataset` to score.
+        cfg: the root `Config`; `mesh_diffusion` and `mesh_data` are read.
+        seed: threaded into the index draw and torch's generator, so a rerun of
+            the same checkpoint gives the same numbers.
+        save_dir: where .obj and .city.json samples are written. None writes none.
+        scaffold: optional ``(t, x) -> x`` projection passed to `generate`.
+        gt_ceiling: also score the ground truth through `faces_to_mesh`, which
+            is the floor every generated number must be read against.
+
+    Returns:
+        dict: metric name to float, averaged over the sampled buildings.
+        Generated metrics are unprefixed; the ceiling is prefixed ``gt_``.
+    """
+    if len(indices) == 0:
+        return {}
+    d = cfg.mesh_diffusion
+    num_bins = cfg.mesh_data.num_bins
+    was_training = model.training
+    model.eval()
+
+    rows, gt_rows, written = [], [], 0
+    with fixed_seed(seed):
+        for start in range(0, len(indices), d.eval_batch_size):
+            chunk = indices[start:start + d.eval_batch_size]
+            items = [dataset[int(i)] for i in chunk]
+            # Fixed slot budget, so the sample is a function of the weights alone
+            # and not of who else landed in the chunk.
+            batch = mesh_set_collate_fn(items, multiple_of=8, width=d.slot_budget,
+                                    num_bins=num_bins)
+            device = next(model.parameters()).device
+            batch = {k: v.to(device) if torch.is_tensor(v) else v
+                     for k, v in batch.items()}
+
+            # The scaffold is derived from *this batch's* LOD1, so it cannot be
+            # built once in the callback's __init__; `scaffold=None` there means
+            # "let this function decide", which is what the default already does.
+            step_hook = _scaffold_hook(batch, cfg, scaffold)
+
+            with torch.no_grad():
+                sampled = model.generate(batch, n_steps=d.eval_steps,
+                                         scaffold=step_hook)
+
+            for k, i in enumerate(chunk):
+                centre = batch["center"][k].cpu().numpy()
+                scale = batch["scale"][k].cpu().numpy()
+                gen_v, gen_f, stats = faces_to_mesh(
+                    sampled[k], num_bins, snap=d.snap_before_weld,
+                    min_area=d.min_face_area)
+                gen = (gen_v * scale + centre, gen_f)
+
+                _, gt_raw = _resolve(dataset, int(i))
+                row = {}
+                if len(gen_f):
+                    row.update(mesh_metrics(gen, gt_raw, taus=list(d.taus),
+                                            n_points=d.n_points, seed=seed,
+                                            voxel_m=d.voxel_m))
+                else:
+                    # An all-absent sample is a real failure mode of a presence
+                    # channel, and silently dropping it would flatter the average.
+                    row["chamfer_m"] = float("nan")
+                # The do-nothing floor, the companion to the `gt_` ceiling
+                # below: the LOD1 condition through the same `faces_to_mesh`,
+                # scored against the same raw LOD2. A run's real position is
+                # between the two, and above the floor it has learned nothing
+                # its input did not already say.
+                cond_v, cond_f, _ = faces_to_mesh(
+                    batch["cond"][k], num_bins, snap=d.snap_before_weld,
+                    min_area=d.min_face_area)
+                row["chamfer_floor_m"] = chamfer_floor(
+                    (cond_v * scale + centre, cond_f), gt_raw,
+                    n_points=d.n_points, seed=seed)
+                row["chamfer_rel"] = chamfer_ratio(row["chamfer_m"],
+                                                   row["chamfer_floor_m"])
+                row["n_faces"] = float(stats["n_faces"])
+                row["n_verts"] = float(stats["n_verts"])
+                row["empty"] = float(len(gen_f) == 0)
+                for key in ("n_dropped_absent", "n_dropped_degenerate",
+                            "n_dropped_duplicate"):
+                    row[key] = float(stats[key])
+                rows.append(row)
+
+                if gt_ceiling:
+                    ceil_v, ceil_f, _ = faces_to_mesh(
+                        batch["x"][k], num_bins, snap=d.snap_before_weld,
+                        min_area=d.min_face_area)
+                    ceil = (ceil_v * scale + centre, ceil_f)
+                    if len(ceil_f):
+                        gt_rows.append(mesh_metrics(ceil, gt_raw, taus=list(d.taus),
+                                                    n_points=d.n_points, seed=seed,
+                                                    voxel_m=d.voxel_m))
+
+                if save_dir is not None and written < d.save_samples and len(gen_f):
+                    out = Path(save_dir)
+                    out.mkdir(parents=True, exist_ok=True)
+                    name = batch["ids"][k]
+                    write_obj(out / f"{name}_gen.obj", *gen)
+                    write_obj(out / f"{name}_gt.obj", *gt_raw)
+                    try:
+                        save_to_file(mesh_to_cityjson(*gen), out / f"{name}_gen.city.json")
+                    except Exception:
+                        # Write-back is a convenience; a sample that cannot be
+                        # expressed as CityJSON must not take the metrics down.
+                        logger.warning("CityJSON write-back failed for %s", name,
+                                       exc_info=True)
+                    written += 1
+
+    if was_training:
+        model.train()
+    out = _aggregate(rows)
+    out.update({f"gt_{k}": v for k, v in _aggregate(gt_rows).items()})
+    return out
+
+
+def _resolve(dataset, i):
+    """``(index_in_base, raw_gt_mesh)`` through a `Subset` if there is one."""
+    base, idx = dataset, i
+    while hasattr(base, "dataset"):
+        idx = base.indices[idx]
+        base = base.dataset
+    return idx, base.mesh_pair(idx)[1]
+
+
+class MeshSetEvalCallback(L.Callback):
+    """Runs `run_mesh_set_eval` every N epochs and logs the aggregate.
+
+    Gated rather than folded into `validation_step` because the full reverse
+    trajectory is `eval_steps` forward passes per building -- 50 by default,
+    and 100 with classifier-free guidance on. That is affordable every fifth
+    epoch on 16 buildings and unaffordable every epoch on the val split.
+    """
+
+    def __init__(self, cfg, save_dir, seed=1234):
+        self.cfg = cfg
+        self.d = cfg.mesh_diffusion
+        self.save_dir = Path(save_dir) if save_dir is not None else None
+        self.seed = seed
+        # None means "let run_mesh_set_eval build one per batch from that
+        # batch's LOD1", which is the only place the condition is known.
+        self._scaffold = None
+        # {index: do-nothing chamfer} for the val split. `eval_indices` is a
+        # pure function of the split length and the seed, so the same buildings
+        # are scored every epoch and their floor never changes -- computing it
+        # once turns a per-epoch cost into a one-off.
+        self._floors = {}
+
+    def _due(self, epoch):
+        n = self.d.every_n_epochs
+        return n > 0 and (epoch + 1) % n == 0
+
+    def _run(self, trainer, pl_module, split, count, out_dir):
+        dataset = getattr(trainer.datamodule, f"{split}_dataset")
+        if dataset is None or len(dataset) == 0:
+            return
+        indices = eval_indices(len(dataset), count, self.seed)
+        metrics = run_mesh_set_eval(
+            pl_module, dataset, indices, self.cfg, seed=self.seed,
+            save_dir=out_dir, scaffold=self._scaffold)
+        if metrics:
+            pl_module.log_dict({f"{split}_{k}": v for k, v in metrics.items()},
+                               prog_bar=False, sync_dist=True)
+            logger.info("%s mesh eval: %s", split,
+                        {k: round(v, 4) for k, v in metrics.items()})
+
+    def _monitor(self, trainer, pl_module):
+        """Tier 2: the early-stopping metric, every validation epoch.
+
+        Scored twice when an EMA is live -- once from the averaged weights and
+        once from the raw ones -- because EMA leaves the training trajectory
+        untouched, so the second pass IS the no-EMA result at no extra training
+        cost. `val_gen_*` is the EMA reading and drives selection by default;
+        `val_gen_*_live` is the control, and pointing
+        `training.early_stopping.monitor` at `val_gen_coord_mse_live` switches
+        which one selects.
+        """
+        dataset = getattr(trainer.datamodule, "val_dataset", None)
+        if dataset is None or len(dataset) == 0:
+            return
+        indices = eval_indices(len(dataset), self.d.n_val_gen, self.seed)
+        logs = {}
+        metrics = run_generative_monitor(pl_module, dataset, indices, self.cfg,
+                                         seed=self.seed, scaffold=self._scaffold,
+                                         weights="ema", floors=self._floors)
+        logs.update({f"val_{k}": v for k, v in metrics.items()})
+        if pl_module.ema_active:
+            live = run_generative_monitor(pl_module, dataset, indices, self.cfg,
+                                          seed=self.seed, scaffold=self._scaffold,
+                                          weights="live", floors=self._floors)
+            logs.update({f"val_{k}_live": v for k, v in live.items()})
+        else:
+            # Before ema_start_step the two are the same weights; a second pass
+            # would spend 10% of an epoch reproducing the first one exactly.
+            logs.update({f"val_{k}_live": v for k, v in metrics.items()})
+        if logs:
+            pl_module.log_dict(logs, prog_bar=False, sync_dist=True)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        if trainer.sanity_checking:
+            return
+        # Tier 2 runs every epoch: EarlyStopping(strict=True) raises when its
+        # monitored metric is missing, so the monitor cannot live behind the
+        # every_n_epochs gate that tier 3 does.
+        self._monitor(trainer, pl_module)
+        if self._due(trainer.current_epoch):
+            self._run(trainer, pl_module, "val", self.d.n_val, None)
+
+    def on_test_epoch_end(self, trainer, pl_module):
+        """Tier 3 only. The single-step loss is deliberately not computed at
+        test time -- see `MeshDiffusionModule.test_step`."""
+        out = self.save_dir / "samples" if self.save_dir else None
+        self._run(trainer, pl_module, "test", self.d.n_test, out)

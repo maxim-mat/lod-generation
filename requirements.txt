@@ -3,10 +3,52 @@ torch>=2.0.0
 lightning>=2.0.0
 omegaconf>=2.3.0
 
+# Mesh VQ-VAE quantizer. The same library MeshAnything/MeshGPT use, so the
+# codebook gets kmeans init, EMA updates and dead-code revival rather than a
+# hand-rolled quantizer that collapses (see src/models/mesh_vqvae.py).
+vector-quantize-pytorch>=1.31.0
+
 # Data handling & geometry
 numpy>=1.24.0
 pandas>=2.0.0
 scipy>=1.10.0  # ConvexHull + wasserstein_distance for generative eval features/distribution
+
+# CityJSON surface triangulation (src/geometry/geometry.py::triangulate_face).
+# mapbox-earcut is listed explicitly rather than via `cjio[export]`: that extra
+# also pulls `triangle2`, a repackaging of Shewchuk's Triangle, whose licence is
+# not OSI-approved (free for research, commercial needs a separate one). Both
+# cjio and trimesh declare their triangulation backends as *extras* only, so a
+# plain `pip install cjio` leaves the package importable but unable to
+# triangulate -- and cjio raises a bare NameError when that happens.
+cjio>=0.9
+mapbox-earcut>=1.0.2
+# Exact point-to-surface distances for the paired mesh metrics
+# (src/eval/mesh_metrics.py::surface_distances). Sampling both meshes and doing
+# point-cloud-to-point-cloud instead carries a ~sqrt(area/n) noise floor -- 0.129 m
+# at n=4096, which was 126% of the real LOD1->LOD2 chamfer. Install `embreex`
+# alongside if the proximity query becomes a bottleneck; it is a drop-in speedup.
+trimesh>=4.0
+# trimesh's ONLY hard dependency is numpy; everything else sits under extras, so
+# `pip install trimesh` gives you a package that imports fine and then fails at
+# the first proximity query. `closest_point` walks `mesh.triangles_tree`, which
+# is an R-tree, so rtree is not optional for us even though it is for trimesh.
+# Pinned explicitly rather than as `trimesh[easy]`, which would also drag in
+# manifold3d and friends we do not use.
+rtree>=1.0
+# Exact CSG for src/analysis/exact_volume.py: vol(A\B) + vol(B\A) between a
+# building's LOD1 and its LOD2. Nothing already here can do a 3D boolean --
+# shapely is 2D, scipy has no CSG, and trimesh ships the API but no engine, so
+# `trimesh.boolean.*` raises without a backend. Note the comment on trimesh
+# above: manifold3d was previously avoided as an unused `trimesh[easy]` extra.
+# It is now a direct dependency and used directly, not through trimesh.
+#
+# Feed it float64 via `Mesh64`, never the plain float32 `Mesh`. manifold3d sets
+# its vertex-merge tolerance from the bounding box, so at EPSG:28992 magnitudes
+# (y ~ 450,000) float32 gives a 5.4e-2 m tolerance -- it welds vertices 5 cm
+# apart, and measured over 200 real pairs the symmetric difference drifts up to
+# 4.4% (cancellation: an SD is a small difference of large near-equal volumes).
+# Mesh64 takes that to 4.5e-7 m and 1.6e-8 relative.
+manifold3d>=3.0
 
 # Experiment tracking
 tensorboard>=2.12.0
@@ -14,8 +56,13 @@ wandb>=0.15.0
 
 # Visualization
 plotly>=5.14.0
+matplotlib>=3.7   # the QQ plot in src/select_cityjson.py; plotly does not do one
 rich>=13.0.0  # Optional, but nice for progress bars
+streamlit>=1.30.0  # src/outlier_explorer.py
+pyproj>=3.6.0      # EPSG:28992 -> WGS84 for the explorer's map links
 
 # Development & Notebooks
 jupyter>=1.0.0
 pytest>=7.0.0
+# OPT backbone for the mesh transformer (mesh_model.backbone: opt)
+transformers>=4.39

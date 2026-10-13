@@ -1,0 +1,139 @@
+# MeshAnything V2 transition (Chen et al., arXiv:2408.02555)
+# Usage: python main.py --train --config configs/mesh-v2-train.yaml
+#
+# V2 supersedes the V1 design mesh-2/mesh-3 follow, and its central decision is
+# to *drop the VQ-VAE*: "Following [4], we discard the VQ-VAE and directly use
+# the discretized coordinates from Seq_V as token indices" (section 3.2, where
+# [4] is MeshXL, arXiv:2405.20853). The compression stage 1 was supposed to buy
+# comes from tokenization instead. Reference code: buaacyw/MeshAnything.
+#
+# This config is mesh2-train.yaml with three changes, all of them toggles:
+#   1. mesh_model.tokenizer: coord   -- no VQ-VAE (already the default)
+#   2. mesh_data.tokenization: amt   -- Adjacent Mesh Tokenization
+#   3. mesh_model.mask_invalid: true -- Masking Invalid Predictions
+#
+# What AMT is measured to buy on this corpus (500 random LOD2 meshes, and the
+# 1670-building mini subset used for the smoke test):
+#   * token sequence 0.54x the coordinate tokenizer's, against ~0.49x reported
+#     on Objaverse -- LOD2 roofs are less well-connected than artist meshes
+#     (0.23 breaks per face), but the compression transfers.
+#   * longest segment 1630 -> 928 tokens, so attention cost falls ~3x.
+#   * all 1670 buildings decode to the *same mesh* under both tokenizers, so
+#     this is a re-spelling of the sequence and not a geometry change.
+#
+# What it does NOT buy, and the reason to watch mesh_eval rather than val_loss:
+# mesh-1 converged with merged_face_ratio 0.83, i.e. systematically simplified
+# meshes, and that is why the VQ-VAE was tried at all. AMT addresses sequence
+# length and regularity, *not* the tendency to simplify. Treat "shorter, more
+# regular sequences also reduce simplification" as the hypothesis under test.
+# V2's own Table 2 is honest about this: AMT improves CD ~5% but makes ECD and
+# perplexity slightly worse. Adopt it for the length, not the accuracy.
+#
+# Gate: merged_face_ratio and chamfer_m at least matching mesh-2, at ~3x less
+# attention cost. If merged_face_ratio is still ~0.83, sequence length was not
+# the binding constraint and the simplification problem needs its own answer.
+
+mode: train
+config_set: mesh
+seed: 42
+
+# Not read under config_set: mesh, but DataConfig.dataset_dir is MISSING and
+# OmegaConf resolves the whole schema, so it still needs a value.
+data:
+  dataset_dir: data/The Hague/mini
+
+mesh_data:
+  dataset_dir: data/The Hague/mini
+  lod_in: LOD1_synth
+  lod_out: LOD2
+  num_bins: 128
+  margin_lo: [0.0, 0.0, 0.0]
+  margin_hi: [0.0, 0.0, 0.1]
+  max_faces: 200
+  max_files: null
+  num_workers: 10
+  persistent_workers: false
+  # Adjacent Mesh Tokenization, V2 Algorithm 1. A face adjacent to the previous
+  # one costs a single new vertex instead of three; '&' restarts when no
+  # unvisited adjacent face exists. Adds one id to the vocabulary (BREAK).
+  #
+  # Note this makes dataset construction slower: AMT's length depends on face
+  # adjacency rather than face count, so `max_seq_len` has to be measured by
+  # tokenizing the corpus once at load instead of derived from a formula.
+  #
+  # Vertex swap ('$', V2 section 3.1) is deliberately not implemented -- it buys
+  # a further ~8% compression at slightly worse accuracy in the paper's Table 2.
+  tokenization: amt
+
+mesh_model:
+  d_model: 512
+  n_head: 8
+  num_layers: 6
+  dropout: 0.1
+  # null = size it from the data. Under AMT that is the *measured* longest AMT
+  # segment, not 9 per face, so the embedding is not oversized by ~2x.
+  max_seq_len: null
+  # Explicit rather than relying on the default: AMT and the VQ-VAE are mutually
+  # exclusive (AMT rewrites the coordinate sequence, the VQ-VAE replaces it with
+  # codes) and the model raises rather than silently ignoring one of them.
+  tokenizer: coord
+  # Masking Invalid Predictions, V2 section 3.2, inherited from PolyGen. At
+  # sampling time, structurally illegal tokens get -inf: EOS mid-face, a break
+  # straight after a break, a break before a strip has three vertices. Affects
+  # generation only, never training, so it is safe to toggle on an existing
+  # checkpoint. Coordinates are never masked, so it cannot deadlock sampling.
+  mask_invalid: true
+
+training:
+  batch_size: 8          # AMT halves the sequence; raise this once a run confirms it
+  train_val_test_split:
+    - 0.8
+    - 0.1
+    - 0.1
+  lr: 1e-3
+  max_epochs: 100
+  gradient_clip_val: 1.0
+  lr_scheduler: "cosine"
+  lr_decay_steps: 50
+  lr_decay_rate: 0.5
+  early_stopping:
+    enabled: true
+    monitor: val_loss
+    patience: 10
+    mode: min
+  checkpoint:
+    enabled: true
+    monitor: val_loss
+    mode: min
+    save_top_k: 3
+    filename: "{epoch:02d}-{val_loss:.4f}"
+
+trainer:
+  accelerator: auto
+  devices: 1
+  precision: "32"
+  log_every_n_steps: 50
+
+logging:
+  loggers:
+    - wandb
+  project_name: lod-generation
+  experiment_name: initial-runs
+  run_name: mesh-v2
+  save_dir: outputs
+  wandb_entity: maxim-lod
+  wandb_offline: false
+  log_model: false
+
+mesh_eval:
+  enabled: true
+  every_n_epochs: 10
+  n_val: 8
+  n_test: 32
+  batch_size: 8
+  n_points: 4096
+  taus: [0.25, 0.5]
+  voxel_m: 0.25
+  save_samples: 8
+
+resume_from: null

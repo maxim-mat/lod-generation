@@ -1,0 +1,38 @@
+# Stage 3, arm 7: a2 with adaLN-Zero timestep conditioning. Nothing else moves.
+#
+# Read against a2-tf-mse, not against a1 -- adaLN-Zero modulates LayerNorms, so
+# it reaches the transformer denoiser only. If stage 1 picks a U-Net arm this
+# arm answers nothing and should be dropped rather than reinterpreted.
+#
+# Why. The additive path adds one timestep embedding to every token immediately
+# before a pre-norm LayerNorm. LayerNorm removes the per-token mean and
+# rescales, and a constant added to every token is precisely the component that
+# attenuates -- so the signal telling the model which noise level it is at is
+# weakest by construction. adaLN-Zero (Peebles & Xie, arXiv:2212.09748 sec 3.2)
+# instead regresses a shift, a scale and a zero-initialised residual gate per
+# sub-layer, which cannot be normalised away because it multiplies the
+# normalised activation rather than preceding it.
+#
+# This is a hypothesis, not a diagnosis. The measured problem on a1 is that the
+# epsilon objective's SNR weighting leaves the high-noise end of the schedule
+# with almost no loss mass (see c6-minsnr's header); weak timestep conditioning
+# would compound that, but nothing yet shows it is a separate cause. c6 and c7
+# are independent shots at the same symptom and should be read separately.
+#
+# CONFOUND, stated up front: adaLN-Zero costs parameters. Measured at the base
+# config's d_model 256 / num_layers 8, the transformer goes 6.68 M -> 9.58 M
+# (+43%), which also puts it above the U-Net's 8.12 M. A c7 win is therefore
+# "adaLN-Zero AND 43% more parameters", not adaLN-Zero alone. Halving
+# num_layers to 4 would price it at matched capacity if the gap looks real.
+# One more asymmetry to expect in the curves. The head is already zero-init
+# (Nichol & Dhariwal's zero-module trick), so NEITHER arm has gradient above the
+# head on step 0. adaLN-Zero then adds a SECOND ramp on top: the gates start at
+# 0, so the attention weights train only as the gates open. Measured over the
+# first three steps, gradient reaching block 0's self-attention is 0 / 0 /
+# 1.4e-3 here against 0 / 0.24 / 0.25 for a2. DiT zero-inits both the same way,
+# so this is faithful rather than a bug -- but c7 will look slower than a2 for
+# the first few hundred steps, and that is the ramp, not the arm losing.
+mesh_diffusion: {order: morton, pos_embed: sinusoidal, loss: mse,
+                 denoiser: transformer, state: continuous, process: ddpm,
+                 target: original, presence_weight: 0.383, time_cond: adaln}
+logging: {run_name: mesh-diff-c7-adaln}

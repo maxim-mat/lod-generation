@@ -36,6 +36,74 @@ def face_normal(points):
     return None if mag < 1e-12 else n / mag
 
 
+def triangulate_face(rings, verts):
+    """Triangles for one CityJSON surface, in the caller's vertex numbering.
+
+    ``rings`` is a whole surface as CityJSON stores it -- ``[exterior, hole,
+    hole, ...]``, per the 2.0.1 spec: "the first array being the exterior
+    boundary of the surface, and the others the interior boundaries". Passing
+    only ``rings[0]`` is what silently paved over every courtyard in the corpus.
+
+    Delegates to ``cjio.geom_help.triangulate_face``, which projects onto the
+    face's own Newell normal before triangulating, so tilted planes are handled
+    and holes get a seed point each. ``sloppy=True`` selects the mapbox_earcut
+    engine over Shewchuk ``triangle``: earcut is FSF-licensed, ships as a wheel,
+    and adds no Steiner points -- so a hole-free ring still yields exactly
+    ``n - 2`` triangles and sequence lengths do not move.
+
+    Args:
+        rings: list of rings, each a list of indices into ``verts``.
+        verts: [V, 3] array the indices refer to.
+
+    Returns:
+        list: ``(a, b, c)`` index triples wound to agree with the exterior
+        ring's normal -- the fan this replaces got that for free by preserving
+        ring order, and callers like `fix_winding` and `signed_volume` depend
+        on it. Empty when the face is degenerate or the engine bails, which is
+        the caller's cue to drop the face rather than emit garbage.
+    """
+    from cjio import geom_help
+
+    # cjio sets this flag at import and then never consults it: its
+    # `triangulate_face_mapbox_earcut` calls the module unguarded, so a machine
+    # without the backend fails with a bare `NameError: name 'mapbox_earcut' is
+    # not defined` from inside a library. Checked here so a fresh environment
+    # says what to install. An empty return means a *degenerate face*; a missing
+    # engine is an environment fault and must never be mistaken for one.
+    if not geom_help.MODULE_EARCUT_AVAILABLE:
+        raise ImportError(
+            "mapbox-earcut is not installed, so cjio has no triangulation "
+            "engine. `pip install mapbox-earcut` (it is in requirements.txt). "
+            "cjio and trimesh both declare it only as an extra "
+            "(`cjio[export]`, `trimesh[easy]`), so a plain install of either "
+            "leaves it out.")
+
+    if not rings or len(rings[0]) < 3:
+        return []
+
+    v = np.asarray(verts, dtype=float)
+    normal = face_normal(v[rings[0]])
+    if normal is None:                      # zero-area / collinear exterior ring
+        return []
+
+    # cjio mutates the ring lists it is handed when stripping duplicates.
+    tris, ok = geom_help.triangulate_face([list(r) for r in rings], v, sloppy=True)
+    if not ok:
+        return []
+
+    out = []
+    for tri in np.asarray(tris).reshape(-1, 3):
+        a, b, c = (int(i) for i in tri)
+        if a == b or b == c or a == c:
+            continue
+        # Earcut follows the exterior ring in practice, but nothing in its
+        # contract promises it, and a silently mirrored roof is expensive.
+        if float(np.cross(v[b] - v[a], v[c] - v[a]) @ normal) < 0:
+            a, c = c, a
+        out.append((a, b, c))
+    return out
+
+
 def shell_edge_defects(faces):
     """``(unpaired, reused)`` directed edges of a shell.
 

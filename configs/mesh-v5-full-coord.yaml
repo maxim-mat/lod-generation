@@ -1,0 +1,177 @@
+# V5: the from-scratch coordinate arm, on the FULL corpus.
+# Usage: python main.py --train --config configs/mesh-v5-full-coord.yaml
+#
+# Paired with configs/mesh-v5-full-opt-coord.yaml. Dataset, split, seed,
+# effective batch, schedule, monitor and epoch budget are identical across the
+# two; only `mesh_model.backbone` differs, so the gap between them is the
+# backbone and nothing else.
+#
+# Three changes from the v3 arms, all deliberate:
+#
+#  1. `mesh_data.dataset_dir` is `cleaner`, not `mini_cleaner`. The latter is a
+#     2% uniform sample of the former (sample_manifest.json: fraction 0.02,
+#     seed 42, alpha 0.0) -- 5,178 objects drawn from a population of 258,923.
+#     This is a 50x scale-up of exactly the same corpus, not a different one.
+#
+#  2. lr 1e-3 with a 2000-step linear warmup, then cosine. The v3 arms ran flat
+#     5e-5 with no schedule and no warmup at all; `warmup_steps` existed in the
+#     config schema but `MeshTransformerModule` did not read it, so setting it
+#     there would have been silently ignored. It is wired now.
+#
+#  3. Selection is on `val_gen_chamfer_m`, not `val_token_acc`. The v3 runs
+#     showed why: `mesh-v3-opt-amt-sin` scored HIGHER token accuracy than
+#     `mesh-v3-opt-coord-sin` (0.616 vs 0.567) while its teacher-forced chamfer
+#     was 1.9x worse (0.778 m vs 0.414 m). Token accuracy ranks these models in
+#     the opposite order to the geometry, so it cannot select between them.
+#
+# Epoch arithmetic, because it is nothing like the mini corpus:
+#   train split      207,138 objects
+#   batches/epoch     51,784  at batch_size 4
+#   optimizer steps    12,946 per epoch at accumulate_grad_batches 4
+# `mesh-v3-coord-sin`'s ENTIRE run was 36,830 steps -- 2.8 epochs here.
+
+mode: train
+config_set: mesh
+seed: 42
+
+# Not read under config_set: mesh, but DataConfig.dataset_dir is MISSING and
+# OmegaConf resolves the whole schema, so it still needs a value.
+data:
+  dataset_dir: data/The Hague/cleaner
+
+mesh_data:
+  dataset_dir: data/The Hague/cleaner
+  lod_in: LOD1
+  lod_out: LOD2
+  num_bins: 128
+  margin_lo: [0.0, 0.0, 0.0]
+  margin_hi: [0.0, 0.0, 0.1]
+  # Unchanged from v3 so the corpus filter is the same one; on mini_cleaner 200
+  # kept 97.8% of pairs.
+  max_faces: 200
+  max_files: null
+  tokenization: coord
+  # LOWER than v3's 10, on purpose. `MeshDataset` holds every parsed mesh in
+  # RAM (~1.5-2 GB for 258,923 pairs), and on Windows each dataloader worker is
+  # a spawned process that receives its own pickled copy. At 10 workers that is
+  # 15-20 GB of duplicated dataset before a single batch exists. Raise it only
+  # after watching resident memory on a short run.
+  num_workers: 4
+  persistent_workers: true
+
+mesh_model:
+  backbone: scratch
+  d_model: 512
+  n_head: 8
+  num_layers: 6
+  dropout: 0.1
+  pos_embed: sinusoidal
+  n_max_triangles: null
+  cond_max_triangles: null
+  max_seq_len: null
+  tokenizer: coord
+  vqvae_ckpt: null
+  mask_invalid: true
+
+training:
+  batch_size: 4
+  accumulate_grad_batches: 4   # effective batch 16, matching v3
+  train_val_test_split: [0.8, 0.1, 0.1]
+  # Peak lr, reached at the end of warmup and annealed from there. 20x the v3
+  # arms' 5e-5, which the diffusion branch measured as far too low at a
+  # comparable batch (lr 5e-5 dropped its loss 51% over 250 steps against 91%
+  # at 1e-3).
+  lr: 1.0e-3
+  # Applied to WEIGHT MATRICES ONLY -- embeddings, LayerNorm gains and biases
+  # go in a second, undecayed param group (99.4% of the scratch model and 99.6%
+  # of the OPT one is decayed). 0.01 is AdamW's own default, so this value is
+  # what every run so far actually used; what changes is that the 0.6% that
+  # should never have been decayed no longer is.
+  #
+  # Worth being explicit about here rather than inheriting: decoupled decay is
+  # applied every step independently of the gradient, so its strength scales
+  # with lr x steps. At the v3 arms' flat 5e-5 over 94k steps it was a 5% pull;
+  # at 1e-3 with cosine over 30 epochs of this corpus it is ~7x.
+  weight_decay: 0.01
+  # Linear ramp over 2000 optimizer steps -- 15% of one epoch here, and the
+  # insurance that makes a 20x lr jump safe while Adam's second moment is cold.
+  # Runs on the STEP interval; left on Lightning's default `epoch` it would ramp
+  # over 2000 epochs and train badly in silence.
+  warmup_steps: 2000
+  # Cosine from the peak down to eta_min = 0.01 * lr, with T_max taken from
+  # Lightning's `estimated_stepping_batches`. That means MAX_EPOCHS SETS THE
+  # ANNEALING HORIZON: it is the real budget, not a safety ceiling, and
+  # shortening it makes the schedule steeper rather than just stopping earlier.
+  lr_scheduler: cosine
+  lr_decay_steps: 50           # step-schedule knobs, unused under cosine
+  lr_decay_rate: 0.5
+  # 30 epochs = ~388k optimizer steps, ~10x mesh-v3-coord-sin's entire run.
+  max_epochs: 30
+  gradient_clip_val: 1.0
+  # val_gen_chamfer_m: surface error in metres of a FREE-RUNNING generation,
+  # scored against the ground truth through the same tokenizer. Lower is better,
+  # so mode: min.
+  #
+  # NOT val_token_acc, which the v3 runs showed ranks tokenizations in the
+  # opposite order to geometry. NOT val_tf_chamfer_m either: that one is
+  # teacher-forced, so it measures the metric size of a typical token error
+  # rather than what the model produces on its own.
+  #
+  # This metric only exists on epochs where MeshEvalCallback runs, and
+  # `EarlyStopping` is built with Lightning's default strict=True -- a missing
+  # monitor raises rather than being skipped. Hence mesh_eval.every_n_epochs: 1
+  # below. The two settings are coupled; changing one without the other kills
+  # the run on its first validation epoch.
+  early_stopping:
+    enabled: true
+    monitor: val_gen_chamfer_m
+    # 10 epochs is ~130k optimizer steps here, against 15 epochs of ~250 steps
+    # on mini. Patience 15 there fired on metric noise while three of the four
+    # v3 arms were still improving; an epoch on this corpus is 50x the data, so
+    # the per-epoch number is correspondingly less noisy.
+    patience: 10
+    mode: min
+  checkpoint:
+    enabled: true
+    monitor: val_gen_chamfer_m
+    mode: min
+    save_top_k: 3
+    filename: "{epoch:02d}-{val_gen_chamfer_m:.4f}"
+
+trainer:
+  accelerator: auto
+  devices: 1
+  precision: "32"
+  log_every_n_steps: 50
+
+logging:
+  loggers:
+    - wandb
+  project_name: lod-generation
+  experiment_name: initial-runs
+  run_name: mesh-v5-full-coord
+  save_dir: outputs
+  wandb_entity: maxim-lod
+  wandb_offline: false
+  log_model: false
+
+mesh_eval:
+  enabled: true
+  # EVERY epoch, because early stopping and checkpointing read this callback's
+  # `val_gen_chamfer_m`. At ~13k optimizer steps per epoch the cost of 32
+  # beam-5 generations is negligible against the epoch itself.
+  every_n_epochs: 1
+  # 32, not v3's 8. This is now the selection metric, and a mean over 8
+  # buildings is noisy enough that early stopping would fire on the sample
+  # rather than on the model.
+  n_val: 32
+  n_test: 64
+  batch_size: 8
+  n_points: 4096
+  taus: [0.25, 0.5]
+  voxel_m: 0.25
+  save_samples: 8
+  beam_size: 5
+  length_penalty: 1.0
+
+resume_from: null

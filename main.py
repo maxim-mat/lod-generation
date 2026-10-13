@@ -5,6 +5,7 @@ CityJSON LOD Generation — Main Entry Point
 Training:
     python main.py --train --config configs/train.yaml
     python main.py --train --config configs/train.yaml model.hidden_dim=128 training.max_epochs=100
+    python main.py --train --config configs/mesh-train.yaml --config-set mesh
 
 Inference:
     python main.py --inference --config configs/inference.yaml
@@ -35,7 +36,10 @@ def main():
     
     logger.info("Loading config from: %s", args.config)
     cfg = load_config(args.config, args.overrides)
-    
+    if args.config_set:
+        cfg.config_set = args.config_set
+
+    logger.info("Config set: %s", cfg.config_set)
     logger.info("Config:\n%s", OmegaConf.to_yaml(OmegaConf.structured(cfg)))
     
     if args.train:

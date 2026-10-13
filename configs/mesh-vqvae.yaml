@@ -1,0 +1,148 @@
+# Stage-1 learned mesh vocabulary (MeshAnything, arXiv:2406.10163 §4.2)
+# Usage: python main.py --train --config configs/mesh-vqvae.yaml
+#
+# Trains a VQ-VAE to reconstruct LOD1 and LOD2 faces through a codebook. The
+# resulting checkpoint is what stage 2 loads frozen in place of the coordinate
+# tokenizer. Design and gate: docs/superpowers/specs/2026-08-08-mesh-vqvae-design.md
+#
+# Success is NOT "beat the coordinate tokenizer" -- the decoder predicts logits
+# over the same 128 bins, so its reconstruction ceiling is that tokenizer's
+# measured 0.107 m chamfer plus whatever the codebook loses. What is bought is a
+# decoder that tolerates imperfect codes; there is no token compression, because
+# quantization is per vertex (3 vertices x depth 3 = 9 tokens per face, the
+# reference's `face_per_token = num_quantizers * 3`).
+#
+# The earlier per-face variant gave 3 tokens per face and looked like a win
+# until it was measured: 3 codes carrying 9 coordinates is a bottleneck 2x
+# narrower than the data, and run mesh-vqvae-3 bottomed out at 0.246 m -- which
+# then capped stage-2 run mesh-3 no matter how well it predicted.
+#
+# Gate: val reconstruction within ~0.15 m, and a codebook actually in use --
+# watch val_codes_used and val_codebook_ppl, not just the loss.
+
+mode: train
+config_set: mesh_vqvae
+seed: 42
+
+# Not read under config_set: mesh_vqvae, but DataConfig.dataset_dir resolves
+# with the rest of the schema, so it still needs a value.
+data:
+  dataset_dir: data/The Hague/mini
+
+# Same block the transformer uses, so the two stages cannot disagree about
+# bins, margins, max_faces or the seeded train/val/test split. A building in
+# the transformer's test split must never be in the VQ-VAE's training set.
+mesh_data:
+  dataset_dir: data/The Hague/mini
+  lod_in: LOD1_synth
+  lod_out: LOD2
+  num_bins: 128
+  margin_lo: [0.0, 0.0, 0.0]
+  margin_hi: [0.0, 0.0, 0.1]
+  max_faces: 200
+  max_files: null
+  num_workers: 10
+  persistent_workers: false
+
+# Codebook (MeshVQVAEConfig)
+mesh_vqvae:
+  # 1024, not the paper's 8192: walls, ground planes and roof slopes are far
+  # less varied than Objaverse art assets, and a codebook past the diversity of
+  # the data leaves most entries dead and the survivors undertrained. Calibrate
+  # from val_codes_used -- raise it if usage saturates, lower it if most entries
+  # never fire.
+  codebook_size: 1024
+  depth: 3               # codes per *vertex*; x3 vertices = 9 tokens per face
+  d_model: 256
+  # Width of the code vectors, independent of d_model. Stage 2 embeds a code by
+  # projecting this vector, so it is also that projection's input width.
+  # MeshGPT's dim_codebook is 192 against a model dim of 512; this takes the
+  # absolute number rather than the ratio, so at d_model 256 the codebook is
+  # 75% of the model width instead of their 37.5%. Deliberate -- ~96 would be
+  # the ratio-matched value if the codes turn out to be over-provisioned.
+  codebook_dim: 192
+  n_head: 8
+  num_layers: 4          # encoder and decoder each
+  dropout: 0.1
+  max_faces: null        # null = size it from the corpus's longest mesh
+  # MeshGPT's `commit_loss_weight`. Quantization runs through ResidualVQ from
+  # vector-quantize-pytorch with MeshGPT's settings (kmeans_init, EMA codebook,
+  # dead-code revival at EMA usage < 2) -- the library MeshAnything itself uses.
+  # The codebook is EMA-updated rather than trained, so this is the only
+  # quantizer term in the loss. Watch codes_used_s0/s1/s2, not the pooled
+  # codes_used: a hand-rolled quantizer collapsed to 28 live entries of 1024 by
+  # epoch 1 (mesh-vqvae-2), and the pooled number read "fine" throughout.
+  commitment: 0.1
+  decay: 0.8             # codebook EMA decay
+  # Rotation trick (arXiv:2410.06424) in place of the straight-through
+  # estimator: the gradient at the code is rotated onto the encoder output
+  # rather than copy-pasted. ON here, which is a deliberate departure from
+  # MeshAnything -- that paper predates it. lucidrains/meshgpt-pytorch does
+  # pass rotation_trick=True on current main, but that also postdates
+  # MeshAnything, so it is not evidence of what the paper ran.
+  #
+  # Its reported win is an order of magnitude on quantization error, which is
+  # the side that matters here (recon_ce / bin_mae). Note it cannot be A/B'd by
+  # inspecting the quantizer alone: it changes only the gradient reaching the
+  # encoder, so any forward-only comparison shows nothing. Judge it on
+  # val_recon_ce against a rotation_trick: false run.
+  rotation_trick: true
+  # Stage 1b lives in configs/mesh-vqvae-nr.yaml, not here.
+  noise_resistant: false
+
+training:
+  # Items are single meshes here, not (LOD1, LOD2) pairs of 1800-token
+  # sequences, so this can be far larger than the transformer's 32.
+  batch_size: 512
+  train_val_test_split:
+    - 0.8
+    - 0.1
+    - 0.1
+  lr: 1e-4
+  max_epochs: 100
+  gradient_clip_val: 1.0
+  lr_scheduler: "cosine"
+  lr_decay_steps: 50
+  lr_decay_rate: 0.5
+  # Monitor reconstruction, NOT val_loss. val_loss carries the quantizer term,
+  # which legitimately *rises* as the codebook commits -- in mesh-vqvae-1 its
+  # best value was epoch 0, before any training, so early stopping fired at
+  # epoch 10 and the restored checkpoint was the untrained model (test metrics
+  # came back identical to epoch-0 val). recon_ce was still falling monotonically
+  # when the run was killed. It is also the quantity this file's gate is
+  # written against.
+  early_stopping:
+    enabled: true
+    monitor: val_recon_ce
+    patience: 10
+    mode: min
+  checkpoint:
+    enabled: true
+    monitor: val_recon_ce
+    mode: min
+    save_top_k: 3
+    filename: "{epoch:02d}-{val_recon_ce:.4f}"
+
+trainer:
+  accelerator: auto
+  devices: 1
+  precision: "32"
+  log_every_n_steps: 50
+
+logging:
+  loggers:
+    - wandb
+  project_name: lod-generation
+  experiment_name: initial-runs
+  run_name: mesh-vqvae-4
+  save_dir: outputs
+  wandb_entity: maxim-lod
+  wandb_offline: false
+  log_model: false
+
+# Unconditional distribution metrics do not apply to a reconstruction model;
+# create_callbacks gates this off by config_set regardless of what is here.
+generative_eval:
+  enabled: false
+
+resume_from: null

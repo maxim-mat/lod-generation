@@ -1,0 +1,140 @@
+# Scratch backbone, sinusoidal positions, beam search, flat low LR.
+# Usage: python main.py --train --config configs/mesh-v4-scratch-sin.yaml
+#
+# Four deliberate departures from mesh-v3-coord, all in one run -- so this is a
+# probe, not an A/B. Nothing here isolates which change did what.
+#
+#   1. pos_embed: sinusoidal   -- no positional ceiling at all
+#   2. mesh_eval.beam_size: 5  -- best sequence, not best next token
+#   3. lr 5e-5, lr_scheduler none -- flat, 20x below the 1e-3 mesh-2 converged at
+#   4. early stopping on val_token_acc/max instead of val_loss/min
+#
+# Dataset is still `mini_cleaner`, so its numbers are NOT comparable with
+# mesh-v2 / mesh-v2-2, and the sampling-bias confound recorded in
+# docs/research/2026-08-24-preliminary-future-plan.md is still present.
+
+mode: train
+config_set: mesh
+seed: 42
+
+# Not read under config_set: mesh, but DataConfig.dataset_dir is MISSING and
+# OmegaConf resolves the whole schema, so it still needs a value.
+data:
+  dataset_dir: data/The Hague/mini_cleaner
+
+mesh_data:
+  dataset_dir: data/The Hague/mini_cleaner
+  # Real LOD1, not LOD1_synth: `cleaner` is built on the real pair and is
+  # Source B only, since Source A ships no lod-1 geometry.
+  lod_in: LOD1
+  lod_out: LOD2
+  num_bins: 128
+  margin_lo: [0.0, 0.0, 0.0]
+  margin_hi: [0.0, 0.0, 0.1]
+  # Purely a corpus filter now -- it no longer decides model capacity. Kept at
+  # 200 to match the mesh-v3 scratch arms (97.8% of pairs on mini_cleaner).
+  max_faces: 200
+  max_files: null
+  tokenization: coord
+  num_workers: 10
+  persistent_workers: false
+
+mesh_model:
+  backbone: scratch
+  d_model: 512
+  n_head: 8
+  num_layers: 6
+  dropout: 0.1
+  # Fixed Fourier positions (Vaswani et al., arXiv:1706.03762 section 3.5).
+  # No parameters and no row count, so on this backbone -- where positions
+  # restart per segment and there were never pretrained rows to preserve --
+  # the length ceiling disappears rather than moving.
+  #
+  # The failure mode changes with it: too long no longer raises, it degrades,
+  # because absolute sinusoidal positions do not reliably extrapolate past the
+  # lengths actually trained on (Press et al., arXiv:2108.12409).
+  pos_embed: sinusoidal
+  # Capacity is unset, so it falls back to the corpus's longest segment. Under
+  # sinusoidal positions that number is no longer a ceiling -- it survives only
+  # as the generation budget, the cap for when EOS never arrives.
+  n_max_triangles: null
+  cond_max_triangles: null
+  max_seq_len: null
+  tokenizer: coord          # no VQ-VAE
+  vqvae_ckpt: null
+  # Sampling-time only; never touches training.
+  mask_invalid: true
+
+training:
+  batch_size: 4
+  accumulate_grad_batches: 4   # effective batch 16
+  train_val_test_split: [0.8, 0.1, 0.1]
+  # 5e-5 flat. mesh-2 converged at 1e-3 at this size, so this is 20x lower and
+  # expected to need many more epochs; max_epochs is raised to match. With no
+  # schedule there is also no annealing phase, which is what the mesh-v3 arms
+  # never reached anyway -- they early-stopped at 89% of peak LR.
+  lr: 5e-5
+  max_epochs: 400
+  gradient_clip_val: 1.0
+  lr_scheduler: "none"
+  lr_decay_steps: 50           # unread while lr_scheduler is "none"
+  lr_decay_rate: 0.5
+  # val_token_acc/max. Read the mode twice: mesh-6 monitored this same metric
+  # with mode: min, which rewards accuracy *falling*, so it never fired and
+  # burned 72 h on a diverging run. `max` is the fix, not a preference.
+  #
+  # Chosen over val_loss because the two diverge here: on mesh-v3-coord val_loss
+  # bottomed at epoch 26 and rose to 1.18 by epoch 40 while val_token_acc kept
+  # climbing to 0.749. Selecting on loss stops while the thing we care about is
+  # still improving.
+  early_stopping:
+    enabled: true
+    monitor: val_token_acc
+    patience: 15
+    mode: max
+  # Matched to early stopping on purpose. Left on val_loss/min it would save the
+  # epoch-26 checkpoint of a run that early-stopped at epoch 45 -- "best" by a
+  # criterion the run was not using.
+  checkpoint:
+    enabled: true
+    monitor: val_token_acc
+    mode: max
+    save_top_k: 3
+    filename: "{epoch:02d}-{val_token_acc:.4f}"
+
+trainer:
+  accelerator: auto
+  devices: 1
+  precision: "32"
+  log_every_n_steps: 50
+
+logging:
+  loggers:
+    - wandb
+  project_name: lod-generation
+  experiment_name: initial-runs
+  run_name: mesh-v4-scratch-sin
+  save_dir: outputs
+  wandb_entity: maxim-lod
+  wandb_offline: false
+  log_model: false
+
+mesh_eval:
+  enabled: true
+  every_n_epochs: 10
+  n_val: 8
+  n_test: 32
+  batch_size: 8
+  n_points: 4096
+  taus: [0.25, 0.5]
+  voxel_m: 0.25
+  save_samples: 8
+  # Search for the best sequence rather than the best next token. 5x the
+  # generation compute, but the KV cache measured 20.6x at 1800 tokens, so the
+  # eval is still ~4x cheaper than the greedy runs before it.
+  beam_size: 5
+  # Not cosmetic: raw sum-of-log-probs prefers short sequences, and short here
+  # means a mesh with fewer triangles. 1.0 normalises per token.
+  length_penalty: 1.0
+
+resume_from: null
