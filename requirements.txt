@@ -35,6 +35,20 @@ trimesh>=4.0
 # Pinned explicitly rather than as `trimesh[easy]`, which would also drag in
 # manifold3d and friends we do not use.
 rtree>=1.0
+# Exact CSG for src/analysis/exact_volume.py: vol(A\B) + vol(B\A) between a
+# building's LOD1 and its LOD2. Nothing already here can do a 3D boolean --
+# shapely is 2D, scipy has no CSG, and trimesh ships the API but no engine, so
+# `trimesh.boolean.*` raises without a backend. Note the comment on trimesh
+# above: manifold3d was previously avoided as an unused `trimesh[easy]` extra.
+# It is now a direct dependency and used directly, not through trimesh.
+#
+# Feed it float64 via `Mesh64`, never the plain float32 `Mesh`. manifold3d sets
+# its vertex-merge tolerance from the bounding box, so at EPSG:28992 magnitudes
+# (y ~ 450,000) float32 gives a 5.4e-2 m tolerance -- it welds vertices 5 cm
+# apart, and measured over 200 real pairs the symmetric difference drifts up to
+# 4.4% (cancellation: an SD is a small difference of large near-equal volumes).
+# Mesh64 takes that to 4.5e-7 m and 1.6e-8 relative.
+manifold3d>=3.0
 
 # Experiment tracking
 tensorboard>=2.12.0
