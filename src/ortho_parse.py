@@ -1,0 +1,315 @@
+"""Build one orthophoto mosaic per CityJSON file of a dataset subset.
+
+Each ``<subset>/<lod_out>/<Source>/<name>.city.json`` gets
+``<out>/<Source>/<name>.tif``: the raw 1 km tiles pasted together over the
+union of that file's building crop windows (`src.dataset.ortho.crop_bounds`
+at ``--beta-max``), at the raw tiles' native resolution and pixel grid, so no
+pixel is resampled. Only the 256 px blocks that intersect a window are written
+(GDAL sparse files), which keeps a sparse subset such as ``mini_cleaner`` small.
+
+The windows use the same LOD1 frame the dataset uses, so ``--lod-in`` and the
+margins must match the training config; they are recorded in
+``ortho_manifest.json`` and `MeshDataset` checks them before reading.
+
+Usage:
+    python -m src.ortho_parse "data/The Hague/mini_cleaner" \\
+        --raw "data/The Hague/raw/ortho" --out "data/The Hague/mini_cleaner/ortho"
+"""
+import argparse
+import collections
+import json
+import logging
+import math
+import multiprocessing as mp
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import numpy as np
+import rasterio
+from rasterio.enums import Resampling
+from rasterio.transform import from_origin
+from rasterio.windows import Window
+
+from src.dataset.ortho import crop_bounds
+from src.filter_cityjson import _git_commit
+from src.ortho_tiles import (GSD_M, TILE_M, building_frames, pw_datum_counts, readme_text,
+                             tile_name, tiles_for_bounds)
+
+logger = logging.getLogger(__name__)
+
+OVERVIEWS = [2, 4, 8, 16]
+BETAS_REPORTED = (0.05, 0.1, 0.25)
+
+
+def _coverage(window, tile_dir, year):
+    """Fraction of a window's area that falls on raw tiles present on disk."""
+    xmin, ymin, xmax, ymax = window
+    covered = 0.0
+    for tx, ty in tiles_for_bounds(window):
+        if (tile_dir / tile_name(tx, ty, year)).is_file():
+            covered += ((min(xmax, tx + TILE_M) - max(xmin, tx))
+                        * (min(ymax, ty) - max(ymin, ty - TILE_M)))
+    return covered / ((xmax - xmin) * (ymax - ymin))
+
+
+def mosaic_file(windows, tile_dir, out_path, year, gsd=GSD_M, block=256, chunk=4096,
+                quality=90):
+    """Paste raw tiles into one sparse, tiled YCbCr-JPEG GeoTIFF over `windows`.
+
+    All arithmetic is done in integer centimetres on the raw tiles' pixel grid,
+    so tile pixels are copied, never resampled, and no float drift accumulates.
+
+    Args:
+        windows: {id: (xmin, ymin, xmax, ymax)} in metres.
+        tile_dir: folder of raw tiles for `year`.
+        out_path: GeoTIFF to write.
+        gsd: raw ground sampling distance, metres (0.08 for the real tiles).
+        block, chunk: output block size and read chunk, pixels; chunk must be a
+            multiple of block.
+        quality: JPEG quality of the output and its overviews.
+
+    Returns:
+        dict: coverage {id: fraction on present tiles}, missing_tiles, bytes,
+        width, height.
+    """
+    g = round(gsd * 100)
+    if TILE_M * 100 % g or chunk % block:
+        raise ValueError(f"gsd {gsd} must divide {TILE_M} m and chunk must be a multiple of block.")
+    tile_dir, out_path = Path(tile_dir), Path(out_path)
+
+    boxes = list(windows.values())
+    x0 = math.floor(min(b[0] for b in boxes) * 100 / g) * g
+    y0 = math.floor(min(b[1] for b in boxes) * 100 / g) * g
+    x1 = math.ceil(max(b[2] for b in boxes) * 100 / g) * g
+    y1 = math.ceil(max(b[3] for b in boxes) * 100 / g) * g
+    width, height = (x1 - x0) // g, (y1 - y0) // g
+
+    # Which output blocks any window touches; everything else stays unallocated.
+    mask = np.zeros((math.ceil(height / block), math.ceil(width / block)), bool)
+    for xmin, ymin, xmax, ymax in boxes:
+        c0, c1 = math.floor((xmin * 100 - x0) / g), math.ceil((xmax * 100 - x0) / g)
+        r0, r1 = math.floor((y1 - ymax * 100) / g), math.ceil((y1 - ymin * 100) / g)
+        mask[r0 // block:(r1 - 1) // block + 1, c0 // block:(c1 - 1) // block + 1] = True
+
+    profile = dict(driver="GTiff", width=width, height=height, count=3, dtype="uint8",
+                   crs="EPSG:28992", transform=from_origin(x0 / 100, y1 / 100, gsd, gsd),
+                   tiled=True, blockxsize=block, blockysize=block, compress="JPEG",
+                   photometric="YCBCR", jpeg_quality=quality, interleave="pixel",
+                   sparse_ok=True, bigtiff="IF_SAFER")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    missing, sources = set(), {}
+    try:
+        with rasterio.open(out_path, "w", **profile) as dst:
+            for cr in range(0, height, chunk):
+                for cc in range(0, width, chunk):
+                    h, w = min(chunk, height - cr), min(chunk, width - cc)
+                    blocks = mask[cr // block:(cr + h - 1) // block + 1,
+                                  cc // block:(cc + w - 1) // block + 1]
+                    if not blocks.any():
+                        continue
+                    cx0, cy1 = x0 + cc * g, y1 - cr * g
+                    cx1, cy0 = cx0 + w * g, cy1 - h * g
+                    arr = np.zeros((3, h, w), np.uint8)
+                    for tx, ty in sorted(tiles_for_bounds((cx0 / 100, cy0 / 100,
+                                                           cx1 / 100, cy1 / 100))):
+                        name = tile_name(tx, ty, year)
+                        if name not in sources:
+                            path = tile_dir / name
+                            if not path.is_file():
+                                missing.add(name)
+                                continue
+                            src = rasterio.open(path)
+                            if (round(src.transform.a * 100) != g or
+                                    (round(src.transform.c), round(src.transform.f)) != (tx, ty)):
+                                src.close()
+                                raise ValueError(f"{path} is not a {gsd} m tile anchored at "
+                                                 f"({tx}, {ty}): transform {src.transform}")
+                            sources[name] = src
+                        src = sources.get(name)
+                        if src is None:
+                            continue
+                        ix0, ix1 = max(cx0, tx * 100), min(cx1, (tx + TILE_M) * 100)
+                        iy0, iy1 = max(cy0, (ty - TILE_M) * 100), min(cy1, ty * 100)
+                        if ix1 <= ix0 or iy1 <= iy0:
+                            continue
+                        ww, hh = (ix1 - ix0) // g, (iy1 - iy0) // g
+                        data = src.read((1, 2, 3), window=Window(
+                            (ix0 - tx * 100) // g, (ty * 100 - iy1) // g, ww, hh))
+                        dc0, dr0 = (ix0 - cx0) // g, (cy1 - iy1) // g
+                        arr[:, dr0:dr0 + hh, dc0:dc0 + ww] = data
+                    for bi, bj in np.argwhere(blocks):
+                        r, c = bi * block, bj * block
+                        bh, bw = min(block, h - r), min(block, w - c)
+                        dst.write(arr[:, r:r + bh, c:c + bw],
+                                  window=Window(cc + c, cr + r, bw, bh))
+    finally:
+        for src in sources.values():
+            src.close()
+
+    # Overviews let a large building's crop decode a few blocks instead of
+    # tens of megapixels. Without these options GDAL writes them uncompressed RGB.
+    with rasterio.Env(COMPRESS_OVERVIEW="JPEG", PHOTOMETRIC_OVERVIEW="YCBCR",
+                      INTERLEAVE_OVERVIEW="PIXEL", JPEG_QUALITY_OVERVIEW=quality):
+        with rasterio.open(out_path, "r+") as dst:
+            dst.build_overviews(OVERVIEWS, Resampling.average)
+
+    return {"coverage": {oid: _coverage(b, tile_dir, year) for oid, b in windows.items()},
+            "missing_tiles": sorted(missing), "bytes": out_path.stat().st_size,
+            "width": width, "height": height}
+
+
+def _parse_one(job):
+    """Mosaic one CityJSON file. Top-level so a spawned Pool can pickle it."""
+    rel, lod1_path, lod2_path, out_path, cfg = job
+    try:
+        frames, without_lod1 = building_frames(lod1_path, lod2_path,
+                                               cfg["margin_lo"], cfg["margin_hi"])
+        result = {"rel": rel, "ids": sorted(frames), "without_lod1": without_lod1,
+                  "need_beta": [f.need_beta for f in frames.values()],
+                  "pw_datum": dict(pw_datum_counts(lod2_path)), "written": False}
+        if frames:
+            windows = {oid: crop_bounds(f.center, f.scale, cfg["beta_max"])
+                       for oid, f in frames.items()}
+            stats = mosaic_file(windows, cfg["tile_dir"], out_path, cfg["year"], gsd=cfg["gsd"])
+            result.update(written=True, bytes=stats["bytes"],
+                          missing_tiles=stats["missing_tiles"],
+                          partial={k: v for k, v in stats["coverage"].items() if v < 1 - 1e-9})
+        return result
+    except (OSError, KeyError, IndexError, ValueError, rasterio.errors.RasterioError) as exc:
+        return {"rel": rel, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def parse_subset(subset_root, raw_dir, out_dir, year=2022, beta_max=0.25, lod_in="LOD1",
+                 lod_out="LOD2", margin_lo=(0.0, 0.0, 0.0), margin_hi=(0.0, 0.0, 0.1),
+                 gsd=GSD_M, workers=1):
+    """Write one mosaic per `lod_out` CityJSON file of a subset.
+
+    Returns:
+        dict: totals -- files, buildings, errors, partial coverage per id,
+        missing tiles, ids duplicated across files, bytes written, the
+        ``b3_pw_datum`` distribution, and how far LOD2 reaches past the unit box
+        (``need_beta`` percentiles and the fraction of buildings needing more
+        than each reported beta).
+    """
+    subset_root, out_dir = Path(subset_root), Path(out_dir)
+    cfg = {"margin_lo": list(margin_lo), "margin_hi": list(margin_hi), "beta_max": beta_max,
+           "tile_dir": Path(raw_dir) / str(year), "year": year, "gsd": gsd}
+    jobs = []
+    for lod2_path in sorted((subset_root / lod_out).rglob("*.json")):
+        rel = lod2_path.relative_to(subset_root / lod_out)
+        out_rel = rel.with_name(rel.name.split(".")[0] + ".tif")
+        jobs.append((rel.as_posix(), subset_root / lod_in / rel, lod2_path,
+                     out_dir / out_rel, cfg))
+    if not jobs:
+        raise FileNotFoundError(f"No CityJSON under {subset_root / lod_out}")
+
+    totals = {"files": len(jobs), "files_written": 0, "buildings": 0, "without_lod1": 0,
+              "errors": {}, "partial_coverage": {}, "missing_tiles": set(),
+              "bytes_written": 0, "pw_datum": collections.Counter()}
+    seen, duplicates, need = {}, set(), []
+    pool = mp.Pool(workers) if workers > 1 else None
+    try:
+        results = pool.imap_unordered(_parse_one, jobs) if pool else map(_parse_one, jobs)
+        for done, res in enumerate(results, 1):
+            if "error" in res:
+                logger.error("failed on %s: %s", res["rel"], res["error"])
+                totals["errors"][res["rel"]] = res["error"]
+                continue
+            for oid in res["ids"]:
+                if oid in seen:
+                    duplicates.add(oid)
+                seen[oid] = res["rel"]
+            totals["buildings"] += len(res["ids"])
+            totals["without_lod1"] += res["without_lod1"]
+            totals["pw_datum"].update(res["pw_datum"])
+            need += res["need_beta"]
+            if res["written"]:
+                totals["files_written"] += 1
+                totals["bytes_written"] += res["bytes"]
+                totals["missing_tiles"].update(res["missing_tiles"])
+                totals["partial_coverage"].update(res["partial"])
+            if done % 25 == 0:
+                logger.info("%d/%d files", done, len(jobs))
+    finally:
+        if pool:
+            pool.close()
+            pool.join()
+
+    need = np.asarray(need or [0.0])
+    totals.update(
+        missing_tiles=sorted(totals["missing_tiles"]),
+        pw_datum=dict(totals["pw_datum"]),
+        duplicate_ids=sorted(duplicates),
+        need_beta_pct={p: float(np.percentile(need, p)) for p in (50, 90, 99)},
+        need_beta_max=float(need.max()),
+        need_beta_frac_over={str(b): float((need > b).mean()) for b in BETAS_REPORTED},
+    )
+    return totals
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("subset", type=Path, help="subset root holding LOD1/ and LOD2/")
+    parser.add_argument("--raw", type=Path, required=True, help="raw ortho root (year subfolders)")
+    parser.add_argument("--out", type=Path, required=True, help="output folder, must be empty")
+    parser.add_argument("--year", type=int, default=2022)
+    parser.add_argument("--beta-max", type=float, default=0.25,
+                        help="largest crop margin the dataset may request, normalized units")
+    parser.add_argument("--lod-in", default="LOD1", help="folder whose meshes define the frame")
+    parser.add_argument("--lod-out", default="LOD2")
+    parser.add_argument("--margin-lo", type=float, nargs=3, default=[0.0, 0.0, 0.0])
+    parser.add_argument("--margin-hi", type=float, nargs=3, default=[0.0, 0.0, 0.1])
+    parser.add_argument("--gsd", type=float, default=GSD_M, help="raw tile resolution, metres")
+    parser.add_argument("--workers", type=int, default=min(8, mp.cpu_count()))
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    if not args.subset.is_dir():
+        sys.exit(f"subset not found: {args.subset}")
+    if not (args.raw / str(args.year)).is_dir():
+        sys.exit(f"raw tiles not found: {args.raw / str(args.year)}")
+    if args.out.exists() and any(args.out.iterdir()):
+        sys.exit(f"output folder is not empty: {args.out}")
+
+    try:
+        totals = parse_subset(args.subset, args.raw, args.out, args.year, args.beta_max,
+                              args.lod_in, args.lod_out, args.margin_lo, args.margin_hi,
+                              args.gsd, args.workers)
+    except FileNotFoundError as exc:
+        sys.exit(str(exc))
+
+    manifest = {"created": datetime.now(timezone.utc).isoformat(), "git_commit": _git_commit(),
+                "source": str(args.subset.resolve()), "raw": str(args.raw.resolve()),
+                "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+                "totals": totals}
+    args.out.mkdir(parents=True, exist_ok=True)
+    (args.out / "ortho_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    body = [
+        "## This folder",
+        "",
+        f"One mosaic per CityJSON file of `{args.subset.name}/{args.lod_out}`, same relative",
+        "path and name with `.tif`. Tiled 256 px YCbCr JPEG GeoTIFF at the raw resolution,",
+        "overviews 2/4/8/16. Only blocks under a building's crop window are stored;",
+        "everything else reads as 0.",
+        "",
+        f"Crop windows: frame of `{args.lod_in}` (margins lo {args.margin_lo}, hi "
+        f"{args.margin_hi}) plus beta_max = {args.beta_max}. The dataset refuses a larger",
+        "`image_margin` or a different `lod_in`/margins (see `ortho_manifest.json`).",
+        "",
+        f"Files written: {totals['files_written']} / {totals['files']}; buildings: "
+        f"{totals['buildings']}; partially covered: {len(totals['partial_coverage'])}; "
+        f"missing raw tiles: {len(totals['missing_tiles'])}; errors: {len(totals['errors'])}.",
+        f"Produced by `python -m src.ortho_parse` at commit {manifest['git_commit']}.",
+    ]
+    (args.out / "README.md").write_text(
+        readme_text(f"Orthophoto mosaics: {args.subset.name}", args.year, totals["pw_datum"], body),
+        encoding="utf-8")
+    logger.info("wrote %d mosaics (%.1f MB) to %s", totals["files_written"],
+                totals["bytes_written"] / 1e6, args.out)
+    return totals
+
+
+if __name__ == "__main__":
+    main()

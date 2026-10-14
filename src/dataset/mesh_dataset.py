@@ -595,26 +595,38 @@ def parse_cityjson_file_to_meshes(filepath):
     return meshes
 
 
-def _scan_lod_dir(dataset_dir, lod_dir, max_files=None):
-    """Load every CityJSON under ``<dataset_dir>/<lod_dir>`` into meshes."""
+def _scan_lod_dir(dataset_dir, lod_dir, max_files=None, with_paths=False):
+    """Load every CityJSON under ``<dataset_dir>/<lod_dir>`` into meshes.
+
+    Args:
+        with_paths: also return ``{object id: file path relative to the LOD
+            folder}`` (posix, e.g. ``"Source B/x.city.json"``), last file wins
+            for a repeated id exactly as for the meshes.
+    """
     root = Path(dataset_dir) / lod_dir
     if not root.is_dir():
         raise FileNotFoundError(f"No LOD folder {root!s} under {dataset_dir!r}")
 
-    meshes, seen = {}, 0
+    meshes, paths, seen = {}, {}, 0
     for parent, _, files in sorted(os.walk(root)):
         for name in sorted(files):
             if not name.lower().endswith((".json", ".city.json")):
                 continue
             if max_files is not None and seen >= max_files:
-                return meshes
+                return (meshes, paths) if with_paths else meshes
             seen += 1
+            path = Path(parent) / name
             try:
-                meshes.update(parse_cityjson_file_to_meshes(Path(parent) / name))
+                tile = parse_cityjson_file_to_meshes(path)
             except (OSError, ValueError) as exc:
                 # One corrupt tile must not kill an epoch's worth of loading.
                 logger.warning("skipping %s: %s", name, exc)
-    return meshes
+                continue
+            meshes.update(tile)
+            if with_paths:
+                rel = path.relative_to(root).as_posix()
+                paths.update((oid, rel) for oid in tile)
+    return (meshes, paths) if with_paths else meshes
 
 
 # ----------------------------------------------------------------------
@@ -643,12 +655,22 @@ class MeshDataset(Dataset):
             sequence length is 9 tokens per face and attention is quadratic.
         max_files (int, optional): stop after this many files per LOD. For
             smoke tests and sample dumps -- not a sampling strategy.
+        ortho_dir (str | Path, optional): per-file orthophoto mosaics written by
+            `src.ortho_parse`; relative paths resolve against `dataset_dir`.
+            When set, every item gains ``"image"``: a ``uint8 [3, image_size,
+            image_size]`` top-down crop covering normalized x/y in
+            ``[-0.5 - image_margin, 0.5 + image_margin]`` of the item's own
+            frame, rows along +y and columns along +x (see `src.dataset.ortho`).
+            None (the default) leaves items exactly as before.
+        image_size (int): crop side in pixels.
+        image_margin (float): crop margin beyond the unit box, normalized units;
+            at most the ``beta_max`` the mosaics were built with.
     """
 
     def __init__(self, dataset_dir, lod_in="LOD1_synth", lod_out="LOD2",
                  num_bins=NUM_BINS, margin_lo=(0.0, 0.0, 0.0),
                  margin_hi=(0.0, 0.0, 0.1), max_faces=None, max_files=None,
-                 tokenization="coord"):
+                 tokenization="coord", ortho_dir=None, image_size=256, image_margin=0.1):
         self.dataset_dir = Path(dataset_dir)
         self.num_bins = num_bins
         if tokenization not in ("coord", "amt"):
@@ -660,7 +682,8 @@ class MeshDataset(Dataset):
         self.bos, self.eos, self.pad = specials(num_bins)
 
         meshes_in = _scan_lod_dir(self.dataset_dir, lod_in, max_files)
-        meshes_out = _scan_lod_dir(self.dataset_dir, lod_out, max_files)
+        meshes_out, files_out = _scan_lod_dir(self.dataset_dir, lod_out, max_files,
+                                              with_paths=True)
 
         ids = sorted(set(meshes_in) & set(meshes_out))
         # Purely a corpus decision: which buildings belong in the dataset.
@@ -683,6 +706,12 @@ class MeshDataset(Dataset):
             logger.warning("No buildings shared between %s and %s under %s",
                            lod_in, lod_out, self.dataset_dir)
 
+        self.ortho = None
+        if ortho_dir is not None:
+            # Mosaics mirror the LOD2 file names: "Source B/x.city.json" -> "Source B/x.tif".
+            self.image_files = [files_out[i].split(".")[0] + ".tif" for i in ids]
+            self.ortho = self._open_ortho(ortho_dir, lod_in, lod_out, image_size, image_margin)
+
         # Longest *segment* the model must position-embed. Positions restart in
         # the target segment (see `MeshTransformer.forward`), so this is a max
         # over the two halves, not their sum -- and unlike a sum it cannot be
@@ -696,8 +725,10 @@ class MeshDataset(Dataset):
             # building); the alternative is a 10-per-face upper bound that would
             # oversize the positional embedding by ~2x and throw away the
             # compression this tokenizer exists for.
+            # `_tokens`, not `self[i]`: reading every building's image here
+            # would cost a full pass over the orthophotos for a length count.
             self.max_seq_len = max((max(len(item["cond"]), len(item["tgt"]) - 1)
-                                    for item in (self[i] for i in range(len(self.ids)))),
+                                    for item in map(self._tokens, range(len(self.ids)))),
                                    default=1)
         else:
             self.max_seq_len = max((max(9 * len(a[1]), 9 * len(b[1]) + 1)
@@ -751,6 +782,47 @@ class MeshDataset(Dataset):
             np.round(self.margin_lo, 3).tolist(),
             np.round(self.margin_hi, 3).tolist(), 100 * clipped)
 
+    def _open_ortho(self, ortho_dir, lod_in, lod_out, image_size, image_margin):
+        """Reader over the mosaics, after checking they were built for this frame.
+
+        The mosaics only cover windows up to the ``beta_max`` they were built
+        with, in the frame of the ``lod_in`` meshes and margins they were built
+        from. Any other setting would silently crop past the stored pixels, so
+        it is refused here rather than discovered as black borders mid-training.
+
+        Raises:
+            FileNotFoundError: no manifest, or a mosaic an item needs is missing.
+            ValueError: `image_margin`, `lod_in`, `lod_out` or the margins differ
+                from what the mosaics were built for.
+        """
+        # Imported here so mesh-only users never load GDAL.
+        from src.dataset.ortho import OrthoReader
+
+        root = Path(ortho_dir)
+        if not root.is_absolute():
+            root = self.dataset_dir / root
+        manifest_path = root / "ortho_manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"No ortho_manifest.json in {root}; build it with "
+                                    "`python -m src.ortho_parse`.")
+        built = json.loads(manifest_path.read_text(encoding="utf-8"))["args"]
+        if image_margin > built["beta_max"]:
+            raise ValueError(f"image_margin={image_margin} exceeds the beta_max="
+                             f"{built['beta_max']} the mosaics in {root} were built with.")
+        if (lod_in, lod_out) != (built["lod_in"], built["lod_out"]):
+            raise ValueError(f"Mosaics in {root} were built for lod_in={built['lod_in']!r}, "
+                             f"lod_out={built['lod_out']!r}; got {lod_in!r}, {lod_out!r}.")
+        if not (np.allclose(self.margin_lo, built["margin_lo"])
+                and np.allclose(self.margin_hi, built["margin_hi"])):
+            raise ValueError(f"Mosaics in {root} were built for margin_lo={built['margin_lo']}, "
+                             f"margin_hi={built['margin_hi']}; got {self.margin_lo.tolist()}, "
+                             f"{self.margin_hi.tolist()}.")
+        missing = sorted({f for f in self.image_files if not (root / f).is_file()})
+        if missing:
+            raise FileNotFoundError(f"{len(missing)} mosaic(s) missing under {root}: "
+                                    f"{missing[:5]}")
+        return OrthoReader(root, size=image_size, beta=image_margin)
+
     def __len__(self):
         return len(self.ids)
 
@@ -759,6 +831,14 @@ class MeshDataset(Dataset):
         return self.pairs[index]
 
     def __getitem__(self, index):
+        item = self._tokens(index)
+        if self.ortho is not None:
+            item["image"] = self.ortho.crop(self.image_files[index],
+                                            item["center"].numpy(), item["scale"].numpy())
+        return item
+
+    def _tokens(self, index):
+        """The item without its image: tokens, id and the frame."""
         (v_in, f_in), (v_out, f_out) = self.pairs[index]
         v_in_n, center, scale = normalize_to_unit_box(
             v_in, margin_lo=self.margin_lo, margin_hi=self.margin_hi)
@@ -801,7 +881,7 @@ def mesh_collate_fn(batch, pad=PAD):
     out = {"cond": cond, "cond_pad_mask": cond_mask,
            "tgt": tgt, "tgt_pad_mask": tgt_mask,
            "ids": [item["id"] for item in batch]}
-    for key in ("center", "scale"):
+    for key in ("center", "scale", "image"):
         if key in batch[0]:
             out[key] = torch.stack([item[key] for item in batch])
     return out

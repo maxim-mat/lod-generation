@@ -58,6 +58,14 @@ class MeshDataConfig:
     max_files: Optional[int] = None
     num_workers: int = 4
     persistent_workers: bool = False
+    # Top-down orthophoto crop per building (`MeshDataset(ortho_dir=...)`):
+    # folder of per-file mosaics from `python -m src.ortho_parse`, relative to
+    # dataset_dir (e.g. "ortho") or absolute. None keeps items image-free, which
+    # is every run so far. image_margin is the crop's margin beyond the unit box
+    # in normalized units and may not exceed the mosaics' beta_max.
+    ortho_dir: Optional[str] = None
+    image_size: int = 256
+    image_margin: float = 0.1
 
 @dataclass
 class MeshEvalConfig:

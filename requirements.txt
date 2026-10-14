@@ -49,6 +49,14 @@ rtree>=1.0
 # 4.4% (cancellation: an SD is a small difference of large near-equal volumes).
 # Mesh64 takes that to 4.5e-7 m and 1.6e-8 relative.
 manifold3d>=3.0
+# Orthophoto I/O (src/ortho_download.py, src/ortho_parse.py, src/dataset/ortho.py):
+# windowed reads resampled to a fixed size, tiled YCbCr-JPEG GeoTIFF writing with
+# sparse blocks and overviews. Nothing above reads or writes georeferenced
+# rasters; the Windows wheels bundle GDAL. Pinned below 1.5 because 1.5 requires
+# numpy>=2, which the scipy here (1.13, numpy<2.3) does not allow; rasterio 1.4
+# in turn breaks on affine 3.x (slotted Affine).
+rasterio>=1.4,<1.5
+affine>=2.3,<3
 
 # Experiment tracking
 tensorboard>=2.12.0
@@ -60,6 +68,7 @@ matplotlib>=3.7   # the QQ plot in src/select_cityjson.py; plotly does not do on
 rich>=13.0.0  # Optional, but nice for progress bars
 streamlit>=1.30.0  # src/outlier_explorer.py
 pyproj>=3.6.0      # EPSG:28992 -> WGS84 for the explorer's map links
+pydeck>=0.8        # src/ortho_explorer.py map; ships with streamlit, listed because it is imported directly
 
 # Development & Notebooks
 jupyter>=1.0.0

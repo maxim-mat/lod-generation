@@ -75,6 +75,9 @@ def train_mesh(cfg: Config):
         num_workers=cfg.mesh_data.num_workers,
         persistent_workers=cfg.mesh_data.persistent_workers,
         seed=cfg.seed,
+        ortho_dir=cfg.mesh_data.ortho_dir,
+        image_size=cfg.mesh_data.image_size,
+        image_margin=cfg.mesh_data.image_margin,
     )
     datamodule.setup()
     logger.info("Mesh pairs: train=%d, val=%d, test=%d",

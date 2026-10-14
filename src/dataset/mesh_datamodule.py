@@ -27,6 +27,8 @@ class MeshDataModule(L.LightningDataModule):
         max_faces (int, optional): drop buildings above this triangle count.
         max_files (int, optional): read only the first N files per LOD.
         seed (int): seeds the train/val/test split, for reproducibility.
+        ortho_dir, image_size, image_margin: optional orthophoto crops, passed
+            straight to `MeshDataset`; ``ortho_dir=None`` disables them.
     """
 
     def __init__(self, dataset_dir, lod_in="LOD1_synth", lod_out="LOD2",
@@ -34,9 +36,12 @@ class MeshDataModule(L.LightningDataModule):
                  margin_hi=(0.0, 0.0, 0.1), max_faces=None, max_files=None,
                  batch_size=8, train_val_test_split=(0.8, 0.1, 0.1),
                  num_workers=0, persistent_workers=False, seed=42,
-                 tokenization="coord"):
+                 tokenization="coord", ortho_dir=None, image_size=256, image_margin=0.1):
         super().__init__()
         self.tokenization = tokenization
+        self.ortho_dir = ortho_dir
+        self.image_size = image_size
+        self.image_margin = image_margin
         self.dataset_dir = dataset_dir
         self.lod_in = lod_in
         self.lod_out = lod_out
@@ -66,7 +71,8 @@ class MeshDataModule(L.LightningDataModule):
             num_bins=self.num_bins, margin_lo=self.margin_lo,
             margin_hi=self.margin_hi,
             max_faces=self.max_faces, max_files=self.max_files,
-            tokenization=self.tokenization,
+            tokenization=self.tokenization, ortho_dir=self.ortho_dir,
+            image_size=self.image_size, image_margin=self.image_margin,
         )
         total = len(self.full_dataset)
         if total == 0:
