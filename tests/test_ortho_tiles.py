@@ -5,9 +5,9 @@ import numpy as np
 import pytest
 
 from src.dataset.mesh_dataset import normalize_to_unit_box, parse_cityjson_file_to_meshes
-from src.ortho_tiles import (building_frames, load_sheet_index, parse_tile_name,
-                             pw_datum_counts, sheet_for_tile, tile_name, tile_url,
-                             tiles_for_bounds)
+from src.ortho_tiles import (assign_year, building_frames, load_sheet_index, parse_tile_name,
+                             pw_datum_counts, readme_text, sheet_for_tile, sheets_for_tile,
+                             tile_name, tile_url, tiles_for_bounds)
 
 MARGIN_LO, MARGIN_HI = [0.0, 0.0, 0.0], [0.0, 0.0, 0.1]
 QUADS = [[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4], [1, 2, 6, 5], [2, 3, 7, 6], [3, 0, 4, 7]]
@@ -103,3 +103,44 @@ def test_pw_datum_counts(tmp_path):
                       {"a": (0, 0, 1, 1, 1), "b": (2, 2, 3, 3, 1), "c": (4, 4, 5, 5, 1)},
                       datum={"a": 2022, "b": 2022, "c": None})
     assert pw_datum_counts(lod2) == {"2022": 2, "unknown": 1}
+
+
+def test_tile_url_follows_the_2023_portal_layout():
+    assert tile_url(81000, 455000, perceel=1, blok=3, year=2023) == (
+        "https://basisdata.nl/hwh-ortho/2023/Ortho/1/03/beelden_tif_tegels/"
+        "2023_081000_455000_RGB_hrl.tif")
+
+
+@pytest.mark.parametrize("datum, years, expected", [
+    ("2023", [2022, 2023], 2023),
+    ("2022", [2022, 2023], 2022),
+    ("2020", [2022, 2023], 2022),
+    ("2014", [2023, 2022], 2022),         # order of `years` does not matter
+    ("2025", [2022, 2023], 2023),
+    ("2022", [2021, 2023], 2023),         # tie -> the later year
+    ("unknown", [2022, 2023], 2023),      # no point-cloud year -> most recent imagery
+])
+def test_assign_year_picks_the_closest_imagery_year(datum, years, expected):
+    assert assign_year(datum, years) == expected
+
+
+def test_sheets_for_tile_lists_every_block_touching_the_tile():
+    index = load_sheet_index({"type": "FeatureCollection", "features": [
+        {"type": "Feature", "properties": {"BLOK": "3", "PERCEEL": "Perceel 1"},
+         "geometry": {"type": "MultiPolygon", "coordinates": [[[
+             [80000, 450000], [81600, 450000], [81600, 460000], [80000, 460000], [80000, 450000]]]]}},
+        {"type": "Feature", "properties": {"BLOK": "12", "PERCEEL": "Perceel 2"},
+         "geometry": {"type": "MultiPolygon", "coordinates": [[[
+             [81600, 450000], [90000, 450000], [90000, 460000], [81600, 460000], [81600, 450000]]]]}},
+    ]})
+    assert sheets_for_tile(81000, 455000, index) == [(1, 3), (2, 12)]   # centre block first
+    assert sheets_for_tile(83000, 455000, index) == [(2, 12)]
+    assert sheets_for_tile(10000, 455000, index) == []
+    assert sheet_for_tile(81000, 455000, index) == (1, 3)
+
+
+def test_readme_states_the_year_rule_and_each_point_cloud_years_imagery():
+    text = readme_text("t", [2022, 2023], {"2023": 3, "2020": 1}, ["body"])
+    for needle in ("2022", "2023", "CC-BY 4.0", "b3_pw_datum", "closest",
+                   "2023: 3 (75.0%) -> 2023 imagery", "2020: 1 (25.0%) -> 2022 imagery (2 y apart)"):
+        assert needle in text, needle

@@ -118,6 +118,13 @@ def read_manifest(ortho_root):
     return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
 
 
+@st.cache_data
+def read_assignment(ortho_root):
+    """{building id: imagery year} written by `src.ortho_parse`."""
+    path = Path(ortho_root) / "year_assignment.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+
+
 @st.cache_data(max_entries=8)
 def read_file(path):
     """One CityJSON file and its world vertices, parsed on first use."""
@@ -226,6 +233,11 @@ def main():
         st.error(f"No ortho_manifest.json under {ortho_root}; run `python -m src.ortho_parse`.")
         return
     built = manifest["args"]
+    years_of = read_assignment(str(ortho_root))
+    if years_of is None:
+        st.error(f"No year_assignment.json under {ortho_root}; rebuild with "
+                 "`python -m src.ortho_parse`.")
+        return
 
     if "file" not in st.session_state:
         _random_building(root, files)
@@ -258,7 +270,11 @@ def main():
     _, center, scale = normalize_to_unit_box(meshes1[oid][0], margin_lo=built["margin_lo"],
                                              margin_hi=built["margin_hi"])
     bounds = crop_bounds(center, scale, beta)
-    mosaic = file.split(".")[0] + ".tif"
+    year = years_of.get(oid)
+    if year is None:
+        st.warning(f"`{oid}` has no imagery year in year_assignment.json, so it has no crop.")
+        return
+    mosaic = f"{year}/{file.split('.')[0]}.tif"
     crop = ortho_reader(str(ortho_root), size, beta).crop(mosaic, center, scale)
     obj2 = cj2["CityObjects"][oid]
     rings = footprint_rings(obj2, verts2)
@@ -267,9 +283,9 @@ def main():
     st.subheader(oid)
     st.caption(f"`{file}` · window {bounds[2] - bounds[0]:.1f} m square · "
                f"{(bounds[2] - bounds[0]) / size * 100:.1f} cm/px at {size} px · "
-               f"point cloud {datum or 'unknown'} vs imagery {built['year']}")
-    if datum is not None and str(datum) != str(built["year"]):
-        st.warning(f"LOD2 comes from a {datum} point cloud; the photo is {built['year']}. "
+               f"point cloud {datum or 'unknown'} vs imagery {year}")
+    if datum is not None and str(datum) != str(year):
+        st.warning(f"LOD2 comes from a {datum} point cloud; the photo is {year}. "
                    "The building may have changed in between.")
 
     col3d, colcrop = st.columns([3, 2])

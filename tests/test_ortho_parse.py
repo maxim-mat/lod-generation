@@ -26,13 +26,16 @@ def texture(x, y):
     return np.clip(np.stack([r, g, b]), 0, 255).astype(np.uint8)
 
 
-def write_raw_tile(raw_dir, xmin, ymax, noise=False):
+def write_raw_tile(raw_dir, xmin, ymax, noise=False, year=YEAR):
+    """A 1 km tile; other years get the inverted texture so their pixels are recognisable."""
     xs = xmin + (np.arange(TILE_PX) + 0.5) * GSD
     ys = ymax - (np.arange(TILE_PX) + 0.5) * GSD
     data = texture(*np.meshgrid(xs, ys))
+    if year != YEAR:
+        data = 255 - data
     if noise:
         data = np.random.default_rng(int(xmin + ymax)).integers(0, 256, data.shape, dtype=np.uint8)
-    path = raw_dir / str(YEAR) / tile_name(xmin, ymax, YEAR)
+    path = raw_dir / str(year) / tile_name(xmin, ymax, year)
     path.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(path, "w", driver="GTiff", width=TILE_PX, height=TILE_PX, count=3,
                        dtype="uint8", crs="EPSG:28992", compress="deflate", tiled=True,
@@ -42,9 +45,11 @@ def write_raw_tile(raw_dir, xmin, ymax, noise=False):
 
 
 def read_world(path, x, y):
-    """RGB at world (x, y) from a north-up raster."""
+    """RGB at world (x, y) from a north-up raster; zeros outside it, as OrthoReader pads."""
     with rasterio.open(path) as src:
         row, col = src.index(x, y)
+        if not (0 <= row < src.height and 0 <= col < src.width):
+            return np.zeros(3, np.uint8)
         return src.read(window=((row, row + 1), (col, col + 1)))[:, 0, 0]
 
 
@@ -56,8 +61,9 @@ def psnr(a, b):
 @pytest.fixture
 def raw(tmp_path):
     raw_dir = tmp_path / "The Hague" / "raw" / "ortho"
-    for x in (80000, 81000):
-        write_raw_tile(raw_dir, x, 451000)
+    for year in (2022, 2023):
+        for x in (80000, 81000):
+            write_raw_tile(raw_dir, x, 451000, year=year)
     return raw_dir
 
 
@@ -118,40 +124,76 @@ def test_missing_raw_tile_lowers_coverage_and_reads_zero(tmp_path):
     assert not read_world(out, 81050.0, 450500.0).any()
 
 
+def test_missing_tiles_lists_only_tiles_a_window_needs(tmp_path):
+    raw_dir = tmp_path / "raw"
+    write_raw_tile(raw_dir, 80000, 451000)
+    write_raw_tile(raw_dir, 82000, 451000)
+    # Two windows two tiles apart: the read chunks span the absent tile 81000,
+    # which neither window needs.
+    stats = mosaic_file({"a": (80100.0, 450100.0, 80200.0, 450200.0),
+                         "b": (82100.0, 450100.0, 82200.0, 450200.0)}, raw_dir / str(YEAR),
+                        tmp_path / "m.tif", YEAR, gsd=GSD)
+    assert stats["missing_tiles"] == []
+
+
 def _subset(root):
-    datum = {"a": 2022, "b": 2020}
+    datum = {"a": 2023, "b": 2020}                      # -> 2023 and 2022 imagery
     boxes = {"a": (80100, 450100, 80120, 450130, 8), "b": (80500, 450500, 80510, 450512, 5)}
     for lod in ("LOD1", "LOD2"):
         write_tile(root / lod / "Source B" / "10-1-2.city.json", boxes, datum=datum)
     return root
 
 
-def test_parse_subset_mirrors_cityjson_names_and_reports_provenance(raw, tmp_path):
+def test_parse_subset_writes_one_sparse_mosaic_per_year_and_the_assignment(raw, tmp_path):
     subset = _subset(tmp_path / "The Hague" / "mini_cleaner")
     out = subset / "ortho"
-    totals = parse_subset(subset, raw, out, year=YEAR, beta_max=0.25, lod_in="LOD1",
+    totals = parse_subset(subset, raw, out, years=[2022, 2023], beta_max=0.25, lod_in="LOD1",
                           lod_out="LOD2", margin_lo=[0, 0, 0], margin_hi=[0, 0, 0.1],
                           gsd=GSD, workers=1)
 
-    assert (out / "Source B" / "10-1-2.tif").is_file()
-    assert totals["files_written"] == 1 and totals["buildings"] == 2
-    assert totals["pw_datum"] == {"2022": 1, "2020": 1}
+    m22, m23 = out / "2022" / "Source B" / "10-1-2.tif", out / "2023" / "Source B" / "10-1-2.tif"
+    assert m22.is_file() and m23.is_file()
+    assert json.loads((out / "year_assignment.json").read_text(encoding="utf-8")) == {
+        "a": 2023, "b": 2022}
+    assert totals["files_written"] == {"2022": 1, "2023": 1}
+    assert totals["buildings_per_year"] == {"2022": 1, "2023": 1}
+    assert totals["buildings"] == 2 and totals["pw_datum"] == {"2023": 1, "2020": 1}
     assert totals["partial_coverage"] == {}
     assert set(totals["need_beta_frac_over"]) == {"0.05", "0.1", "0.25"}
+    # "a" is read from the 2023 flight (inverted texture); "b"'s window is not in
+    # the 2023 mosaic at all, and vice versa.
+    a_xy, b_xy = (80110.0, 450115.0), (80505.0, 450506.0)
+    np.testing.assert_allclose(read_world(m23, *a_xy),
+                               255 - texture(np.array(a_xy[0]), np.array(a_xy[1])), atol=8)
+    assert not read_world(m23, *b_xy).any()
+    np.testing.assert_allclose(read_world(m22, *b_xy),
+                               texture(np.array(b_xy[0]), np.array(b_xy[1])), atol=8)
+    assert not read_world(m22, *a_xy).any()
 
 
 def test_main_writes_manifest_and_readme_and_refuses_a_non_empty_out(raw, tmp_path):
     subset = _subset(tmp_path / "The Hague" / "mini_cleaner")
     out = subset / "ortho"
-    argv = [str(subset), "--raw", str(raw), "--out", str(out), "--gsd", str(GSD), "--workers", "1"]
+    argv = [str(subset), "--raw", str(raw), "--out", str(out), "--years", "2022", "2023",
+            "--gsd", str(GSD), "--workers", "1"]
     main(argv)
 
     manifest = json.loads((out / "ortho_manifest.json").read_text(encoding="utf-8"))
     assert {"created", "git_commit", "source", "args", "totals"} <= set(manifest)
     assert manifest["args"]["beta_max"] == 0.25 and manifest["args"]["lod_in"] == "LOD1"
+    assert manifest["args"]["years"] == [2022, 2023]
     readme = (out / "README.md").read_text(encoding="utf-8")
-    for needle in ("2022", "CC-BY 4.0", "b3_pw_datum", "2020: 1"):
-        assert needle in readme
+    for needle in ("2022", "2023", "CC-BY 4.0", "b3_pw_datum",
+                   "2023: 1 (50.0%) -> 2023 imagery", "2020: 1 (50.0%) -> 2022 imagery"):
+        assert needle in readme, needle
 
     with pytest.raises(SystemExit):
         main(argv)
+
+
+def test_main_refuses_a_year_without_raw_tiles(raw, tmp_path):
+    subset = _subset(tmp_path / "The Hague" / "mini_cleaner")
+    with pytest.raises(SystemExit) as exc:
+        main([str(subset), "--raw", str(raw), "--out", str(subset / "ortho"),
+              "--years", "2021", "2022", "--gsd", str(GSD), "--workers", "1"])
+    assert "2021" in str(exc.value.code)

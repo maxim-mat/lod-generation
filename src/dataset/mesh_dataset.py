@@ -708,9 +708,8 @@ class MeshDataset(Dataset):
 
         self.ortho = None
         if ortho_dir is not None:
-            # Mosaics mirror the LOD2 file names: "Source B/x.city.json" -> "Source B/x.tif".
-            self.image_files = [files_out[i].split(".")[0] + ".tif" for i in ids]
-            self.ortho = self._open_ortho(ortho_dir, lod_in, lod_out, image_size, image_margin)
+            self.ortho = self._open_ortho(ortho_dir, lod_in, lod_out, image_size, image_margin,
+                                          files_out)
 
         # Longest *segment* the model must position-embed. Positions restart in
         # the target segment (see `MeshTransformer.forward`), so this is a max
@@ -782,7 +781,7 @@ class MeshDataset(Dataset):
             np.round(self.margin_lo, 3).tolist(),
             np.round(self.margin_hi, 3).tolist(), 100 * clipped)
 
-    def _open_ortho(self, ortho_dir, lod_in, lod_out, image_size, image_margin):
+    def _open_ortho(self, ortho_dir, lod_in, lod_out, image_size, image_margin, files_out):
         """Reader over the mosaics, after checking they were built for this frame.
 
         The mosaics only cover windows up to the ``beta_max`` they were built
@@ -790,10 +789,16 @@ class MeshDataset(Dataset):
         from. Any other setting would silently crop past the stored pixels, so
         it is refused here rather than discovered as black borders mid-training.
 
+        Each building reads the mosaic of its own imagery year, from
+        ``year_assignment.json``: ``<year>/<LOD2 path with .tif>``, e.g.
+        "Source B/x.city.json" -> "2023/Source B/x.tif".
+
         Raises:
-            FileNotFoundError: no manifest, or a mosaic an item needs is missing.
+            FileNotFoundError: no manifest or year assignment, or a mosaic an
+                item needs is missing.
             ValueError: `image_margin`, `lod_in`, `lod_out` or the margins differ
-                from what the mosaics were built for.
+                from what the mosaics were built for, or a building has no
+                assigned year.
         """
         # Imported here so mesh-only users never load GDAL.
         from src.dataset.ortho import OrthoReader
@@ -817,6 +822,17 @@ class MeshDataset(Dataset):
             raise ValueError(f"Mosaics in {root} were built for margin_lo={built['margin_lo']}, "
                              f"margin_hi={built['margin_hi']}; got {self.margin_lo.tolist()}, "
                              f"{self.margin_hi.tolist()}.")
+        assignment_path = root / "year_assignment.json"
+        if not assignment_path.is_file():
+            raise FileNotFoundError(f"No year_assignment.json in {root}; rebuild the mosaics "
+                                    "with `python -m src.ortho_parse`.")
+        year_of = json.loads(assignment_path.read_text(encoding="utf-8"))
+        unassigned = [i for i in self.ids if i not in year_of]
+        if unassigned:
+            raise ValueError(f"{len(unassigned)} building(s) have no imagery year in "
+                             f"{assignment_path}: {unassigned[:5]}")
+        self.image_years = [int(year_of[i]) for i in self.ids]
+        self.image_files = [f"{year_of[i]}/{files_out[i].split('.')[0]}.tif" for i in self.ids]
         missing = sorted({f for f in self.image_files if not (root / f).is_file()})
         if missing:
             raise FileNotFoundError(f"{len(missing)} mosaic(s) missing under {root}: "

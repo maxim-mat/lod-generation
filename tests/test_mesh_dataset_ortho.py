@@ -3,6 +3,7 @@
 raw tiles -> `src.ortho_parse` -> MeshDataset(ortho_dir=...). Off by default, so
 every existing config and checkpoint sees exactly the old items.
 """
+import json
 import pickle
 import shutil
 from pathlib import Path
@@ -20,18 +21,22 @@ from tests.test_ortho_tiles import write_tile
 S = 32
 BOXES = {"a": (80100, 450100, 80120, 450130, 8), "b": (80500, 450500, 80510, 450512, 5),
          "c": (80700, 450300, 80716, 450310, 6), "d": (80300, 450800, 80312, 450820, 7)}
+# Point-cloud years -> imagery: a, d -> 2023; b (2020), c -> 2022.
+DATUM = {"a": 2023, "b": 2020, "c": 2022, "d": 2023}
+YEAR_OF = {"a": 2023, "b": 2022, "c": 2022, "d": 2023}
 
 
 @pytest.fixture(scope="module")
 def subset(tmp_path_factory):
     hague = tmp_path_factory.mktemp("data") / "The Hague"
     raw = hague / "raw" / "ortho"
-    write_raw_tile(raw, 80000, 451000)
+    for year in (2022, 2023):
+        write_raw_tile(raw, 80000, 451000, year=year)
     root = hague / "mini_cleaner"
     for lod in ("LOD1", "LOD2"):
-        write_tile(root / lod / "Source B" / "10-1-2.city.json", BOXES)
+        write_tile(root / lod / "Source B" / "10-1-2.city.json", BOXES, datum=DATUM)
     parse_main([str(root), "--raw", str(raw), "--out", str(root / "ortho"),
-                "--gsd", str(GSD), "--workers", "1"])
+                "--years", "2022", "2023", "--gsd", str(GSD), "--workers", "1"])
     return root
 
 
@@ -44,15 +49,17 @@ def test_without_ortho_items_are_unchanged(subset):
     assert set(item) == {"cond", "tgt", "id", "center", "scale"}
 
 
-def test_image_is_the_aligned_crop_of_the_items_own_frame(subset):
+@pytest.mark.parametrize("oid", ["a", "b"])
+def test_image_is_the_aligned_crop_from_the_buildings_own_year(subset, oid):
     ds = _ds(subset, ortho_dir="ortho", image_size=S, image_margin=0.1)
-    item = ds[0]
+    item = ds[ds.ids.index(oid)]
     img = item["image"]
     assert img.dtype == torch.uint8 and tuple(img.shape) == (3, S, S)
     assert img.float().mean() > 10                       # real texture, not padding
-    direct = OrthoReader(subset / "ortho", size=S, beta=0.1).crop(
-        "Source B/10-1-2.tif", item["center"].numpy(), item["scale"].numpy())
-    assert torch.equal(img, direct)
+    reader = OrthoReader(subset / "ortho", size=S, beta=0.1)
+    own = reader.crop(f"{YEAR_OF[oid]}/Source B/10-1-2.tif", item["center"].numpy(),
+                      item["scale"].numpy())
+    assert torch.equal(img, own)
 
 
 def test_absolute_ortho_dir_is_used_as_is(subset):
@@ -87,7 +94,7 @@ def test_a_different_frame_lod_is_refused(subset, tmp_path):
 def test_missing_mosaic_is_reported_at_construction(subset, tmp_path):
     root = tmp_path / "copy"
     shutil.copytree(subset, root)
-    (root / "ortho" / "Source B" / "10-1-2.tif").unlink()
+    (root / "ortho" / "2023" / "Source B" / "10-1-2.tif").unlink()
     with pytest.raises(FileNotFoundError, match="10-1-2.tif"):
         _ds(root, ortho_dir="ortho")
 
@@ -122,3 +129,22 @@ def test_config_defaults_keep_images_off():
     cfg = load_config(Path("configs/mesh-v5-full-opt-coord.yaml"), [])
     assert cfg.mesh_data.ortho_dir is None
     assert (cfg.mesh_data.image_size, cfg.mesh_data.image_margin) == (256, 0.1)
+
+
+def test_missing_year_assignment_is_refused(subset, tmp_path):
+    root = tmp_path / "copy"
+    shutil.copytree(subset, root)
+    (root / "ortho" / "year_assignment.json").unlink()
+    with pytest.raises(FileNotFoundError, match=r"year_assignment\.json"):
+        _ds(root, ortho_dir="ortho")
+
+
+def test_a_building_missing_from_the_assignment_is_refused(subset, tmp_path):
+    root = tmp_path / "copy"
+    shutil.copytree(subset, root)
+    path = root / "ortho" / "year_assignment.json"
+    assignment = json.loads(path.read_text(encoding="utf-8"))
+    del assignment["c"]
+    path.write_text(json.dumps(assignment), encoding="utf-8")
+    with pytest.raises(ValueError, match="year"):
+        _ds(root, ortho_dir="ortho")

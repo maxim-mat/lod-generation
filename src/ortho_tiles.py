@@ -29,6 +29,14 @@ BASE_URL = "https://basisdata.nl/hwh-ortho"
 URL_TEMPLATES = {
     2021: "{base}/2021/{perceel}/{blok:02d}/beelden_tif_tegels/{name}",
     2022: "{base}/2022/Ortho/{perceel}/{blok:02d}/beelden_tif_tegels/{name}",
+    2023: "{base}/2023/Ortho/{perceel}/{blok:02d}/beelden_tif_tegels/{name}",
+}
+# The viewer's sheet-index assets; each name carries a build hash, so these can
+# go stale -- the scripts take them as overridable arguments.
+SHEET_INDEX_URLS = {
+    2021: f"{BASE_URL}/AUX/bladwijzer/assets/BM2021-BOnvSrdy.geojson",
+    2022: f"{BASE_URL}/AUX/bladwijzer/assets/BM2022-CzCy-9pa.geojson",
+    2023: f"{BASE_URL}/AUX/bladwijzer/assets/BM2023-C9bfq-d_.geojson",
 }
 
 Frame = collections.namedtuple("Frame", "center scale need_beta")
@@ -80,13 +88,41 @@ def load_sheet_index(source):
     return blocks
 
 
+def sheets_for_tile(xmin, ymax, index):
+    """Candidate ``(perceel, blok)`` pairs for a tile, most likely first.
+
+    The block containing the tile centre is the portal's own assignment; blocks
+    containing only a corner are fallbacks for tiles on a block boundary, whose
+    delivery folder does not always follow the centre (seen as HTTP 403).
+    """
+    def inside(exterior, holes, pt):
+        return exterior.contains_point(pt) and not any(h.contains_point(pt) for h in holes)
+
+    centre = (xmin + TILE_M / 2, ymax - TILE_M / 2)
+    corners = [(xmin + 1, ymax - 1), (xmin + TILE_M - 1, ymax - 1),
+               (xmin + 1, ymax - TILE_M + 1), (xmin + TILE_M - 1, ymax - TILE_M + 1)]
+    first = [(p, b) for ext, holes, p, b in index if inside(ext, holes, centre)]
+    rest = [(p, b) for ext, holes, p, b in index
+            if (p, b) not in first and any(inside(ext, holes, c) for c in corners)]
+    return first + rest
+
+
 def sheet_for_tile(xmin, ymax, index):
     """``(perceel, blok)`` of the block containing the tile centre, or None."""
-    centre = (xmin + TILE_M / 2, ymax - TILE_M / 2)
-    for exterior, holes, perceel, blok in index:
-        if exterior.contains_point(centre) and not any(h.contains_point(centre) for h in holes):
-            return perceel, blok
-    return None
+    return (sheets_for_tile(xmin, ymax, index) or [None])[0]
+
+
+def assign_year(pw_datum, years):
+    """Imagery year for a building: the one in `years` closest to its point-cloud year.
+
+    Ties go to the later year; a building without a ``b3_pw_datum`` gets the
+    most recent imagery.
+    """
+    years = sorted(int(y) for y in years)
+    if pw_datum in (None, "unknown"):
+        return years[-1]
+    datum = int(pw_datum)
+    return min(years, key=lambda y: (abs(y - datum), -y))
 
 
 def tile_url(xmin, ymax, perceel, blok, year):
@@ -122,32 +158,38 @@ def building_frames(lod1_path, lod2_path, margin_lo, margin_hi):
     return frames, sum(oid not in lod1 for oid in lod2)
 
 
-def readme_text(title, year, pw_counts, body):
-    """README for an orthophoto data folder: source, licence, CRS and the year remark.
+def readme_text(title, years, pw_counts, body):
+    """README for an orthophoto data folder: source, licence, CRS and the year rule.
 
     Args:
         title: first heading.
-        year: the imagery year used for every building.
+        years: the imagery years in use.
         pw_counts: {point-cloud year: n buildings} over the data the folder serves.
         body: extra markdown lines specific to the folder.
     """
+    years = sorted(int(y) for y in years)
     total = sum(pw_counts.values()) or 1
-    dist = [f"- {k}: {n} ({100 * n / total:.1f}%)" for k, n in
-            sorted(pw_counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+    dist = []
+    for datum, n in sorted(pw_counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        year = assign_year(datum, years)
+        gap = "" if datum == "unknown" or int(datum) == year else f" ({abs(int(datum) - year)} y apart)"
+        dist.append(f"- {datum}: {n} ({100 * n / total:.1f}%) -> {year} imagery{gap}")
+    listed = ", ".join(str(y) for y in years)
     return "\n".join([
         f"# {title}",
         "",
-        f"Source: Beeldmateriaal Nederland, 8 cm RGB orthophoto, {year} flight.",
+        f"Source: Beeldmateriaal Nederland, 8 cm RGB orthophotos, flights {listed}.",
         "Licence: CC-BY 4.0 -- attribute \"Beeldmateriaal Nederland\" in any derived figure.",
         "CRS: EPSG:28992 (RD New), metres, rasters stored north-up.",
         "",
-        "## Year remark",
+        "## Year rule",
         "",
-        f"Every building uses the **{year}** imagery. The 3DBAG LOD2 geometry was",
-        "reconstructed from AHN point clouds of different years, recorded per building",
-        f"in the CityObject attribute `b3_pw_datum`. Where that year is not {year} the photo",
+        "The 3DBAG LOD2 geometry was reconstructed from AHN point clouds of different",
+        "years, recorded per building in the CityObject attribute `b3_pw_datum`. Each",
+        f"building uses the imagery year closest to that among {listed} (ties go to the",
+        "later year; no `b3_pw_datum` -> the most recent). Where the years differ, the photo",
         "can show a building that has since been built, demolished or extended.",
-        "Point-cloud years of the buildings this data covers:",
+        "Point-cloud year of the buildings this data covers, and the imagery each gets:",
         "",
         *dist,
         "",
