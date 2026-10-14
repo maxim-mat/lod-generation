@@ -833,7 +833,7 @@ class MeshTransformerModule(L.LightningModule):
                  vqvae=None, backbone="scratch", opt_name="facebook/opt-350m",
                  opt_pretrained=True, opt_config=None,
                  tokenization="coord", mask_invalid=False, pos_embed="learned",
-                 opt_max_positions=None):
+                 opt_max_positions=None, tf_chamfer=False):
         """
         Args:
             num_bins (int): coordinate discretization used by the tokenizer.
@@ -849,6 +849,10 @@ class MeshTransformerModule(L.LightningModule):
                 the model predicts *codes* rather than coordinates and the LOD1
                 condition is encoded (never quantized -- see the design spec).
                 None keeps the coordinate tokenizer, which stays the default.
+            tf_chamfer (bool): log the teacher-forced chamfer series
+                (`*_tf_chamfer_m`, `_floor_m`, `_rel`; see `_log_tf_chamfer`).
+                Off by default: it is a diagnostic, not a selection metric,
+                and costs a host sync plus two surface queries per sample.
         """
         super().__init__()
         # The tokenizer is a module, not a hyperparameter: pickling it into the
@@ -882,6 +886,7 @@ class MeshTransformerModule(L.LightningModule):
             )
         self.tokenization = tokenization
         self.mask_invalid = mask_invalid
+        self.tf_chamfer = tf_chamfer
         _check_pos_embed(pos_embed)
 
         self.vqvae = vqvae
@@ -1263,17 +1268,18 @@ class MeshTransformerModule(L.LightningModule):
         # `_trainer`, not `trainer`: the property raises when detached, which a
         # unit test calling training_step directly always is.
         trainer = getattr(self, "_trainer", None)
-        stride = trainer.log_every_n_steps if trainer is not None else 0
-        self._log_tf_chamfer(logits, targets, batch, "train", batch_idx, stride,
-                             condition)
+        if self.tf_chamfer and trainer is not None:
+            self._log_tf_chamfer(logits, targets, batch, "train", batch_idx,
+                                 trainer.log_every_n_steps, condition)
         return loss
 
     def _eval_step(self, batch, prefix, batch_idx=0):
         loss, logits, targets, condition = self._shared_step(batch)
         self._log_token_metrics(loss, logits, targets, batch, prefix, on_step=False)
         # Every eval batch: one sample each, and eval is not on the hot path.
-        self._log_tf_chamfer(logits, targets, batch, prefix, batch_idx, stride=1,
-                             condition=condition)
+        if self.tf_chamfer:
+            self._log_tf_chamfer(logits, targets, batch, prefix, batch_idx, stride=1,
+                                 condition=condition)
         return loss
 
     def validation_step(self, batch, batch_idx):

@@ -1,4 +1,5 @@
 """Smoke checks for the LOD1-conditioned mesh transformer. CPU + random data only."""
+import pytest
 import torch
 
 from src.dataset.mesh_dataset import specials, vocab_size
@@ -591,3 +592,52 @@ def test_zero_weight_decay_still_yields_a_usable_optimizer():
     decayed, undecayed = _groups(m)
     assert not decayed
     assert undecayed == {id(p) for p in m.parameters() if p.requires_grad}
+
+
+# ----------------------------------------------------------------------
+# Teacher-forced chamfer switch (mesh_eval.tf_chamfer)
+# ----------------------------------------------------------------------
+
+class _Oracle(torch.nn.Module):
+    """Predicts every target token exactly, so the teacher-forced decode is clean."""
+
+    def forward(self, cond, tgt, cond_pad_mask=None, tgt_pad_mask=None):
+        return _one_hot(tgt[:, 1:])
+
+
+def _tf_keys(step, **kw):
+    """The tf_chamfer series one step logs, with a trainer striding every batch."""
+    from types import SimpleNamespace
+
+    model = MeshTransformerModule(num_bins=NUM_BINS, d_model=16, n_head=2,
+                                  num_layers=1, dropout=0.0, max_seq_len=64, **kw)
+    model.network = _Oracle()
+    model._trainer = SimpleNamespace(log_every_n_steps=1)
+    logged = {}
+    model.log = lambda name, value, **_: logged.__setitem__(name, float(value))
+    getattr(model, step)(_batch(), 0)
+    return {k for k in logged if "tf_chamfer" in k}
+
+
+@pytest.mark.parametrize("step", ["training_step", "validation_step", "test_step"])
+def test_tf_chamfer_is_off_by_default(step):
+    assert _tf_keys(step) == set()
+
+
+@pytest.mark.parametrize("step, prefix", [("training_step", "train"),
+                                          ("validation_step", "val"),
+                                          ("test_step", "test")])
+def test_tf_chamfer_logs_all_three_series_when_enabled(step, prefix):
+    assert _tf_keys(step, tf_chamfer=True) == {
+        f"{prefix}_tf_chamfer_m", f"{prefix}_tf_chamfer_floor_m",
+        f"{prefix}_tf_chamfer_rel"}
+
+
+def test_tf_chamfer_switch_defaults_off_and_reaches_the_module():
+    from pathlib import Path
+
+    from src.utils.config import Config
+
+    assert Config().mesh_eval.tf_chamfer is False
+    src = Path("src/train_mesh.py").read_text(encoding="utf-8")
+    assert "tf_chamfer=cfg.mesh_eval.tf_chamfer" in src

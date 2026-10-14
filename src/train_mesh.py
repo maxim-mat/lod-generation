@@ -145,6 +145,7 @@ def train_mesh(cfg: Config):
         # inverse and the vocabulary is one id short.
         tokenization=cfg.mesh_data.tokenization,
         mask_invalid=cfg.mesh_model.mask_invalid,
+        tf_chamfer=cfg.mesh_eval.tf_chamfer,
     )
     if cfg.mesh_model.backbone == "opt":
         params = sum(p.numel() for p in model.network.opt.parameters())

@@ -87,6 +87,12 @@ class MeshEvalConfig:
     # sum-of-log-probs, which prefers short sequences -- and short here means a
     # mesh with fewer triangles, so the default normalises per token.
     length_penalty: float = 1.0
+    # Teacher-forced chamfer series ({train,val,test}_tf_chamfer_m, _floor_m,
+    # _rel), logged from the model's own steps rather than this callback. A
+    # diagnostic -- the metric size of a typical token error, not generation
+    # quality -- so off by default: each logged sample costs a host sync and
+    # two exact surface queries.
+    tf_chamfer: bool = False
 
 @dataclass
 class MeshModelConfig:
