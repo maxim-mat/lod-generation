@@ -482,6 +482,7 @@ def build_split(ref_cfg, split):
         max_faces=m.max_faces, max_files=m.max_files, tokenization=m.tokenization,
         batch_size=ref_cfg.training.batch_size,
         train_val_test_split=tuple(ref_cfg.training.train_val_test_split),
+        split=ref_cfg.training.split,
         num_workers=0, seed=ref_cfg.seed, ortho_dir=m.ortho_dir, image_size=m.image_size,
         image_margin=m.image_margin, image_min_coverage=m.image_min_coverage)
     datamodule.setup()

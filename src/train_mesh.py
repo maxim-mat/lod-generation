@@ -2,6 +2,7 @@
 
 Reached from `src.train.train` when `cfg.config_set == "mesh"`.
 """
+import json
 import logging
 from pathlib import Path
 
@@ -79,8 +80,18 @@ def train_mesh(cfg: Config):
         image_size=cfg.mesh_data.image_size,
         image_margin=cfg.mesh_data.image_margin,
         image_min_coverage=cfg.mesh_data.image_min_coverage,
+        split=cfg.training.split,
     )
     datamodule.setup()
+    # Which buildings were held out, so evaluation and later runs can be
+    # checked against the same split.
+    (save_dir / "split.json").write_text(json.dumps(
+        {"scheme": cfg.training.split, "seed": cfg.seed,
+         "ratios": list(cfg.training.train_val_test_split),
+         "sizes": {n: len(getattr(datamodule, f"{n}_dataset"))
+                   for n in ("train", "val", "test")},
+         "skipped_no_image": datamodule.skipped_no_image,
+         "tiles": datamodule.split_groups}, indent=2), encoding="utf-8")
     logger.info("Mesh pairs: train=%d, val=%d, test=%d",
                 len(datamodule.train_dataset), len(datamodule.val_dataset),
                 len(datamodule.test_dataset))
@@ -150,6 +161,7 @@ def train_mesh(cfg: Config):
         tokenization=cfg.mesh_data.tokenization,
         mask_invalid=cfg.mesh_model.mask_invalid,
         tf_chamfer=cfg.mesh_eval.tf_chamfer,
+        data_split=cfg.training.split,
     )
     if cfg.mesh_model.backbone == "opt":
         params = sum(p.numel() for p in model.network.opt.parameters())

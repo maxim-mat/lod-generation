@@ -833,7 +833,7 @@ class MeshTransformerModule(L.LightningModule):
                  vqvae=None, backbone="scratch", opt_name="facebook/opt-350m",
                  opt_pretrained=True, opt_config=None,
                  tokenization="coord", mask_invalid=False, pos_embed="learned",
-                 opt_max_positions=None, tf_chamfer=False):
+                 opt_max_positions=None, tf_chamfer=False, data_split="random"):
         """
         Args:
             num_bins (int): coordinate discretization used by the tokenizer.
@@ -853,6 +853,10 @@ class MeshTransformerModule(L.LightningModule):
                 (`*_tf_chamfer_m`, `_floor_m`, `_rel`; see `_log_tf_chamfer`).
                 Off by default: it is a diagnostic, not a selection metric,
                 and costs a host sync plus two surface queries per sample.
+            data_split (str): the train/val/test split scheme of the data this
+                model trains on (`training.split`). Recorded only, so a
+                checkpoint can be refused as an init for a run on another
+                scheme, whose val/test buildings it has seen.
         """
         super().__init__()
         # The tokenizer is a module, not a hyperparameter: pickling it into the

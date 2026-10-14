@@ -276,6 +276,9 @@ class TrainingConfig:
     """Configuration for training loop."""
     batch_size: int = 32
     train_val_test_split: List[float] = field(default_factory=lambda: [0.8, 0.1, 0.1])
+    # 'random' = per building (every run up to v5); 'tile' = whole 3DBAG tiles
+    # per split, see src/analysis/spatial_correlation.py.
+    split: str = "random"
     lr: float = 1e-3
     max_epochs: int = 100
     gradient_clip_val: Optional[float] = None

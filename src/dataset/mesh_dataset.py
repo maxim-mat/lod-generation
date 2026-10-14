@@ -706,6 +706,8 @@ class MeshDataset(Dataset):
 
         self.ids = ids
         self.pairs = [(meshes_in[i], meshes_out[i]) for i in ids]
+        # LOD2 file per building: the geographic split's unit.
+        self.files = [files_out[i] for i in ids]
         if not self.ids:
             logger.warning("No buildings shared between %s and %s under %s",
                            lod_in, lod_out, self.dataset_dir)

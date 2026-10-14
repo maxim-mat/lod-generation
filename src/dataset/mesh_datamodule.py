@@ -4,10 +4,10 @@ import logging
 from functools import partial
 
 import lightning as L
-import torch
-from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data import DataLoader, Subset
 
 from src.dataset.mesh_dataset import NUM_BINS, MeshDataset, mesh_collate_fn, specials
+from src.dataset.splits import random_split_indices, tile_split_indices
 
 logger = logging.getLogger(__name__)
 
@@ -15,8 +15,9 @@ logger = logging.getLogger(__name__)
 class MeshDataModule(L.LightningDataModule):
     """Splits `MeshDataset` and serves padded token batches.
 
-    Mirrors `CityJSONDataModule`: same split ratios, same seeded `random_split`,
-    same worker plumbing. It has no marginals/coord-scale statistics to compute --
+    The default ``split="random"`` is the seeded per-building `random_split`
+    every run up to v5 used; ``split="tile"`` keeps each 3DBAG tile (CityJSON
+    file) whole within one split (see `src.dataset.splits`). It has no marginals/coord-scale statistics to compute --
     the tokenizer's per-building unit-box normalization already does that job.
 
     Args:
@@ -30,6 +31,7 @@ class MeshDataModule(L.LightningDataModule):
         max_faces (int, optional): drop buildings above this triangle count.
         max_files (int, optional): read only the first N files per LOD.
         seed (int): seeds the train/val/test split, for reproducibility.
+        split (str): ``"random"`` (per building) or ``"tile"`` (whole files).
         ortho_dir, image_size, image_margin: optional orthophoto crops, passed
             straight to `MeshDataset`; ``ortho_dir=None`` disables them.
         image_min_coverage (float): with `ortho_dir`, buildings whose mosaic
@@ -43,8 +45,11 @@ class MeshDataModule(L.LightningDataModule):
                  batch_size=8, train_val_test_split=(0.8, 0.1, 0.1),
                  num_workers=0, persistent_workers=False, seed=42,
                  tokenization="coord", ortho_dir=None, image_size=256, image_margin=0.1,
-                 image_min_coverage=1.0):
+                 image_min_coverage=1.0, split="random"):
         super().__init__()
+        if split not in ("random", "tile"):
+            raise ValueError(f"Unknown split {split!r}; expected 'random' or 'tile'.")
+        self.split = split
         self.tokenization = tokenization
         self.ortho_dir = ortho_dir
         self.image_size = image_size
@@ -68,6 +73,7 @@ class MeshDataModule(L.LightningDataModule):
         self.full_dataset = None
         self.train_dataset = self.val_dataset = self.test_dataset = None
         self.skipped_no_image = {}
+        self.split_groups = {}
 
         assert abs(sum(train_val_test_split) - 1.0) < 1e-5, "Split ratios must sum to 1.0"
 
@@ -88,15 +94,16 @@ class MeshDataModule(L.LightningDataModule):
         if total == 0:
             raise ValueError(f"No LOD pairs found under {self.dataset_dir}")
 
-        r_train, r_val, _ = self.train_val_test_split
-        train_size = int(r_train * total)
-        val_size = int(r_val * total)
-        generator = torch.Generator().manual_seed(self.seed)
-        self.train_dataset, self.val_dataset, self.test_dataset = random_split(
-            self.full_dataset,
-            [train_size, val_size, total - train_size - val_size],
-            generator=generator,
-        )
+        ratios = self.train_val_test_split
+        if self.split == "tile":
+            parts, assign = tile_split_indices(self.full_dataset.files, ratios, self.seed)
+            names = ("train", "val", "test")
+            self.split_groups = {g: names[k] for g, k in assign.items()}
+        else:
+            parts = random_split_indices(total, ratios, self.seed)
+            self.split_groups = {}
+        self.train_dataset, self.val_dataset, self.test_dataset = (
+            Subset(self.full_dataset, p) for p in parts)
 
         # Split first, then drop buildings without an orthophoto: the split
         # stays exactly v5's, so an image run initialised from v5 never
