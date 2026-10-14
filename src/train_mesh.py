@@ -1,8 +1,6 @@
 """Training pipeline for the LOD1-conditioned mesh transformer (config_set: mesh).
 
-Reached from `src.train.train` when `cfg.config_set == "mesh"`. Kept separate
-from the diffusion path because that one resolves marginals, a coordinate scale
-and a z-shift from the datamodule, none of which exist here.
+Reached from `src.train.train` when `cfg.config_set == "mesh"`.
 """
 import logging
 from pathlib import Path

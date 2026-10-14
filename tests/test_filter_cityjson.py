@@ -153,8 +153,8 @@ def test_sliver_screen_removes_object():
 
 # --- end to end -----------------------------------------------------------
 
-def test_filtered_fixture_still_parses_to_a_levi_graph(tmp_path):
-    from src.dataset.dataset import parse_cityjson_file_to_graphs
+def test_filtered_fixture_still_parses_to_a_mesh(tmp_path):
+    from src.dataset.mesh_dataset import parse_cityjson_file_to_meshes
     from src.filter_cityjson import filter_cityjson
 
     fixture = Path(__file__).parent / "fixtures" / "synthetic_lod2_building.city.json"
@@ -165,14 +165,12 @@ def test_filtered_fixture_still_parses_to_a_levi_graph(tmp_path):
     path.write_text(json.dumps(out), encoding="utf-8")
 
     # The fixture is already a single clean LOD2 Solid, so filtering must not
-    # change the graph it produces.
-    before = next(iter(parse_cityjson_file_to_graphs(fixture).values()))
-    after = next(iter(parse_cityjson_file_to_graphs(path).values()))
-    assert after["x"].shape == before["x"].shape
-    np.testing.assert_allclose(np.sort(after["x"].numpy(), axis=0),
-                               np.sort(before["x"].numpy(), axis=0), atol=1e-6)
-    assert sorted(after["node_labels"].tolist()) == sorted(before["node_labels"].tolist())
-    assert after["edge_index"].shape == before["edge_index"].shape
+    # change the mesh it produces.
+    v0, f0 = next(iter(parse_cityjson_file_to_meshes(fixture).values()))
+    v1, f1 = next(iter(parse_cityjson_file_to_meshes(path).values()))
+    assert v1.shape == v0.shape
+    np.testing.assert_allclose(np.sort(v1, axis=0), np.sort(v0, axis=0), atol=1e-6)
+    assert f1.shape == f0.shape
 
 
 def _raw_tree(tmp_path):
@@ -200,7 +198,7 @@ def test_synthetic_lod1_is_opt_in(tmp_path):
 
 def test_convert_on_the_fly_pairs_synth_lod1_with_lod2(tmp_path):
     """The synthetic pair must keep the LOD2 filename and object ids."""
-    from src.dataset.dataset import parse_cityjson_file_to_graphs
+    from src.dataset.mesh_dataset import parse_cityjson_file_to_meshes
     from src.filter_cityjson import process_dataset
 
     raw, out = _raw_tree(tmp_path)
@@ -211,11 +209,11 @@ def test_convert_on_the_fly_pairs_synth_lod1_with_lod2(tmp_path):
     assert totals["LOD1_synth"]["files"] == 1
     assert (out / "LOD1_synth" / "Source A" / "description.txt").exists()
 
-    lod2 = parse_cityjson_file_to_graphs(out / "LOD2" / "Source A" / "tile.city.json")
-    synth = parse_cityjson_file_to_graphs(out / "LOD1_synth" / "Source A" / "tile.city.json")
+    lod2 = parse_cityjson_file_to_meshes(out / "LOD2" / "Source A" / "tile.city.json")
+    synth = parse_cityjson_file_to_meshes(out / "LOD1_synth" / "Source A" / "tile.city.json")
     assert set(synth) == set(lod2)
-    g1, g2 = next(iter(synth.values())), next(iter(lod2.values()))
-    assert g1["x"].shape[0] < g2["x"].shape[0]        # LOD1 is the coarser of the pair
+    (v1, f1), (v2, f2) = next(iter(synth.values())), next(iter(lod2.values()))
+    assert len(f1) < len(f2)                          # LOD1 is the coarser of the pair
 
 
 def test_real_lod1_and_lod2_are_split_into_their_own_folders(tmp_path):

@@ -115,9 +115,8 @@ def test_padded_targets_are_excluded_from_the_loss():
 def test_mesh_config_set_resolves():
     """configs/mesh-train.yaml must survive the structured-schema merge.
 
-    Guards the trap that MeshDataConfig introduces: OmegaConf resolves the
-    *whole* Config, so a new MISSING field or an unfilled diffusion field breaks
-    every config file, not just the new one.
+    Guards the trap that OmegaConf resolves the *whole* Config, so a new
+    MISSING field breaks every config file, not just the new one.
     """
     from pathlib import Path
 
@@ -126,10 +125,6 @@ def test_mesh_config_set_resolves():
     cfg = load_config(Path("configs/mesh-train.yaml"), [])
     assert cfg.config_set == "mesh"
     assert cfg.mesh_data.dataset_dir and cfg.mesh_data.num_bins == 128
-
-    # ...and the diffusion configs keep resolving with the new blocks defaulted.
-    levi = load_config(Path("configs/levi1-train.yaml"), [])
-    assert levi.config_set == "diffusion" and levi.mesh_data.dataset_dir is None
 
 
 def test_validation_step_logs_accuracy():

@@ -15,7 +15,6 @@ import pytest
 from src.analysis.cityobject_analysis import signed_volume as an_signed_volume
 from src.dataset.mesh_dataset import fix_winding
 from src.dataset.mesh_dataset import signed_volume as md_signed_volume
-from src.eval.building_features import signed_volume as bf_signed_volume
 
 # Unit cube, outward wound.
 CUBE_V = np.array([[0., 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0],
@@ -43,7 +42,6 @@ def test_closed_rings_are_unaffected_by_translation():
     there = an_signed_volume(CUBE_RINGS, CUBE_V + FAR)
     assert abs(here) == pytest.approx(1.0)
     assert abs(there) == pytest.approx(1.0, rel=1e-6)
-    assert bf_signed_volume(CUBE_V + FAR, CUBE_RINGS) == pytest.approx(1.0, rel=1e-6)
 
 
 def open_cube():
@@ -73,7 +71,6 @@ def test_open_rings_stay_bounded_when_translated():
     rings = [r for i, r in enumerate(CUBE_RINGS) if i != 2]      # drops the -y wall
     far = an_signed_volume(rings, CUBE_V + FAR)
     assert abs(far) < 10.0, f"open-shell volume exploded with the origin: {far}"
-    assert abs(bf_signed_volume(CUBE_V + FAR, rings)) < 10.0
 
 
 def test_fix_winding_decision_survives_translation():

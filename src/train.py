@@ -1,28 +1,16 @@
 import logging
-from pathlib import Path
-from datetime import datetime
-
-import lightning as L
 
 from src.utils.config import Config
-from src.utils.setup_utils import (
-    create_datamodule,
-    create_model,
-    create_loggers,
-    create_callbacks
-)
 
 logger = logging.getLogger(__name__)
 
 def train(cfg: Config):
     """
     Main training pipeline.
-    Sets up Datamodule, Model, Logger, Callbacks and runs the Lightning Trainer.
 
-    `cfg.config_set` selects which set of config objects is built: "diffusion"
-    (default) and "mini" both run the Levi-graph diffusion below -- "mini" is
-    the same objects pointed at the mini dataset -- while "mesh" hands off to
-    the LOD1-conditioned mesh transformer.
+    `cfg.config_set` selects which set of config objects is built: "mesh" runs
+    the LOD1-conditioned mesh transformer, "mesh_vqvae" its stage-1 learned
+    vocabulary.
     """
     if cfg.config_set == "mesh":
         from src.train_mesh import train_mesh
@@ -30,107 +18,5 @@ def train(cfg: Config):
     if cfg.config_set == "mesh_vqvae":
         from src.train_mesh_vqvae import train_mesh_vqvae
         return train_mesh_vqvae(cfg)
-    if cfg.config_set == "mesh_diffusion":
-        from src.train_mesh_diffusion import train_mesh_diffusion
-        return train_mesh_diffusion(cfg)
-    if cfg.config_set not in ("diffusion", "mini"):
-        raise ValueError(f"Unknown config_set: {cfg.config_set!r}. Expected "
-                         "'diffusion', 'mini', 'mesh', 'mesh_vqvae' or "
-                         "'mesh_diffusion'.")
-
-    # Seed everything for reproducibility
-    L.seed_everything(cfg.seed, workers=True)
-    start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Setup save directory
-    save_dir = Path(cfg.logging.save_dir, cfg.logging.experiment_name, cfg.logging.run_name)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    
-    logger.info("Initializing Datamodule...")
-    datamodule = create_datamodule(cfg)
-    datamodule.setup()
-    
-    resolved_n_max = datamodule.n_max
-    logger.info(f"Resolved N_max = {resolved_n_max}")
-    
-    logger.info(
-        "Dataset loaded: train=%d, val=%d, test=%d",
-        len(datamodule.train_dataset) if datamodule.train_dataset else 0,
-        len(datamodule.val_dataset) if datamodule.val_dataset else 0,
-        len(datamodule.test_dataset) if datamodule.test_dataset else 0,
-    )
-    
-    logger.info("Creating Model...")
-    x_marginals, e_marginals = datamodule.compute_marginals()
-    logger.info(
-        "Train-split marginals: nodes (active, virtual)=%s, edges (none, edge)=%s",
-        x_marginals.tolist(), e_marginals.tolist(),
-    )
-
-    coord_scale = cfg.data.coord_scale
-    if coord_scale is None:
-        coord_scale = datamodule.compute_coord_scale()
-        logger.info("Coordinate scale from train split: %.6f m/unit", coord_scale)
-    else:
-        logger.info("Coordinate scale from config: %.6f m/unit", coord_scale)
-
-    z_shift = cfg.data.z_shift
-    if z_shift is None:
-        z_shift = datamodule.compute_z_shift() if cfg.model.equivariance == "se2" else 0.0
-    if cfg.model.equivariance == "se2":
-        logger.info("z shift (se2): %.6f m", z_shift)
-
-    dist_r_max = cfg.data.dist_r_max
-    if cfg.model.dist_embed == "bessel" and dist_r_max is None:
-        dist_r_max = datamodule.compute_dist_r_max(coord_scale)
-        logger.info("Bessel r_max from train split: %.6f (normalised units)", dist_r_max)
-
-    model = create_model(cfg, resolved_n_max, x_marginals=x_marginals,
-                         e_marginals=e_marginals, coord_scale=coord_scale,
-                         z_shift=z_shift, dist_r_max=dist_r_max)
-    
-    logger.info("Creating loggers and callbacks...")
-    exp_loggers = create_loggers(cfg, save_dir)
-    callbacks = create_callbacks(cfg, save_dir)
-    
-    # Configure Lightning Trainer
-    trainer = L.Trainer(
-        max_epochs=cfg.training.max_epochs,
-        accelerator=cfg.trainer.accelerator,
-        devices=cfg.trainer.devices,
-        precision=cfg.trainer.precision,
-        gradient_clip_val=cfg.training.gradient_clip_val,
-        accumulate_grad_batches=cfg.training.accumulate_grad_batches,
-        callbacks=callbacks,
-        logger=exp_loggers if exp_loggers else False,
-        log_every_n_steps=cfg.trainer.log_every_n_steps,
-        deterministic=False,
-        default_root_dir=str(save_dir),
-    )
-    
-    # Log hyperparameters to loggers
-    if exp_loggers:
-        from omegaconf import OmegaConf
-        hparams = OmegaConf.to_container(OmegaConf.structured(cfg), resolve=True)
-        # Log the resolved scale, not the `null` placeholder that asked for it.
-        hparams["data"]["coord_scale"] = coord_scale
-        for lg in trainer.loggers:
-            lg.log_hyperparams(hparams)
-            
-    # Run training
-    logger.info("Starting training...")
-    trainer.fit(model, datamodule=datamodule, ckpt_path=cfg.resume_from)
-    
-    # Test best model if test split exists
-    if datamodule.test_dataset and len(datamodule.test_dataset) > 0:
-        best_model_path = trainer.checkpoint_callback.best_model_path
-        if best_model_path:
-            logger.info(f"Running test evaluation using best checkpoint: {best_model_path}")
-            trainer.test(model, datamodule=datamodule, ckpt_path=best_model_path)
-        else:
-            logger.warning("No best checkpoint found! Running test evaluation with current model weights.")
-            trainer.test(model, datamodule=datamodule)
-            
-    logger.info("Training complete.")
-    if cfg.training.checkpoint.enabled and trainer.checkpoint_callback.best_model_path:
-        logger.info(f"Best checkpoint saved to: {trainer.checkpoint_callback.best_model_path}")
+    raise ValueError(f"Unknown config_set: {cfg.config_set!r}. Expected "
+                     "'mesh' or 'mesh_vqvae'.")

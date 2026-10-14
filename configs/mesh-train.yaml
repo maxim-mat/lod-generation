@@ -8,12 +8,6 @@ mode: train
 config_set: mesh
 seed: 42
 
-# The diffusion `data:` block is not read under config_set: mesh, but
-# DataConfig.dataset_dir is MISSING and OmegaConf resolves the whole schema, so
-# it still needs a value. Left deliberately non-real so nothing quietly uses it.
-data:
-  dataset_dir: data/The Hague/mini
-
 # Mesh dataset settings (MeshDataConfig)
 mesh_data:
   dataset_dir: data/The Hague/mini
@@ -79,9 +73,7 @@ logging:
   wandb_offline: false
   log_model: false
 
-# Free-running generation scored against the paired ground-truth LOD2. The
-# unconditional generative_eval does not apply here and is gated off by
-# config_set in create_callbacks, so it needs no block.
+# Free-running generation scored against the paired ground-truth LOD2.
 #
 # Ceilings measured on mini (raw LOD2 vs its own 128-bin round trip), which is
 # the best any model can score: chamfer 0.155 m, footprint IoU 0.992,

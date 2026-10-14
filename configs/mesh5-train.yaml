@@ -28,9 +28,6 @@ mode: train
 config_set: mesh
 seed: 42
 
-data:
-  dataset_dir: data/The Hague/mini
-
 # Identical to mesh-vqvae.yaml and mesh4-train.yaml -- the split is seeded from
 # these, and a building in the transformer's test set must never have trained
 # the tokenizer.

@@ -35,8 +35,12 @@ def _cj(sizes):
     objects, verts, base = {}, [], 0
     for i, n in enumerate(sizes):
         objects[f"b{i}"] = {"type": "Building", "geometry": [_solid(n, base)]}
-        for k in range(2 * n):
-            verts.append([k, i, 0])
+        # A real n-gon prism, one per object along x: the mesh parser drops
+        # zero-area faces, so collinear placeholders would parse to nothing.
+        for z in (0, 1):
+            for k in range(n):
+                a = 2 * np.pi * k / n
+                verts.append([3 * i + np.cos(a), np.sin(a), z])
         base += 2 * n
     return {"type": "CityJSON", "version": "1.1",
             "CityObjects": objects, "vertices": verts}
@@ -122,15 +126,15 @@ def test_pairing_is_preserved_across_folders(tmp_path):
 
 
 def test_output_is_readable_by_the_parser(tmp_path):
-    from src.dataset.dataset import parse_cityjson_file_to_graphs
+    from src.dataset.mesh_dataset import parse_cityjson_file_to_meshes
 
     root = _dataset(tmp_path, folders=("LOD2",))
     sample_dataset(root, tmp_path / "mini", fraction=0.75, seed=2, alpha=1.0)
-    graphs = parse_cityjson_file_to_graphs(
+    meshes = parse_cityjson_file_to_meshes(
         str(tmp_path / "mini" / "LOD2" / "Source A" / "t.json"))
-    assert graphs
-    for g in graphs.values():
-        assert g["x"].shape[0] > 0
+    assert meshes
+    for verts, faces in meshes.values():
+        assert verts.shape[0] > 0 and faces.shape[0] > 0
 
 
 def test_manifest_records_the_seed(tmp_path):

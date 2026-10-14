@@ -3,16 +3,16 @@
 CityJSON LOD Generation — Main Entry Point
 
 Training:
-    python main.py --train --config configs/train.yaml
-    python main.py --train --config configs/train.yaml model.hidden_dim=128 training.max_epochs=100
-    python main.py --train --config configs/mesh-train.yaml --config-set mesh
+    python main.py --train --config configs/mesh-v5-full-opt-coord.yaml
+    python main.py --train --config configs/mesh-vqvae.yaml --config-set mesh_vqvae
 
-Inference:
-    python main.py --inference --config configs/inference.yaml
-    python main.py --inference --config configs/train.yaml inference.checkpoint_path=outputs/regnn_diffusion/default/checkpoints/last.ckpt
+Inference (LOD1 CityJSON in, LOD2 CityJSON out; pass the run's own training config):
+    python main.py --inference --config configs/mesh-v5-full-opt-coord.yaml \
+        inference.checkpoint_path=wandb://maxim-lod/lod-generation/model-<run_id>:best \
+        inference.input_path="data/The Hague/cleaner/LOD1_synth/Source A"
 
 Override any config parameter using OmegaConf dot notation:
-    python main.py --train --config configs/train.yaml training.batch_size=16 model.T=1000 logging.loggers="['tensorboard', 'wandb']"
+    python main.py --train --config configs/mesh-v5-full-opt-coord.yaml training.batch_size=16 logging.loggers="['tensorboard', 'wandb']"
 """
 import logging
 import sys
@@ -47,7 +47,6 @@ def main():
         cfg.mode = "train"
         train(cfg)
     elif args.inference:
-        # Override mode in config for consistency
         cfg.mode = "inference"
         run_inference(cfg)
     else:

@@ -254,7 +254,7 @@ def _git_state():
     """``(info, diff)``: commit, dirty flag and status lines, plus ``git diff HEAD``."""
     def git(*args):
         return subprocess.run(["git", *args], cwd=REPO_ROOT, capture_output=True,
-                              text=True, check=True).stdout
+                              text=True, encoding="utf-8", errors="replace", check=True).stdout
     try:
         status = git("status", "--porcelain")
         info = {"commit": git("rev-parse", "HEAD").strip(),

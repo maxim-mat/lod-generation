@@ -839,8 +839,7 @@ class MeshTransformerModule(L.LightningModule):
             num_bins (int): coordinate discretization used by the tokenizer.
                 Must match the datamodule's, or the vocabulary is misaligned;
                 saved as a hyperparameter so inference restores it.
-            lr_scheduler (str): 'none' | 'cosine' | 'step', as in
-                `CityJSONDiffusionModule`.
+            lr_scheduler (str): 'none' | 'cosine' | 'step'.
             opt_max_positions (int, optional): OPT position-table size, from
                 `mesh_dataset.position_budget`. None keeps the hub default.
             pos_embed (str): 'learned' | 'sinusoidal'. Applies to both
@@ -1327,10 +1326,6 @@ class MeshTransformerModule(L.LightningModule):
 
     def configure_optimizers(self):
         """AdamW, with optional linear warmup composed over any schedule.
-
-        Deliberately the same shape as `MeshDiffusionModule.configure_optimizers`
-        so the two branches anneal identically and a cross-branch comparison is
-        not confounded by the schedule.
 
         Warmup runs on the STEP interval, never the epoch one. Lightning
         defaults `interval` to "epoch", so a 2000-step warmup left on the

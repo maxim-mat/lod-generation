@@ -6,85 +6,14 @@ from omegaconf import MISSING
 logger = logging.getLogger(__name__)
 
 @dataclass
-class DataConfig:
-    """Configuration for dataset and datamodule."""
-    dataset_dir: str = MISSING
-    lods: List[int] = field(default_factory=lambda: [1, 2])
-    normalize_coords: bool = False
-    num_workers: int = 4
-    # Keep DataLoader workers alive across epochs (ignored when num_workers=0).
-    persistent_workers: bool = False
-    n_max: Optional[int] = None
-    upper_limit_nodes: Optional[int] = None
-    # Metres per unit of the model's coordinate space. None = compute the pooled
-    # std of the train split. Set explicitly to reuse a scale across runs.
-    coord_scale: Optional[float] = None
-    # se2 only: metres subtracted from z before scaling, so the absolute-height
-    # channel is zero-mean under the N(0,1) prior. None = train-split mean
-    # vertex z (ignored unless model.equivariance == "se2").
-    z_shift: Optional[float] = None
-    # Bessel distance basis (model.dist_embed == "bessel") only: cutoff radius in
-    # normalised coord units. None = compute a high quantile of train-split
-    # pairwise distance on the fly. Ignored for other dist_embed modes.
-    dist_r_max: Optional[float] = None
-
-@dataclass
-class ModelConfig:
-    """Configuration for model architecture and the diffusion noise schedule."""
-    num_node_classes: int = 5  # vertex, ground, roof, wall, off (Levi graph)
-    num_edge_classes: int = 3  # off, vertex-vertex, vertex-face
-    equivariance: str = "so2"  # "so2" | "se2" | "o3"
-    time_embed: str = "scalar"  # "scalar" (raw t/T) | "sinusoidal" (Fourier lift)
-    # Pairwise-distance featurization into lin_dist1. "raw" = MiDi's single
-    # linear channel; the others lift distance for multi-scale resolution.
-    dist_embed: str = "raw"  # "raw" | "sinusoidal" | "mlp" | "bessel"
-    dist_embed_dim: int = 16  # feature width of the lift (even for sinusoidal); ignored for "raw"
-    hidden_dim: int = 64      # dx: node channel width, must be divisible by n_head
-    edge_dim: int = 32        # de: edge channel width; drives [B,N,N,de] memory
-    global_dim: int = 32      # dy: global feature width
-    n_head: int = 8
-    num_layers: int = 4
-    dropout: float = 0.1
-    T: int = 500
-    # "marginal" = limit distribution is the training class marginals (MiDi default)
-    discrete_noise_type: str = "marginal"  # "marginal" | "uniform"
-
-    # Cosine schedule exponent per feature (positions, node classes, edges).
-    # nu_pos > nu_e destroys coordinates faster than graph structure.
-    nu_pos: float = 2.5
-    nu_x: float = 1.0
-    nu_e: float = 1.5
-
-    # Loss weights, MiDi's lambda_train restricted to (pos, X, E).
-    lambda_pos: float = 3.0
-    lambda_x: float = 0.4
-    lambda_e: float = 2.0
-
-    # Weight of the Off-slot coordinate term. The coord MSE is normalised over
-    # real slots only; Off keeps a smaller anchor because the zero-CoM projection
-    # spans every slot, so unheld Off positions rigidly translate the building.
-    off_anchor_weight: float = 0.1
-
-    # Cross-entropy class balancing, the categorical counterpart of the above.
-    # Off is 73.7% of node slots and 99.0% of node pairs; GroundSurface is 0.67%
-    # of node slots. class_balance is the exponent on inverse frequency: 0 leaves
-    # the loss proper, 1 equalises every class's contribution. off_ce_weight
-    # scales the Off class on top, since how often the model emits Off sets the
-    # generated graph's size. Any non-default value biases the network's x0
-    # posterior, which `_debias` divides back out before sampling.
-    class_balance: float = 0.5
-    off_ce_weight: float = 1.0
-
-@dataclass
 class MeshDataConfig:
     """Dataset/datamodule for the LOD1-conditioned mesh transformer.
 
-    Separate from `DataConfig`: the mesh pipeline shares none of its fields
-    (no n_max, no coord_scale, no marginals) and reads two LOD directories by
-    name rather than by LOD number.
+    Reads two LOD directories by name rather than by LOD number.
     """
-    # Not MISSING: every existing diffusion config would then fail to resolve
-    # just for leaving this whole block out. Checked in `train_mesh` instead.
+    # Not MISSING, so a config that never reads mesh data (posthoc eval's own
+    # file, the schema round-trip tests) still resolves. Checked in
+    # `train_mesh` / `train_mesh_vqvae` instead.
     dataset_dir: Optional[str] = None
     # Directory names under dataset_dir, not LOD numbers. LOD1_synth is the
     # default input because the real LOD1 folder only covers Source B, while
@@ -134,9 +63,8 @@ class MeshDataConfig:
 class MeshEvalConfig:
     """Free-running generation scored against the paired ground-truth LOD2.
 
-    Replaces `GenerativeEvalConfig` on the mesh path: that one measures an
-    unconditional model against a distribution, which is meaningless here since
-    every LOD1 condition has exactly one correct answer.
+    Per-pair rather than distributional: every LOD1 condition has exactly one
+    correct answer, so unconditional distribution metrics are meaningless here.
     """
     enabled: bool = True
     # generate() has no KV cache, so a 200-face building is ~1800 sequential
@@ -310,249 +238,6 @@ class MeshVQVAEConfig:
     init_from: Optional[str] = None
 
 @dataclass
-class ScaffoldConfig:
-    """LOD1-derived legal region, applied during reverse diffusion.
-
-    MeshWeaver's scaffold masking (arXiv 2606.04688, section 3.2 fix 3), which
-    the 2026-08-24 research scan flags as the item most likely to transfer. In
-    an autoregressive model it is a logit mask; here it is a projection, and it
-    costs one operation per reverse step rather than one per token.
-    """
-    enabled: bool = False
-    # Occupancy grid resolution, in normalized box units. 1/32 of the box is
-    # ~0.5 m on a 16 m building -- coarse enough that a legal roof plane is not
-    # carved into disconnected cells, fine enough to exclude open air.
-    voxel: float = 1.0 / 32
-    # Grow the LOD1 occupancy by this many voxels before testing. LOD2 is NOT
-    # contained in LOD1 -- the ridge rises above it -- so a zero dilation would
-    # project every ridge vertex back down onto the LOD1 roof.
-    dilate: int = 3
-    # Only apply below this fraction of the trajectory. Above it x_t is nearly
-    # pure noise and every coordinate is out of bounds, so projecting would
-    # overwrite the denoiser rather than guide it.
-    apply_below_t: float = 0.5
-
-
-@dataclass
-class MeshDiffusionConfig:
-    """Non-autoregressive whole-mesh diffusion. Read under
-    `config_set: mesh_diffusion`.
-
-    Mesh *data* still comes from `mesh_data` -- the same dataset_dir, LOD names,
-    num_bins, margins and max_faces as the autoregressive branch, so the two are
-    comparable. This block holds only what is specific to the diffusion model.
-
-    The seven axes below are meant to be mixed; `validate_combination` in this
-    module is the authority on which mixtures are legal.
-    """
-    # --- representation ---------------------------------------------------
-    # "morton": faces sorted by Z-order of their quantized centroid.
-    # "none":   file order, only meaningful with a permutation-equivariant model.
-    order: str = "morton"
-    # What `x` is. Independent of how it is corrupted (`process`) and how it is
-    # read out (`loss`) -- see plan D10, which exists because the reference
-    # implementation ties all three together and it is easy to copy that.
-    #   "continuous" -- raw coordinates in [-0.5, 0.5]. 10 channels.
-    #   "quantized"  -- coordinates snapped to the num_bins grid, still floats.
-    #                   10 channels. Output leaves the grid unless loss is ce.
-    #   "onehot"     -- 9 * num_bins indicator channels plus presence. What the
-    #                   reference actually diffuses. Wide but cheap: one 1x1
-    #                   conv at the input, ~7 MB of activations at F=200, B=8.
-    #   "bins"       -- 9 integer indices. The only state a categorical process
-    #                   can corrupt.
-    state: str = "continuous"
-    # D3PM only. "uniform" corrupts a bin to a uniformly random one; "gaussian"
-    # corrupts it to a nearby one (Austin et al. arXiv:2107.03006 section 3.2).
-    # Coordinate bins are ordinal, so these are genuinely different processes
-    # and not two spellings of the same default -- see plan D11.
-    transition: str = "gaussian"
-    # Width of the discretized-Gaussian transition at t = 1, in bins. Only read
-    # under transition: gaussian.
-    transition_sigma: float = 16.0
-    # Categorical readout over a Gaussian process only. After each reverse step
-    # the predicted x0 is projected back onto the alphabet: "hard" takes the
-    # argmax one-hot (Diffusion-LM's clamping trick, Li et al.
-    # arXiv:2205.14217 section 4.2), "soft" keeps the softmax. Hard is what
-    # makes a continuous process over a discrete alphabet actually land on
-    # grid points; soft is the ablation that shows whether it matters.
-    x0_clamp: str = "hard"
-
-    # --- denoiser ---------------------------------------------------------
-    denoiser: str = "unet"           # "unet" | "transformer"
-    d_model: int = 256               # transformer width / U-Net base channels
-    n_head: int = 8
-    num_layers: int = 8              # transformer only
-    dropout: float = 0.1
-    # "sinusoidal" needs a meaningful face order; "none" makes the transformer
-    # permutation-equivariant, which is the only correct setting for order:none.
-    pos_embed: str = "sinusoidal"
-    time_dim: int = 128
-    # Probability of dropping the LOD1 condition during training, enabling
-    # classifier-free guidance at sampling. 0 disables CFG.
-    cond_dropout: float = 0.1
-
-    # --- process ----------------------------------------------------------
-    process: str = "ddpm"            # "ddpm" | "flow" | "d3pm"
-    target: str = "noise"            # "noise" | "original" | "velocity"
-    noise_steps: int = 1000
-    beta_start: float = 1e-4
-    beta_end: float = 0.02
-    # Clamp the x0 estimate to +-this before each reverse step; None disables.
-    # Static thresholding (Ho et al. arXiv:2006.11239), and it fixes a real
-    # pathology rather than polishing samples: with an untrained epsilon model
-    # predicting ~0, the DDIM step degenerates to x0 = x_t / sqrt(alpha_bar),
-    # whose per-step factor telescopes to x157 over the trajectory. Samples land
-    # in the hundreds, `quantize` clips every axis to bin 0 or 127, and the mesh
-    # welds to the 8 corners of the box. That also made the early-stopping
-    # monitor start around 24000 instead of O(0.1), and left it unbounded --
-    # one outlier face could dominate the mean it selects on.
-    #
-    # 0.5 because every continuous state lives in [-0.5, 0.5] by construction:
-    # coordinates, the presence channel, and the centred one-hot channels alike.
-    # Set to null for the ablation -- it is a sampler-side intervention, so the
-    # same checkpoint can be scored both ways.
-    #
-    # Gaussian processes only. Flow matching integrates a velocity and never
-    # forms an x0 estimate, and D3PM's state is bounded by its alphabet.
-    x0_clip: Optional[float] = 0.5
-    # Reverse steps at eval. Full-length reverse diffusion per validation
-    # building is what makes this callback expensive; 50 DDIM steps is the
-    # standard trade and is what every reported number should be measured at.
-    eval_steps: int = 50
-    # Guidance weight at sampling. 1.0 is plain conditional; >1 sharpens
-    # toward the condition at the cost of diversity. Requires cond_dropout > 0.
-    guidance: float = 1.0
-
-    # --- loss -------------------------------------------------------------
-    loss: str = "mse"                # "mse" | "hungarian" | "ce"
-    # Weight on the presence channel relative to the nine coordinate channels.
-    # Presence decides face count, which the geometric metrics are far more
-    # sensitive to than to a fraction of a bin on one vertex.
-    #
-    # NOT comparable across arms at a fixed value. The two terms start at
-    # scales set by the target and the readout, so 1.0 buys wildly different
-    # amounts of pull. Measured at init on The Hague/mini_cleaner, with the
-    # zero-init head predicting 0 and E[x0^2] = 0.0958 over real faces:
-    #
-    #   regime                     coord   presence   p/c    w for parity
-    #   target: noise              1.0000    1.0000   1.000     1.000
-    #   target: original           0.0958    0.2500   2.610     0.383
-    #   target: velocity           1.0958    1.2500   1.141     0.877
-    #   loss: ce             ln128=4.8520  ln2=0.693  0.143     7.000
-    #
-    # Left at 1.0 the b3-vs-b4 control is unreadable: those two arms share a
-    # target and differ only in readout, but would differ by 18x in effective
-    # presence weight -- landing squarely on face count, which is what the
-    # geometric metrics are most sensitive to. Every shipped arm therefore sets
-    # this to its regime's parity value (presence and coordinates on equal
-    # footing at init), and `test_shipped_configs_equalise_presence_weight`
-    # pins that. Re-derive the 0.0958 if the corpus changes.
-    presence_weight: float = 1.0
-    # Hungarian only: relative weight of presence inside the matching cost.
-    match_presence_weight: float = 1.0
-
-    # How the timestep reaches the transformer denoiser's blocks.
-    # "additive": one embedding added to every token. Cheap, and what the
-    # conv path's Down/Up do -- but the addition lands immediately before a
-    # pre-norm LayerNorm, which removes the per-token mean, so a constant added
-    # to every token is exactly what the normalisation attenuates.
-    # "adaln": DiT's adaLN-Zero (Peebles & Xie, arXiv:2212.09748 sec 3.2) --
-    # shift, scale and a zero-initialised residual gate per sub-layer.
-    # Costs parameters: measured at the base config's d_model 256 /
-    # num_layers 8, the transformer goes 6.68 M -> 9.58 M.
-    # Reaches `denoiser: transformer` only; the U-Net's GroupNorm conv stack is
-    # not what adaLN modulates, and `validate_combination` warns if it is set
-    # there.
-    time_cond: str = "additive"
-
-    # min-SNR-gamma loss weighting (Hang et al., arXiv:2303.09556). None is the
-    # unweighted objective.
-    #
-    # Not cosmetic here. An epsilon objective is an x0 objective weighted by the
-    # SNR, and on this schedule the SNR spans ~1e4 to ~4e-5, so the loss is
-    # almost entirely a statement about the low-noise end while a reverse
-    # trajectory is decided at the high-noise end. Measured on the linear
-    # schedule: 52% of uniform t draws land where simply echoing the input
-    # already scores below 0.01 epsilon-MSE, which is why `val_loss` can fall
-    # 5x below the echo baseline while chamfer does not move.
-    #
-    # 5.0 is the paper's value. Defined off `alpha_bar`, so it applies to the
-    # ddpm process only -- `validate_combination` rejects it elsewhere.
-    min_snr_gamma: Optional[float] = None
-
-    # Slot budget: how many face slots the model is given, independent of how
-    # many the building actually has. The surplus are DETR no-object slots --
-    # the model must mark them absent, and that is the ONLY mechanism deciding
-    # face count at generation time. Must be >= mesh_data.max_faces and a
-    # multiple of 8 (three stride-2 U-Net levels).
-    #
-    # Eval pins the budget here so a score is reproducible; training jitters up
-    # to it so the model meets a range. Cost is real and it is the eval path
-    # that pays: median LOD2 is 20 faces and median batch-max width 24, so a
-    # budget of 200 is ~8x the convolution cost and ~69x the attention cost of
-    # a tight batch. Lowering max_faces and slot_budget together to the corpus
-    # p90 (88) cuts that to ~3.7x / ~13x, at the price of dropping the top
-    # decile of buildings.
-    slot_budget: int = 200
-
-    # --- weight averaging -------------------------------------------------
-    # EMA decay for the weights used at SAMPLING time. None disables.
-    #
-    # Near-universal in diffusion and worth more than any lr schedule here: it
-    # averages out late-training gradient noise, which is large in this branch
-    # because every sample draws its own t, so each update sees only
-    # batch_size timesteps of the whole schedule.
-    #
-    # The EMA lives on the module rather than in a callback so that it lands in
-    # `state_dict` automatically -- checkpoints are selected on a metric
-    # computed WITH these weights, so they are the ones that must be saved --
-    # and so no callback ordering decides whether eval sees them.
-    ema_decay: Optional[float] = 0.999
-    # Hold off until the live weights are worth averaging. Before this, `generate`
-    # uses the live weights; the EMA is still the initialisation and would make
-    # the early-stopping monitor report on noise.
-    ema_start_step: int = 1000
-
-    # --- sampling and write-back -----------------------------------------
-    scaffold: ScaffoldConfig = field(default_factory=ScaffoldConfig)
-    # Snap to the num_bins grid before welding. Without it `weld` merges by
-    # exact float equality and never fires, and every shared vertex stays
-    # split -- a crack at every edge.
-    snap_before_weld: bool = True
-    # Faces whose area is below this (in normalized box units squared) are
-    # dropped after welding. A diffusion sample can put all three corners in
-    # one bin; such a face contributes nothing and breaks winding repair.
-    min_face_area: float = 1e-6
-
-    # --- eval -------------------------------------------------------------
-    # Three eval tiers, because one number cannot do all three jobs.
-    #
-    #  1. Single-step loss, every batch. The objective. Cheap, but a bad
-    #     SELECTION criterion: it is a Monte-Carlo estimate over t, only loosely
-    #     coupled to sample quality, and in different units per arm (ln 128 for
-    #     the CE arms against ~0.10 for the x0 arms), so it is not comparable
-    #     across the grid.
-    #  2. A free-running reverse trajectory on `n_val_gen` fixed buildings at
-    #     `gen_eval_steps`, EVERY validation epoch. This is what early stopping
-    #     and checkpointing read. Measured at ~10% of a training epoch.
-    #  3. The geometric metrics (chamfer, IoU, watertight), every
-    #     `every_n_epochs`, on `n_val`. ~48% of an epoch, hence the gate.
-    #
-    # Tier 2 cannot be folded into tier 3: `EarlyStopping(strict=True)` raises
-    # when its monitored metric is absent from the logs, so a monitor produced
-    # only every N epochs crashes the run on epoch 1.
-    n_val_gen: int = 8
-    gen_eval_steps: int = 20
-    every_n_epochs: int = 5
-    n_val: int = 16
-    n_test: int = 64
-    eval_batch_size: int = 8
-    n_points: int = 4096
-    taus: List[float] = field(default_factory=lambda: [0.25, 0.5])
-    voxel_m: float = 0.25
-    save_samples: int = 8
-
-@dataclass
 class EarlyStoppingConfig:
     """Configuration for early stopping callback."""
     enabled: bool = True
@@ -597,9 +282,8 @@ class TrainingConfig:
     # epoch-scaled warmup would ramp for thousands of steps, which is a
     # different intervention entirely.
     #
-    # NOTE: currently honoured by `config_set: mesh_diffusion` only. The mesh,
-    # mesh_vqvae and diffusion branches ignore it, so setting it there is a
-    # silent no-op rather than an error.
+    # NOTE: honoured by `config_set: mesh` only. mesh_vqvae ignores it, so
+    # setting it there is a silent no-op rather than an error.
     warmup_steps: int = 0
     # AdamW's own default, so leaving this unset reproduces every run trained
     # before it was exposed. It applies ONLY to weight matrices: embeddings,
@@ -612,8 +296,7 @@ class TrainingConfig:
     # 5e-5 it was a 5% nudge, at 1e-3 with cosine over 30 full-corpus epochs it
     # is a ~7x pull, which is what made the exclusion worth doing.
     #
-    # Read by the mesh transformer only. `MeshDiffusionModule` still uses
-    # AdamW's default on a single group.
+    # Read by the mesh transformer only.
     weight_decay: float = 0.01
     lr_decay_steps: int = 50
     lr_decay_rate: float = 0.5
@@ -639,48 +322,6 @@ class LoggingConfig:
     wandb_entity: Optional[str] = None
     wandb_offline: bool = False
     log_model: bool = True
-
-@dataclass
-class InferenceConfig:
-    """Configuration for inference."""
-    # Weights to sample from. Resolved by `src.inference._resolve_checkpoint`, which
-    # dispatches on the prefix:
-    #   local path      "outputs/regnn_diffusion/default/checkpoints/last.ckpt"
-    #                   Relative to the cwd. Must exist, or inference exits.
-    #   WandB artifact  "wandb://[entity/]project/name:alias"
-    #                   e.g. "wandb://me/lod-generation/model-abc123:best". A bare
-    #                   "wandb://name:alias" is qualified from logging.wandb_entity
-    #                   and logging.project_name. Downloaded to
-    #                   <logging.save_dir>/wandb_artifacts/ and the .ckpt inside is
-    #                   loaded. Artifacts written by logging.log_model hold one
-    #                   model.ckpt; aliases "best"/"latest"/"v<N>" all work.
-    #   fsspec URL      "https://...", "s3://...", "gs://..."
-    #                   Anything with a "://" that isn't wandb:// is handed to
-    #                   Lightning unchanged; it opens the URL itself. Needs the
-    #                   matching fsspec backend installed (s3fs, gcsfs, ...).
-    checkpoint_path: Optional[str] = None
-    batch_size: int = 10
-    output_dir: str = "outputs/generated"
-    # Attach the generative-eval metrics/samples to an existing WandB run instead of
-    # logging locally only. Use when training ran without generative_eval.enabled.
-    wandb_run_id: Optional[str] = None
-
-@dataclass
-class GenerativeEvalConfig:
-    """End-of-pipeline full-generation evaluation (fires on test end)."""
-    enabled: bool = True
-    num_batches: int = 4          # batches sampled through the full reverse chain
-    batch_size: int = 16
-    log_n_samples: int = 8        # graphs+geometries persisted locally and to WandB
-    save_dir: Optional[str] = None  # None -> <run_save_dir>/generative_eval
-    feature_set: str = "full"     # "full" | "welldefined"
-    val3dity_path: Optional[str] = None  # None -> shutil.which("val3dity")
-    novelty_tol: float = 0.1      # feature-space distance for a "novel" sample
-    # Reference buildings drawn per split for the Wasserstein/MMD/novelty arms.
-    # The splits hold O(1e5) buildings and kernel_mmd is O(n^2) in the reference
-    # set, so the full test split is both minutes of conversion and a ~80GB
-    # gram matrix. A few thousand samples estimate these statistics fine.
-    ref_max_samples: int = 2000
 
 @dataclass
 class StrategyConfig:
@@ -746,259 +387,58 @@ class PosthocEvalConfig:
 
 
 @dataclass
+class InferenceConfig:
+    """LOD1 -> LOD2 generation with a trained mesh transformer (`--inference`).
+
+    Run it against the checkpoint's *own* training config, so that
+    `mesh_data` (bins, margins, tokenization) and `mesh_eval` (beam settings)
+    are the ones the model was trained and selected under.
+    """
+    # Weights to load. Resolved by `src.inference._resolve_checkpoint`, which
+    # dispatches on the prefix:
+    #   local path      "outputs/initial-runs/mesh-v5-full-opt-coord/checkpoints/last.ckpt"
+    #                   Relative to the cwd. Must exist, or inference exits.
+    #   WandB artifact  "wandb://[entity/]project/name:alias"
+    #                   e.g. "wandb://me/lod-generation/model-abc123:best". A bare
+    #                   "wandb://name:alias" is qualified from logging.wandb_entity
+    #                   and logging.project_name. Downloaded to
+    #                   <logging.save_dir>/wandb_artifacts/ and the .ckpt inside is
+    #                   loaded. Artifacts written by logging.log_model hold one
+    #                   model.ckpt; aliases "best"/"latest"/"v<N>" all work.
+    #   fsspec URL      "https://...", "s3://...", "gs://..."
+    #                   Anything with a "://" that isn't wandb:// is handed to
+    #                   Lightning unchanged; it opens the URL itself. Needs the
+    #                   matching fsspec backend installed (s3fs, gcsfs, ...).
+    checkpoint_path: Optional[str] = None
+    # LOD1 to condition on: one CityJSON file, or a directory searched
+    # recursively for *.json / *.city.json. Every CityObject with geometry gets
+    # one generated LOD2. No LOD2 is read, so this works on unseen data.
+    input_path: Optional[str] = None
+    batch_size: int = 8
+    # Each run writes to a fresh <output_dir>/<timestamp>/ so outputs of two
+    # runs are never mixed into one all_buildings.city.json.
+    output_dir: str = "outputs/generated"
+
+
+@dataclass
 class Config:
     """Root configuration class."""
     mode: str = "train"  # "train" or "inference"
     # Which set of config objects is built and run:
-    #   "diffusion" — data + model, the Levi-graph discrete diffusion (default)
-    #   "mini"      — the same objects pointed at data/The Hague/mini; it needs
-    #                 no fields of its own, so it gets no dataclass of its own
     #   "mesh"      — mesh_data + mesh_model, the LOD1-conditioned transformer
     #   "mesh_vqvae"— mesh_data + mesh_vqvae, stage-1 learned mesh vocabulary
-    #   "mesh_diffusion" — mesh_data + mesh_diffusion, non-autoregressive
-    #                 whole-mesh diffusion / flow matching
     # Resolved in `src.train.train`. Deliberately a plain string switch rather
-    # than a registry; there are four of these and they are all in one repo.
-    config_set: str = "diffusion"
+    # than a registry; there are two of these and they are all in one repo.
+    config_set: str = "mesh"
     seed: int = 42
-    data: DataConfig = field(default_factory=DataConfig)
-    model: ModelConfig = field(default_factory=ModelConfig)
     mesh_data: MeshDataConfig = field(default_factory=MeshDataConfig)
     mesh_model: MeshModelConfig = field(default_factory=MeshModelConfig)
     mesh_eval: MeshEvalConfig = field(default_factory=MeshEvalConfig)
     mesh_vqvae: MeshVQVAEConfig = field(default_factory=MeshVQVAEConfig)
-    mesh_diffusion: MeshDiffusionConfig = field(default_factory=MeshDiffusionConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
-    generative_eval: GenerativeEvalConfig = field(default_factory=GenerativeEvalConfig)
 
     resume_from: Optional[str] = None
 
-
-def validate_combination(cfg):
-    """Reject arm combinations that cannot work, warn about ones that waste.
-
-    Called once at startup, before a datamodule or a model is built, because
-    every rejection here is otherwise a run that either crashes hours in or
-    trains to a loss floor no amount of epochs gets under.
-
-    Args:
-        cfg: the resolved root `Config` (or an OmegaConf view of one).
-
-    Raises:
-        ValueError: the combination is unlearnable or structurally impossible.
-    """
-    d = cfg.mesh_diffusion
-    sorted_order = d.order == "morton"
-    has_pe = d.pos_embed == "sinusoidal"
-
-    if d.order not in ("morton", "none"):
-        raise ValueError(f"mesh_diffusion.order must be 'morton' or 'none', got {d.order!r}.")
-    if d.pos_embed not in ("sinusoidal", "none"):
-        raise ValueError(
-            f"mesh_diffusion.pos_embed must be 'sinusoidal' or 'none', got {d.pos_embed!r}.")
-
-    if d.denoiser not in ("unet", "transformer"):
-        raise ValueError(
-            f"mesh_diffusion.denoiser must be 'unet' or 'transformer', got {d.denoiser!r}.")
-
-    # D4. A slot-to-slot loss needs a canonical face order: without one the
-    # target permutation is an artifact of the source file rather than a
-    # function of the geometry, and at high noise -- where x_t carries no
-    # content to denoise -- the model has no way to decide what belongs where.
-    #
-    # Covers `ce` as well as `mse`: a categorical readout is still scored slot
-    # against slot, so swapping the regression head for a softmax changes
-    # nothing. `hungarian` is the only loss that escapes it, because it solves
-    # for the correspondence first.
-    #
-    # The positional-encoding half of this rule applies to the TRANSFORMER
-    # only. `ConditionalMeshUNet` has no positional input at all -- a
-    # convolution is translation-equivariant along the face axis -- so
-    # requiring pos_embed there would be requiring a no-op.
-    if d.loss in ("mse", "ce"):
-        if not sorted_order:
-            raise ValueError(
-                f"loss: {d.loss} requires order: morton. Under order: none the "
-                "target permutation follows the source file rather than the "
-                "geometry, which is unlearnable rather than merely hard. Use "
-                "loss: hungarian instead.")
-        if d.denoiser == "transformer" and not has_pe:
-            raise ValueError(
-                f"loss: {d.loss} with denoiser: transformer requires "
-                "pos_embed: sinusoidal. Without it the model is permutation "
-                "equivariant and cannot tell one output slot from another, so "
-                "a slot-to-slot target is unlearnable. Use loss: hungarian.")
-    if not sorted_order and has_pe:
-        raise ValueError(
-            "pos_embed: sinusoidal with order: none embeds file order, which "
-            "is an artifact of the writer rather than a function of the "
-            "geometry. Set pos_embed: none.")
-
-    if d.denoiser == "unet" and has_pe:
-        logger.warning(
-            "pos_embed: sinusoidal is ignored under denoiser: unet -- the "
-            "U-Net has no positional input. Kept legal so the a1/a2 arms "
-            "differ on `denoiser` alone, but do not read it as an active axis.")
-
-    # D5, relaxed from a hard rejection. The convolution needs adjacent slots
-    # to be spatially adjacent -- but measured on The Hague/mini_cleaner LOD2,
-    # file order already is: 72.4% of consecutive faces share a corner and the
-    # mean consecutive-centroid step is 0.362, against Morton's 78.5% / 0.316
-    # and a random permutation's 40.9% / 0.513. CityJSON groups faces by
-    # surface, so the triangles of one wall arrive together. The original rule
-    # assumed file order was arbitrary; it is not, and forbidding the pairing
-    # foreclosed an arm rather than preventing a mistake.
-    #
-    # What file order still lacks is *canonicality*: it is a property of the
-    # writer, not of the geometry, so the same building re-exported can permute.
-    # That costs consistency, which is why this warns rather than passing
-    # silently -- and it is exactly what the a1-vs-a4 comparison measures.
-    if d.denoiser == "unet" and not sorted_order:
-        logger.warning(
-            "denoiser: unet with order: none convolves along the file's face "
-            "order. That order carries real locality on this corpus (72.4%% of "
-            "consecutive faces share a corner, against 40.9%% for a random "
-            "permutation), so this is a legitimate arm -- but file order is not "
-            "canonical, so the same mesh re-exported may serialise differently.")
-
-    allowed_targets = {"ddpm": {"noise", "original"},
-                       "flow": {"velocity"},
-                       "d3pm": {"original"}}
-    if d.process not in allowed_targets:
-        raise ValueError(
-            f"mesh_diffusion.process must be one of {sorted(allowed_targets)}, "
-            f"got {d.process!r}.")
-    if d.target not in allowed_targets[d.process]:
-        raise ValueError(
-            f"process: {d.process} allows target in "
-            f"{sorted(allowed_targets[d.process])}, got {d.target!r}. "
-            + ("Flow matching regresses the velocity x1 - x0; there is no "
-               "epsilon to predict." if d.process == "flow" else
-               "D3PM is parameterised by x0 only."))
-
-    if d.loss not in ("mse", "hungarian", "ce"):
-        raise ValueError(
-            f"mesh_diffusion.loss must be 'mse', 'hungarian' or 'ce', got {d.loss!r}.")
-    if d.state not in ("continuous", "quantized", "onehot", "bins"):
-        raise ValueError(
-            "mesh_diffusion.state must be 'continuous', 'quantized', 'onehot' "
-            f"or 'bins', got {d.state!r}.")
-
-    # D10. State and process are separate axes, but not every pair is a real
-    # object: a Gaussian path needs a continuous state, a categorical chain
-    # needs an alphabet.
-    gaussian = d.process in ("ddpm", "flow")
-    if gaussian and d.state == "bins":
-        raise ValueError(
-            f"state: bins has no Gaussian path -- process: {d.process} would "
-            "add real noise to integer indices. Use state: onehot for a "
-            "Gaussian process over the alphabet, or process: d3pm.")
-    if d.process == "d3pm" and d.state != "bins":
-        raise ValueError(
-            f"process: d3pm requires state: bins, got {d.state!r}. The "
-            "categorical chain corrupts indices, not coordinates.")
-    if d.transition not in ("uniform", "gaussian"):
-        raise ValueError(
-            f"mesh_diffusion.transition must be 'uniform' or 'gaussian', "
-            f"got {d.transition!r}.")
-
-    if d.loss == "ce":
-        # The alphabet has to exist before it can be read out.
-        if d.state == "continuous":
-            raise ValueError(
-                "loss: ce needs a discrete alphabet; state: continuous has "
-                "none. Use state: quantized (coordinate channels, categorical "
-                "head) or state: onehot (the reference's scheme).")
-        # Checked before the target rule below: flow's only legal target is
-        # `velocity`, so the target rule would otherwise always fire first and
-        # report the wrong reason for an arm that is impossible either way.
-        if d.process == "flow":
-            raise ValueError(
-                "process: flow is incompatible with loss: ce -- flow matching "
-                "regresses a velocity, and there is no categorical quantity in "
-                "that parameterisation to apply cross-entropy to. Reaching one "
-                "needs a second x0 head, which is a different model.")
-        # The reference permits denoiser_output: noise with cross_entropy,
-        # which supervises on argmax of a Gaussian noise tensor -- an arbitrary
-        # index carrying no signal. It trains, and it trains to nothing.
-        if d.target != "original":
-            raise ValueError(
-                f"loss: ce requires target: original, got {d.target!r}. Under "
-                "target: noise the CE label is the argmax of a noise tensor, "
-                "which is signal-free.")
-    elif d.state == "onehot":
-        raise ValueError(
-            f"state: onehot with loss: {d.loss!r} regresses {9} x num_bins "
-            "indicator channels as if they were coordinates. Use loss: ce, or "
-            "state: quantized for a regression readout on a snapped target.")
-    if d.time_cond not in ("additive", "adaln"):
-        raise ValueError(
-            f"mesh_diffusion.time_cond must be 'additive' or 'adaln', got "
-            f"{d.time_cond!r}.")
-    if d.time_cond == "adaln" and d.denoiser == "unet":
-        logger.warning(
-            "time_cond: adaln is ignored under denoiser: unet -- adaLN-Zero "
-            "modulates a transformer's LayerNorms and the U-Net has none on "
-            "its residual stream. The arm will train, with additive time.")
-
-    if d.min_snr_gamma is not None:
-        if d.min_snr_gamma <= 0:
-            raise ValueError(
-                f"mesh_diffusion.min_snr_gamma must be positive or null, got "
-                f"{d.min_snr_gamma!r}.")
-        if d.process != "ddpm":
-            raise ValueError(
-                f"mesh_diffusion.min_snr_gamma is defined off an alpha_bar "
-                f"schedule and process: {d.process!r} has none. It applies to "
-                "process: ddpm only.")
-        if d.loss == "ce":
-            raise ValueError(
-                "mesh_diffusion.min_snr_gamma reweights a Gaussian regression "
-                "objective; loss: ce is a categorical one, where the SNR "
-                "argument does not hold. Leave it null on the ce arms.")
-
-    if d.x0_clamp not in ("hard", "soft"):
-        raise ValueError(
-            f"mesh_diffusion.x0_clamp must be 'hard' or 'soft', got {d.x0_clamp!r}.")
-
-    # The slot budget has to hold the largest building the corpus filter lets
-    # through, or a batch containing one cannot be padded to it at all.
-    if d.slot_budget % 8:
-        raise ValueError(
-            f"mesh_diffusion.slot_budget must be a multiple of 8 (three "
-            f"stride-2 U-Net levels), got {d.slot_budget}.")
-    max_faces = getattr(cfg.mesh_data, "max_faces", None)
-    if max_faces is not None and d.slot_budget < max_faces:
-        raise ValueError(
-            f"mesh_diffusion.slot_budget ({d.slot_budget}) is below "
-            f"mesh_data.max_faces ({max_faces}); a building at the filter's "
-            "limit would not fit the budget. Raise the budget or lower the "
-            "filter -- lowering both together is the cheap option.")
-
-    # The per-epoch monitor is what early stopping and checkpointing read, and
-    # `EarlyStopping(strict=True)` raises when its metric is absent -- so a zero
-    # sample count would not disable the monitor, it would kill the run.
-    if d.n_val_gen < 1:
-        raise ValueError(
-            f"mesh_diffusion.n_val_gen must be >= 1, got {d.n_val_gen}. It sizes "
-            "the per-epoch generative monitor, which early stopping and "
-            "checkpointing read; at 0 nothing is logged and the run fails on "
-            "the first validation epoch.")
-    if d.gen_eval_steps < 1:
-        raise ValueError(
-            f"mesh_diffusion.gen_eval_steps must be >= 1, got {d.gen_eval_steps}.")
-
-    if d.guidance != 1.0 and d.cond_dropout <= 0:
-        raise ValueError(
-            "guidance != 1.0 needs cond_dropout > 0: classifier-free guidance "
-            "requires an unconditional branch, which only exists if the "
-            "condition was dropped during training.")
-
-    if sorted_order and d.loss == "hungarian":
-        logger.warning(
-            "order: morton with loss: hungarian is legal but wasteful -- the "
-            "matcher re-derives a correspondence the sort already fixed. Kept "
-            "because it is the controlled A/B against loss: mse.")

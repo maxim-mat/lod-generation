@@ -25,11 +25,6 @@ mode: train
 config_set: mesh
 seed: 42
 
-# Not read under config_set: mesh, but DataConfig.dataset_dir is MISSING and
-# OmegaConf resolves the whole schema, so it still needs a value.
-data:
-  dataset_dir: data/The Hague/mini_cleaner
-
 mesh_data:
   dataset_dir: data/The Hague/mini_cleaner
   # Real LOD1, not LOD1_synth: `cleaner` is built on the real pair and is

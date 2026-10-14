@@ -347,7 +347,7 @@ def test_main_rejects_a_bad_metric_before_reading_anything(tmp_path):
 
 def test_main_rejects_a_non_mesh_reference(tmp_path):
     ref = tmp_path / "ref.yaml"
-    ref.write_text("config_set: diffusion\ndata:\n  dataset_dir: x\n")
+    ref.write_text("config_set: mesh_vqvae\n")
     path = _write(tmp_path, f"reference_config: {ref.as_posix()}\ncheckpoint: nope.ckpt\n")
     with pytest.raises(ValueError, match="config_set"):
         main(["--config", str(path)])
@@ -373,3 +373,30 @@ def test_main_checks_tokenization_before_loading_data(tmp_path, monkeypatch):
         "the dataset was loaded before tokenization was checked"))
     with pytest.raises(ValueError, match="tokenization"):
         main(["--config", str(path)])
+
+
+def test_git_state_keeps_a_diff_with_non_ascii_bytes(tmp_path, monkeypatch):
+    """A diff is captured whatever the platform's default codec can decode.
+
+    "Ł" is UTF-8 C5 81, and 0x81 is undefined in cp1252 -- Windows' default --
+    which used to turn the whole diff into None and drop git_diff.patch.
+    """
+    import subprocess
+
+    import src.eval.posthoc_eval as posthoc
+
+    def git(*args):
+        subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+                       cwd=tmp_path, check=True, capture_output=True)
+
+    git("init", "-q")
+    (tmp_path / "f.txt").write_text("a\n", encoding="utf-8")
+    git("add", "f.txt")
+    git("commit", "-q", "-m", "init")
+    (tmp_path / "f.txt").write_text("Łódź\n", encoding="utf-8")
+    monkeypatch.setattr(posthoc, "REPO_ROOT", tmp_path)
+
+    info, diff = posthoc._git_state()
+
+    assert info["dirty"] is True
+    assert "Łódź" in diff

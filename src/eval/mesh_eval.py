@@ -1,13 +1,11 @@
 """Free-running generation scored against the paired ground truth.
 
-`src/eval/callback.py` measures an unconditional model against a *distribution*
--- MMD, Wasserstein, novelty -- because there is nothing to pair a sample with.
 The mesh transformer is conditional: every LOD1 input has exactly one true LOD2,
-so generations can be scored one against one, which is both far more sensitive
-and far cheaper to read.
+so generations are scored one against one rather than against a distribution,
+which is both far more sensitive and far cheaper to read.
 
-Split the same way as `run_generative_eval` / `GenerativeEvalCallback`: a plain
-function that takes a model and a dataset, plus a thin Lightning adapter. The
+Split in two: a plain function that takes a model and a dataset, plus a thin
+Lightning adapter. The
 function is what makes this testable without a trainer and re-runnable from a
 checkpoint.
 

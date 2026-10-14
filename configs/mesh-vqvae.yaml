@@ -24,11 +24,6 @@ mode: train
 config_set: mesh_vqvae
 seed: 42
 
-# Not read under config_set: mesh_vqvae, but DataConfig.dataset_dir resolves
-# with the rest of the schema, so it still needs a value.
-data:
-  dataset_dir: data/The Hague/mini
-
 # Same block the transformer uses, so the two stages cannot disagree about
 # bins, margins, max_faces or the seeded train/val/test split. A building in
 # the transformer's test split must never be in the VQ-VAE's training set.
@@ -139,10 +134,5 @@ logging:
   wandb_entity: maxim-lod
   wandb_offline: false
   log_model: false
-
-# Unconditional distribution metrics do not apply to a reconstruction model;
-# create_callbacks gates this off by config_set regardless of what is here.
-generative_eval:
-  enabled: false
 
 resume_from: null

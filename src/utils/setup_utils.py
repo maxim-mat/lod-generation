@@ -2,81 +2,12 @@ import logging
 from pathlib import Path
 from typing import List
 
-import lightning as L
 from lightning.pytorch.loggers import Logger, TensorBoardLogger, WandbLogger, MLFlowLogger
 from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor, RichProgressBar
 
 from src.utils.config import Config
-from src.dataset.datamodule import CityJSONDataModule
-from src.models.diffusion import CityJSONDiffusionModule
 
 logger = logging.getLogger(__name__)
-
-def create_datamodule(cfg: Config) -> CityJSONDataModule:
-    """Create CityJSON Datamodule from configuration."""
-    return CityJSONDataModule(
-        dataset_dir=cfg.data.dataset_dir,
-        lods=cfg.data.lods,
-        batch_size=cfg.training.batch_size,
-        train_val_test_split=tuple(cfg.training.train_val_test_split),
-        normalize_coords=cfg.data.normalize_coords,
-        num_workers=cfg.data.num_workers,
-        persistent_workers=cfg.data.persistent_workers,
-        n_max=cfg.data.n_max,
-        seed=cfg.seed,
-        upper_limit_nodes=cfg.data.upper_limit_nodes,
-    )
-
-
-def create_model(cfg: Config, n_max: int, x_marginals=None, e_marginals=None,
-                 coord_scale: float = 1.0, z_shift: float = 0.0,
-                 dist_r_max=None) -> CityJSONDiffusionModule:
-    """Create CityJSON Diffusion Module from configuration.
-
-    Args:
-        x_marginals, e_marginals: training-split class frequencies, required for
-            the 'marginal' transition. Fall back to uniform when omitted.
-        coord_scale: metres per unit of the model's coordinate space, from
-            `CityJSONDataModule.compute_coord_scale()`.
-        z_shift: se2 only — train-split mean vertex z in metres, from
-            `CityJSONDataModule.compute_z_shift()`.
-    """
-    return CityJSONDiffusionModule(
-        num_node_classes=cfg.model.num_node_classes,
-        num_edge_classes=cfg.model.num_edge_classes,
-        hidden_dim=cfg.model.hidden_dim,
-        edge_dim=cfg.model.edge_dim,
-        global_dim=cfg.model.global_dim,
-        n_head=cfg.model.n_head,
-        num_layers=cfg.model.num_layers,
-        dropout=cfg.model.dropout,
-        T=cfg.model.T,
-        lr=cfg.training.lr,
-        discrete_noise_type=cfg.model.discrete_noise_type,
-        n_max=n_max,
-        lr_scheduler=cfg.training.lr_scheduler,
-        lr_decay_steps=cfg.training.lr_decay_steps,
-        lr_decay_rate=cfg.training.lr_decay_rate,
-        x_marginals=x_marginals,
-        e_marginals=e_marginals,
-        nu_pos=cfg.model.nu_pos,
-        nu_x=cfg.model.nu_x,
-        nu_e=cfg.model.nu_e,
-        lambda_pos=cfg.model.lambda_pos,
-        lambda_x=cfg.model.lambda_x,
-        lambda_e=cfg.model.lambda_e,
-        off_anchor_weight=cfg.model.off_anchor_weight,
-        class_balance=cfg.model.class_balance,
-        off_ce_weight=cfg.model.off_ce_weight,
-        coord_scale=coord_scale,
-        equivariance=cfg.model.equivariance,
-        z_shift=z_shift,
-        time_embed=cfg.model.time_embed,
-        dist_embed=cfg.model.dist_embed,
-        dist_embed_dim=cfg.model.dist_embed_dim,
-        dist_r_max=dist_r_max,
-    )
-
 
 def create_loggers(cfg: Config, save_dir: Path) -> List[Logger]:
     """
@@ -164,19 +95,5 @@ def create_callbacks(cfg: Config, save_dir: Path) -> list:
         callbacks.append(RichProgressBar())
     except Exception:
         pass
-
-    # Generative Eval. Not for any mesh path: it samples unconditionally via
-    # model.sample(), which none of those modules has, and unconditional
-    # distribution metrics are meaningless when every input has one right
-    # answer -- the VQ-VAE is not even generative, it reconstructs its own
-    # input, and mesh_diffusion samples conditioned on an LOD1 through
-    # MeshSetEvalCallback instead. Gated on config_set rather than trusting the
-    # yaml so a stale file cannot resurrect a callback that would crash on the
-    # first test batch.
-    ge_cfg = cfg.generative_eval
-    if ge_cfg.enabled and cfg.config_set not in ("mesh", "mesh_vqvae",
-                                                 "mesh_diffusion"):
-        from src.eval.callback import GenerativeEvalCallback
-        callbacks.append(GenerativeEvalCallback(ge_cfg, save_dir, cfg.seed))
 
     return callbacks

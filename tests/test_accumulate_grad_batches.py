@@ -15,14 +15,9 @@ from src.utils.initialization import load_config
 
 
 def write_cfg(tmp_path, body):
-    """A config file that resolves.
-
-    `DataConfig.dataset_dir` is MISSING and OmegaConf resolves the whole schema
-    on `to_object`, so every config needs one -- the same reason the mesh
-    configs carry a dummy `data:` block they never read.
-    """
+    """A config file that resolves."""
     path = tmp_path / "c.yaml"
-    path.write_text("data:\n  dataset_dir: /nonexistent\n" + body, encoding="utf-8")
+    path.write_text(body, encoding="utf-8")
     return path
 
 
@@ -53,19 +48,14 @@ def test_non_integer_is_rejected_by_the_schema(tmp_path):
             write_cfg(tmp_path, "training:\n  accumulate_grad_batches: half\n"), [])
 
 
-def test_shipped_default_config_carries_the_key():
-    cfg = OmegaConf.load("configs/default.yaml")
-    assert cfg.training.accumulate_grad_batches == 1
-
-
 def test_lightning_trainer_accepts_the_argument():
     """Guards the wiring against a Lightning rename."""
     assert "accumulate_grad_batches" in inspect.signature(L.Trainer).parameters
 
 
-@pytest.mark.parametrize("module", ["train", "train_mesh", "train_mesh_vqvae"])
+@pytest.mark.parametrize("module", ["train_mesh", "train_mesh_vqvae"])
 def test_every_trainer_passes_it_through(module):
-    """All three entry points, not just the mesh one."""
+    """Both entry points, not just the mesh one."""
     src = (__import__("pathlib").Path("src") / f"{module}.py").read_text(encoding="utf-8")
     assert "accumulate_grad_batches=cfg.training.accumulate_grad_batches," in src
 

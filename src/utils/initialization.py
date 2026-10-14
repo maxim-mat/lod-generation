@@ -40,11 +40,12 @@ def load_config(config_path: Path, overrides: list[str]) -> Config:
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="CityJSON LOD Generation with Graph Diffusion Models",
+        description="CityJSON LOD Generation with mesh transformers",
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--train", action="store_true", help="Train the model")
-    group.add_argument("--inference", action="store_true", help="Run inference")
+    group.add_argument("--inference", action="store_true",
+                       help="Generate LOD2 for LOD1 CityJSON with a trained mesh transformer")
     parser.add_argument(
         "--config", "-c",
         required=True,
@@ -53,7 +54,7 @@ def parse_args():
     )
     parser.add_argument(
         "--config-set",
-        choices=["diffusion", "mini", "mesh", "mesh_vqvae", "mesh_diffusion"],
+        choices=["mesh", "mesh_vqvae"],
         default=None,
         help="Which set of config objects to build and run. Overrides the "
              "config file's `config_set:`; defaults to whatever it says.",

@@ -22,9 +22,6 @@ mode: train
 config_set: mesh_vqvae
 seed: 42
 
-data:
-  dataset_dir: data/The Hague/mini
-
 # Must match the stage-1 run exactly -- the split included. A building the
 # decoder fine-tunes on must not be in the transformer's test split.
 mesh_data:
@@ -107,8 +104,5 @@ logging:
   wandb_entity: maxim-lod
   wandb_offline: false
   log_model: false
-
-generative_eval:
-  enabled: false
 
 resume_from: null

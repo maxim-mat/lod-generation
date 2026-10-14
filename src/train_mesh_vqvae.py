@@ -1,9 +1,8 @@
 """Stage-1 training for the learned mesh vocabulary (config_set: mesh_vqvae).
 
-Reached from `src.train.train`. Kept separate from `train_mesh` for the same
-reason that one is separate from the diffusion path: it resolves a different
-model from a different datamodule, and sharing an entry point would mean a
-function that is mostly branches.
+Reached from `src.train.train`. Kept separate from `train_mesh` because it
+resolves a different model from a different datamodule, and sharing an entry
+point would mean a function that is mostly branches.
 
 The output is a checkpoint whose `MeshVQVAE` stage 2 loads frozen. Success is
 defined in docs/superpowers/specs/2026-08-08-mesh-vqvae-design.md: reconstruction
