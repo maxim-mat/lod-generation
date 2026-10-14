@@ -66,6 +66,9 @@ class MeshDataConfig:
     ortho_dir: Optional[str] = None
     image_size: int = 256
     image_margin: float = 0.1
+    # Buildings whose mosaic covers less than this fraction of their crop are
+    # skipped (after the train/val/test split, so the split never moves).
+    image_min_coverage: float = 1.0
 
 @dataclass
 class MeshEvalConfig:

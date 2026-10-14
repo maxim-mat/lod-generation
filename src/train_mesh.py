@@ -78,6 +78,7 @@ def train_mesh(cfg: Config):
         ortho_dir=cfg.mesh_data.ortho_dir,
         image_size=cfg.mesh_data.image_size,
         image_margin=cfg.mesh_data.image_margin,
+        image_min_coverage=cfg.mesh_data.image_min_coverage,
     )
     datamodule.setup()
     logger.info("Mesh pairs: train=%d, val=%d, test=%d",

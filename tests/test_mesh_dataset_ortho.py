@@ -148,3 +148,44 @@ def test_a_building_missing_from_the_assignment_is_refused(subset, tmp_path):
     path.write_text(json.dumps(assignment), encoding="utf-8")
     with pytest.raises(ValueError, match="year"):
         _ds(root, ortho_dir="ortho")
+
+
+def _with_coverage(subset, tmp_path, coverage):
+    """A copy of the fixture subset whose manifest reports `coverage` ({id: fraction})."""
+    root = tmp_path / "copy"
+    shutil.copytree(subset, root)
+    path = root / "ortho" / "ortho_manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["totals"]["partial_coverage"] = coverage
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    return root
+
+
+def test_dataset_keeps_every_building_and_flags_missing_imagery(subset, tmp_path):
+    root = _with_coverage(subset, tmp_path, {"b": 0.0, "c": 0.97})
+    ds = _ds(root, ortho_dir="ortho", image_size=S)
+    assert ds.ids == ["a", "b", "c", "d"]                       # nothing dropped here
+    assert dict(zip(ds.ids, ds.has_image)) == {"a": True, "b": False, "c": False, "d": True}
+    loose = _ds(root, ortho_dir="ortho", image_size=S, image_min_coverage=0.9)
+    assert dict(zip(loose.ids, loose.has_image)) == {"a": True, "b": False, "c": True, "d": True}
+    assert "image_valid" not in ds[0]
+
+
+def test_datamodule_skips_after_splitting_so_kept_buildings_keep_their_v5_split(subset, tmp_path):
+    root = _with_coverage(subset, tmp_path, {"b": 0.0})
+    kw = dict(lod_in="LOD1", lod_out="LOD2", batch_size=1, seed=7,
+              train_val_test_split=(0.5, 0.25, 0.25))
+    plain = MeshDataModule(root, **kw)
+    plain.setup()
+    with_img = MeshDataModule(root, ortho_dir="ortho", image_size=16, **kw)
+    with_img.setup()
+    for split in ("train", "val", "test"):
+        before = [plain.full_dataset.ids[i] for i in getattr(plain, f"{split}_dataset").indices]
+        after = [with_img.full_dataset.ids[i] for i in getattr(with_img, f"{split}_dataset").indices]
+        assert after == [oid for oid in before if oid != "b"], split
+    assert sum(with_img.skipped_no_image.values()) == 1
+
+
+def test_image_accessor_returns_a_buildings_crop(subset):
+    ds = _ds(subset, ortho_dir="ortho", image_size=S)
+    assert torch.equal(ds.image(2), ds[2]["image"])

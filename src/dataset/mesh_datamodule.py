@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """LightningDataModule for (LOD1, LOD2) mesh-token pairs."""
+import logging
 from functools import partial
 
 import lightning as L
 import torch
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 
 from src.dataset.mesh_dataset import NUM_BINS, MeshDataset, mesh_collate_fn, specials
+
+logger = logging.getLogger(__name__)
 
 
 class MeshDataModule(L.LightningDataModule):
@@ -29,6 +32,9 @@ class MeshDataModule(L.LightningDataModule):
         seed (int): seeds the train/val/test split, for reproducibility.
         ortho_dir, image_size, image_margin: optional orthophoto crops, passed
             straight to `MeshDataset`; ``ortho_dir=None`` disables them.
+        image_min_coverage (float): with `ortho_dir`, buildings whose mosaic
+            covers less than this are dropped from each split *after*
+            splitting, so the split itself is unchanged.
     """
 
     def __init__(self, dataset_dir, lod_in="LOD1_synth", lod_out="LOD2",
@@ -36,12 +42,14 @@ class MeshDataModule(L.LightningDataModule):
                  margin_hi=(0.0, 0.0, 0.1), max_faces=None, max_files=None,
                  batch_size=8, train_val_test_split=(0.8, 0.1, 0.1),
                  num_workers=0, persistent_workers=False, seed=42,
-                 tokenization="coord", ortho_dir=None, image_size=256, image_margin=0.1):
+                 tokenization="coord", ortho_dir=None, image_size=256, image_margin=0.1,
+                 image_min_coverage=1.0):
         super().__init__()
         self.tokenization = tokenization
         self.ortho_dir = ortho_dir
         self.image_size = image_size
         self.image_margin = image_margin
+        self.image_min_coverage = image_min_coverage
         self.dataset_dir = dataset_dir
         self.lod_in = lod_in
         self.lod_out = lod_out
@@ -59,6 +67,7 @@ class MeshDataModule(L.LightningDataModule):
 
         self.full_dataset = None
         self.train_dataset = self.val_dataset = self.test_dataset = None
+        self.skipped_no_image = {}
 
         assert abs(sum(train_val_test_split) - 1.0) < 1e-5, "Split ratios must sum to 1.0"
 
@@ -73,6 +82,7 @@ class MeshDataModule(L.LightningDataModule):
             max_faces=self.max_faces, max_files=self.max_files,
             tokenization=self.tokenization, ortho_dir=self.ortho_dir,
             image_size=self.image_size, image_margin=self.image_margin,
+            image_min_coverage=self.image_min_coverage,
         )
         total = len(self.full_dataset)
         if total == 0:
@@ -87,6 +97,18 @@ class MeshDataModule(L.LightningDataModule):
             [train_size, val_size, total - train_size - val_size],
             generator=generator,
         )
+
+        # Split first, then drop buildings without an orthophoto: the split
+        # stays exactly v5's, so an image run initialised from v5 never
+        # validates on buildings v5 trained on.
+        if self.full_dataset.ortho is not None:
+            keep = self.full_dataset.has_image
+            for name in ("train", "val", "test"):
+                subset = getattr(self, f"{name}_dataset")
+                kept = [i for i in subset.indices if keep[i]]
+                self.skipped_no_image[name] = len(subset.indices) - len(kept)
+                setattr(self, f"{name}_dataset", Subset(self.full_dataset, kept))
+            logger.info("Skipped buildings without an orthophoto: %s", self.skipped_no_image)
 
     @property
     def max_seq_len(self):

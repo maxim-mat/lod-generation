@@ -665,12 +665,16 @@ class MeshDataset(Dataset):
         image_size (int): crop side in pixels.
         image_margin (float): crop margin beyond the unit box, normalized units;
             at most the ``beta_max`` the mosaics were built with.
+        image_min_coverage (float): buildings whose mosaic coverage is below
+            this get ``has_image=False``; `MeshDataModule` drops them after
+            splitting. Every building is kept here, so the split never moves.
     """
 
     def __init__(self, dataset_dir, lod_in="LOD1_synth", lod_out="LOD2",
                  num_bins=NUM_BINS, margin_lo=(0.0, 0.0, 0.0),
                  margin_hi=(0.0, 0.0, 0.1), max_faces=None, max_files=None,
-                 tokenization="coord", ortho_dir=None, image_size=256, image_margin=0.1):
+                 tokenization="coord", ortho_dir=None, image_size=256, image_margin=0.1,
+                 image_min_coverage=1.0):
         self.dataset_dir = Path(dataset_dir)
         self.num_bins = num_bins
         if tokenization not in ("coord", "amt"):
@@ -707,9 +711,16 @@ class MeshDataset(Dataset):
                            lod_in, lod_out, self.dataset_dir)
 
         self.ortho = None
+        self.has_image = [True] * len(ids)
         if ortho_dir is not None:
             self.ortho = self._open_ortho(ortho_dir, lod_in, lod_out, image_size, image_margin,
                                           files_out)
+            coverage = self._manifest_totals.get("partial_coverage", {})
+            self.has_image = [coverage.get(i, 1.0) >= image_min_coverage for i in ids]
+            if not all(self.has_image):
+                logger.info("%d/%d buildings have no orthophoto (coverage < %.2f); "
+                            "MeshDataModule drops them after splitting",
+                            self.has_image.count(False), len(ids), image_min_coverage)
 
         # Longest *segment* the model must position-embed. Positions restart in
         # the target segment (see `MeshTransformer.forward`), so this is a max
@@ -810,7 +821,9 @@ class MeshDataset(Dataset):
         if not manifest_path.is_file():
             raise FileNotFoundError(f"No ortho_manifest.json in {root}; build it with "
                                     "`python -m src.ortho_parse`.")
-        built = json.loads(manifest_path.read_text(encoding="utf-8"))["args"]
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        built = manifest["args"]
+        self._manifest_totals = manifest.get("totals", {})
         if image_margin > built["beta_max"]:
             raise ValueError(f"image_margin={image_margin} exceeds the beta_max="
                              f"{built['beta_max']} the mosaics in {root} were built with.")
@@ -852,6 +865,15 @@ class MeshDataset(Dataset):
             item["image"] = self.ortho.crop(self.image_files[index],
                                             item["center"].numpy(), item["scale"].numpy())
         return item
+
+    def image(self, index):
+        """Crop of building `index`, in its own frame and imagery year.
+
+        For evaluation controls that pair a building with another's image.
+        """
+        item = self._tokens(index)
+        return self.ortho.crop(self.image_files[index], item["center"].numpy(),
+                               item["scale"].numpy())
 
     def _tokens(self, index):
         """The item without its image: tokens, id and the frame."""
