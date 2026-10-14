@@ -77,3 +77,17 @@ def test_main_writes_the_report_for_a_tiny_subset(tmp_path):
     assert rep["metrics"]["volume_m3"]["icc1"] > 0.5
     assert (tmp_path / "out" / "report.md").read_text(encoding="utf-8").startswith(
         "# Spatial correlation (40 buildings, 10 tiles)")
+
+
+def test_correlogram_memory_stays_bounded_on_a_dense_city():
+    # cleaner is ~258k buildings in ~100 km2, so a 4 km radius holds ~100k
+    # neighbours per anchor. Materialising them all at once ran out of memory.
+    import tracemalloc
+    rng = np.random.default_rng(6)
+    xy = rng.uniform(0, 2500, size=(100_000, 2))          # every pair within 4 km
+    values = rng.normal(size=len(xy))
+    tracemalloc.start()
+    correlogram(xy, values, n_anchors=100, seed=7)
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    assert peak < 150e6, f"peak {peak / 1e6:.0f} MB"

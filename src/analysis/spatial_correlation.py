@@ -81,28 +81,27 @@ def permutation_null(values, groups, n_perm=200, seed=0):
     return np.array([icc1(values, rng.permutation(groups)) for _ in range(n_perm)])
 
 
-def correlogram(xy, values, edges=EDGES_M, n_anchors=20000, seed=0):
+def correlogram(xy, values, edges=EDGES_M, n_anchors=5000, seed=0):
     """Pearson correlation of building pairs, binned by centroid distance.
 
-    Pairs are drawn from `n_anchors` random anchors to all buildings within
-    the largest edge, so the cost stays linear in the anchor count.
+    Pairs are drawn from `n_anchors` random anchors to every other building,
+    one anchor at a time: cost is linear in the anchor count and memory stays
+    a few arrays of N floats. A radius query instead materialises ~100k
+    neighbours per anchor at city density, which ran out of memory on cleaner.
     """
     xy, z = np.asarray(xy, float), np.asarray(values, float)
     z = (z - z.mean()) / z.std()
     rng = np.random.default_rng(seed)
     anchors = rng.choice(len(xy), size=min(n_anchors, len(xy)), replace=False)
-    tree = cKDTree(xy)
-    sums = np.zeros(len(edges) - 1)
-    counts = np.zeros(len(edges) - 1, dtype=np.int64)
-    for a, neighbours in zip(anchors, tree.query_ball_point(xy[anchors], r=edges[-1])):
-        nb = np.asarray([j for j in neighbours if j != a], dtype=np.int64)
-        if not len(nb):
-            continue
-        d = np.linalg.norm(xy[nb] - xy[a], axis=1)
-        b = np.digitize(d, edges) - 1
-        ok = (b >= 0) & (b < len(counts))
-        np.add.at(sums, b[ok], z[a] * z[nb[ok]])
-        np.add.at(counts, b[ok], 1)
+    n_bins = len(edges) - 1
+    sums = np.zeros(n_bins)
+    counts = np.zeros(n_bins, dtype=np.int64)
+    for a in anchors:
+        b = np.digitize(np.hypot(*(xy - xy[a]).T), edges) - 1
+        ok = (b >= 0) & (b < n_bins)
+        ok[a] = False
+        sums += np.bincount(b[ok], weights=z[a] * z[ok], minlength=n_bins)
+        counts += np.bincount(b[ok], minlength=n_bins)
     return pd.DataFrame({"lo": edges[:-1], "hi": edges[1:], "n_pairs": counts,
                          "corr": sums / np.maximum(counts, 1)})
 
