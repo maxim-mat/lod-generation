@@ -26,28 +26,19 @@ import pandas as pd
 from scipy.spatial import cKDTree
 
 from src.dataset.mesh_dataset import parse_cityjson_file_to_meshes, signed_volume
-from src.dataset.splits import random_split_indices, tile_split_indices
+from src.dataset.splits import footprint, random_split_indices, tile_split_indices
 from src.filter_cityjson import _git_commit
 
 logger = logging.getLogger(__name__)
 EDGES_M = [0, 25, 50, 100, 250, 500, 1000, 2000, 4000]
 
 
-def _base(verts, faces, tol=1e-3):
-    """Projected area and area-weighted centroid of the triangles at the mesh's lowest z."""
-    tri = verts[faces]
-    flat = (np.abs(tri[:, :, 2] - verts[:, 2].min()) < tol).all(axis=1)
-    t = tri[flat][:, :, :2]
-    area = 0.5 * np.abs((t[:, 1, 0] - t[:, 0, 0]) * (t[:, 2, 1] - t[:, 0, 1])
-                        - (t[:, 2, 0] - t[:, 0, 0]) * (t[:, 1, 1] - t[:, 0, 1]))
-    centroid = (t.mean(axis=1) * area[:, None]).sum(axis=0) / max(area.sum(), 1e-12)
-    return float(area.sum()), centroid
-
-
 def building_metrics(lod1_path, lod2_path):
-    """``{id: (x, y, footprint_m2, volume_m3, n_faces)}`` for buildings present in both files.
+    """``{id: (x, y, footprint_m2, volume_m3, n_faces, lod1_volume_m3)}`` for buildings in both files.
 
-    Footprint and centroid come from the LOD1 base; volume and triangle count from LOD2.
+    Footprint and centroid come from the LOD1 base; volume and triangle count
+    from LOD2. LOD1 volume lets `src.analysis.split_sweep` factor out what the
+    model is already given.
     """
     lod1 = parse_cityjson_file_to_meshes(lod1_path)
     lod2 = parse_cityjson_file_to_meshes(lod2_path)
@@ -55,8 +46,9 @@ def building_metrics(lod1_path, lod2_path):
     for oid, (v2, f2) in lod2.items():
         if oid not in lod1:
             continue
-        area, (x, y) = _base(*lod1[oid])
-        out[oid] = (float(x), float(y), area, abs(float(signed_volume(v2, f2))), int(len(f2)))
+        area, (x, y) = footprint(*lod1[oid])
+        out[oid] = (float(x), float(y), area, abs(float(signed_volume(v2, f2))), int(len(f2)),
+                    abs(float(signed_volume(*lod1[oid]))))
     return out
 
 
@@ -123,17 +115,18 @@ def _job(args):
 
 
 def building_table(subset_root, workers=8):
-    """One row per building: id, tile, x, y, footprint_m2, volume_m3, n_faces."""
+    """One row per building: id, tile, x, y, footprint_m2, volume_m3, n_faces, lod1_volume_m3."""
     root = Path(subset_root)
     rels = sorted(p.relative_to(root / "LOD2") for p in (root / "LOD2").rglob("*.json"))
     rows = []
+    # Ordered imap: report()'s random split depends on row order.
     with mp.Pool(workers) as pool:
-        for done, (rel, metrics) in enumerate(pool.imap_unordered(_job, [(root, r) for r in rels]), 1):
+        for done, (rel, metrics) in enumerate(pool.imap(_job, [(root, r) for r in rels]), 1):
             rows += [(oid, rel.as_posix(), *m) for oid, m in metrics.items()]
             if done % 25 == 0:
                 logger.info("%d/%d files", done, len(rels))
     return pd.DataFrame(rows, columns=["id", "tile", "x", "y", "footprint_m2", "volume_m3",
-                                       "n_faces"])
+                                       "n_faces", "lod1_volume_m3"])
 
 
 def report(table, ratios=(0.8, 0.1, 0.1), seed=42, n_perm=200):

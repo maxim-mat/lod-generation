@@ -7,7 +7,8 @@ import lightning as L
 from torch.utils.data import DataLoader, Subset
 
 from src.dataset.mesh_dataset import NUM_BINS, MeshDataset, mesh_collate_fn, specials
-from src.dataset.splits import random_split_indices, tile_split_indices
+from src.dataset.splits import (buffer_train, grid_labels, random_split_indices,
+                                 tile_split_indices)
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,11 @@ class MeshDataModule(L.LightningDataModule):
         max_faces (int, optional): drop buildings above this triangle count.
         max_files (int, optional): read only the first N files per LOD.
         seed (int): seeds the train/val/test split, for reproducibility.
-        split (str): ``"random"`` (per building) or ``"tile"`` (whole files).
+        split (str): ``"random"`` (per building), ``"tile"`` (whole files) or
+            ``"grid"`` (whole square blocks of `split_block_m` metres).
+        split_block_m (float): grid block side; required for ``"grid"``.
+        split_buffer_m (float): for ``"tile"``/``"grid"``, drop training
+            buildings closer than this to any val/test building.
         ortho_dir, image_size, image_margin: optional orthophoto crops, passed
             straight to `MeshDataset`; ``ortho_dir=None`` disables them.
         image_min_coverage (float): with `ortho_dir`, buildings whose mosaic
@@ -45,11 +50,19 @@ class MeshDataModule(L.LightningDataModule):
                  batch_size=8, train_val_test_split=(0.8, 0.1, 0.1),
                  num_workers=0, persistent_workers=False, seed=42,
                  tokenization="coord", ortho_dir=None, image_size=256, image_margin=0.1,
-                 image_min_coverage=1.0, split="random"):
+                 image_min_coverage=1.0, split="random", split_block_m=None,
+                 split_buffer_m=0.0):
         super().__init__()
-        if split not in ("random", "tile"):
-            raise ValueError(f"Unknown split {split!r}; expected 'random' or 'tile'.")
+        if split not in ("random", "tile", "grid"):
+            raise ValueError(f"Unknown split {split!r}; expected 'random', 'tile' or 'grid'.")
+        if split == "grid" and not split_block_m:
+            raise ValueError("split='grid' needs split_block_m (block side in metres).")
+        if split == "random" and split_buffer_m:
+            raise ValueError("split_buffer_m needs a 'tile' or 'grid' split: a buffer around "
+                             "randomly scattered val/test buildings would empty train.")
         self.split = split
+        self.split_block_m = split_block_m
+        self.split_buffer_m = split_buffer_m
         self.tokenization = tokenization
         self.ortho_dir = ortho_dir
         self.image_size = image_size
@@ -74,6 +87,7 @@ class MeshDataModule(L.LightningDataModule):
         self.train_dataset = self.val_dataset = self.test_dataset = None
         self.skipped_no_image = {}
         self.split_groups = {}
+        self.buffer_dropped = 0
 
         assert abs(sum(train_val_test_split) - 1.0) < 1e-5, "Split ratios must sum to 1.0"
 
@@ -95,13 +109,21 @@ class MeshDataModule(L.LightningDataModule):
             raise ValueError(f"No LOD pairs found under {self.dataset_dir}")
 
         ratios = self.train_val_test_split
-        if self.split == "tile":
-            parts, assign = tile_split_indices(self.full_dataset.files, ratios, self.seed)
-            names = ("train", "val", "test")
-            self.split_groups = {g: names[k] for g, k in assign.items()}
-        else:
+        if self.split == "random":
             parts = random_split_indices(total, ratios, self.seed)
             self.split_groups = {}
+        else:
+            groups = (self.full_dataset.files if self.split == "tile"
+                      else grid_labels(self.full_dataset.xy, self.split_block_m))
+            parts, assign = tile_split_indices(groups, ratios, self.seed)
+            names = ("train", "val", "test")
+            self.split_groups = {g: names[k] for g, k in assign.items()}
+            parts[0], self.buffer_dropped = buffer_train(
+                self.full_dataset.xy, parts[0], parts[1] + parts[2], self.split_buffer_m)
+            if self.buffer_dropped:
+                logger.info("Buffer of %g m dropped %d/%d training buildings",
+                            self.split_buffer_m, self.buffer_dropped,
+                            self.buffer_dropped + len(parts[0]))
         self.train_dataset, self.val_dataset, self.test_dataset = (
             Subset(self.full_dataset, p) for p in parts)
 

@@ -29,6 +29,7 @@ import torch
 from torch.utils.data import Dataset
 
 from src.dataset.dataset import _iter_surfaces
+from src.dataset.splits import footprint
 from src.geometry.geometry import triangulate_face
 
 logger = logging.getLogger(__name__)
@@ -708,6 +709,7 @@ class MeshDataset(Dataset):
         self.pairs = [(meshes_in[i], meshes_out[i]) for i in ids]
         # LOD2 file per building: the geographic split's unit.
         self.files = [files_out[i] for i in ids]
+        self._xy = None
         if not self.ids:
             logger.warning("No buildings shared between %s and %s under %s",
                            lod_in, lod_out, self.dataset_dir)
@@ -856,6 +858,17 @@ class MeshDataset(Dataset):
 
     def __len__(self):
         return len(self.ids)
+
+    @property
+    def xy(self):
+        """``[N, 2]`` LOD1 footprint centroid per building, metres; positions the grid split.
+
+        Computed on first use, so runs on the random split never pay for it.
+        """
+        if self._xy is None:
+            self._xy = np.array([footprint(v, f)[1] for (v, f), _ in self.pairs],
+                                dtype=float).reshape(-1, 2)
+        return self._xy
 
     def mesh_pair(self, index):
         """Raw ``((verts, faces), (verts, faces))`` in metres, for .obj dumps."""

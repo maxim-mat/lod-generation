@@ -10,11 +10,12 @@ from tests.test_ortho_tiles import write_tile
 def test_building_metrics_reads_footprint_volume_and_centroid(tmp_path):
     for lod, h in (("LOD1", 6), ("LOD2", 6)):
         write_tile(tmp_path / lod / "t.city.json", {"a": (100, 200, 110, 208, h)})
-    (x, y, area, vol, faces), = building_metrics(tmp_path / "LOD1" / "t.city.json",
-                                                 tmp_path / "LOD2" / "t.city.json").values()
+    (x, y, area, vol, faces, vol1), = building_metrics(tmp_path / "LOD1" / "t.city.json",
+                                                       tmp_path / "LOD2" / "t.city.json").values()
     assert (x, y) == pytest.approx((105.0, 204.0))
     assert area == pytest.approx(80.0) and vol == pytest.approx(480.0)
     assert faces == 12                    # six quads -> twelve LOD2 triangles
+    assert vol1 == pytest.approx(480.0)   # LOD1 volume, for the LOD1-residual targets
 
 
 def test_icc_is_one_for_identical_members_and_zero_for_iid_noise():
@@ -91,3 +92,17 @@ def test_correlogram_memory_stays_bounded_on_a_dense_city():
     peak = tracemalloc.get_traced_memory()[1]
     tracemalloc.stop()
     assert peak < 150e6, f"peak {peak / 1e6:.0f} MB"
+
+
+def test_building_table_rows_come_in_file_order_whatever_the_worker_count(tmp_path):
+    # report()'s random split depends on row order, so it must not depend on
+    # which worker finished first.
+    from src.analysis.spatial_correlation import building_table
+    root = tmp_path / "mini_cleaner"
+    for t in range(8):
+        n = 40 if t == 0 else 2                     # the first file is the slow one
+        boxes = {f"t{t}-b{b}": (100 * t + 2 * b, 0, 100 * t + 2 * b + 1, 1, 3) for b in range(n)}
+        for lod in ("LOD1", "LOD2"):
+            write_tile(root / lod / "Source B" / f"10-{t}-0.city.json", boxes)
+    table = building_table(root, workers=4)
+    assert table["tile"].tolist() == sorted(table["tile"])

@@ -11,6 +11,7 @@ from omegaconf import OmegaConf
 
 from src.dataset.mesh_datamodule import MeshDataModule
 from src.dataset.mesh_dataset import position_budget
+from src.dataset.splits import split_name
 from src.models.mesh_transformer import MeshTransformerModule
 from src.utils.config import Config
 from src.utils.setup_utils import create_callbacks, create_loggers
@@ -81,17 +82,24 @@ def train_mesh(cfg: Config):
         image_margin=cfg.mesh_data.image_margin,
         image_min_coverage=cfg.mesh_data.image_min_coverage,
         split=cfg.training.split,
+        split_block_m=cfg.training.split_block_m,
+        split_buffer_m=cfg.training.split_buffer_m,
     )
     datamodule.setup()
     # Which buildings were held out, so evaluation and later runs can be
     # checked against the same split.
     (save_dir / "split.json").write_text(json.dumps(
-        {"scheme": cfg.training.split, "seed": cfg.seed,
+        {"scheme": cfg.training.split, "block_m": cfg.training.split_block_m,
+         "buffer_m": cfg.training.split_buffer_m,
+         "name": split_name(cfg.training.split, cfg.training.split_block_m,
+                            cfg.training.split_buffer_m),
+         "seed": cfg.seed,
          "ratios": list(cfg.training.train_val_test_split),
          "sizes": {n: len(getattr(datamodule, f"{n}_dataset"))
                    for n in ("train", "val", "test")},
          "skipped_no_image": datamodule.skipped_no_image,
-         "tiles": datamodule.split_groups}, indent=2), encoding="utf-8")
+         "buffer_dropped": datamodule.buffer_dropped,
+         "groups": datamodule.split_groups}, indent=2), encoding="utf-8")
     logger.info("Mesh pairs: train=%d, val=%d, test=%d",
                 len(datamodule.train_dataset), len(datamodule.val_dataset),
                 len(datamodule.test_dataset))
@@ -161,7 +169,8 @@ def train_mesh(cfg: Config):
         tokenization=cfg.mesh_data.tokenization,
         mask_invalid=cfg.mesh_model.mask_invalid,
         tf_chamfer=cfg.mesh_eval.tf_chamfer,
-        data_split=cfg.training.split,
+        data_split=split_name(cfg.training.split, cfg.training.split_block_m,
+                              cfg.training.split_buffer_m),
     )
     if cfg.mesh_model.backbone == "opt":
         params = sum(p.numel() for p in model.network.opt.parameters())

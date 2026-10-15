@@ -1078,6 +1078,104 @@ git commit -m "feat(analysis): spatial correlation report (ICC by tile, correlog
 
 ---
 
+### Task 2c: Grid split with a buffer, and a block-size sweep
+
+**Why (user, 2026-10-15):** 3DBAG tiles are quadtree tiles from 0.5 to 4 km on a side (median 1 km,
+measured on `cleaner`). That may be far coarser than the distance over which neighbours actually
+resemble each other. Coarse units cost twice:
+- **Few test units:** about 25 test tiles, so a handful of neighbourhoods decides the score.
+- **No separation at the edges:** blocks don't keep a test building near a block edge away from the
+  training building across the boundary.
+
+**What changes:**
+- **`split: grid`:** square blocks of `split_block_m` metres, keyed on each building's LOD1 footprint
+  centroid. The blocks are balanced into train/val/test by the same greedy as the tile split
+  (`tile_split_indices` takes any group labels).
+- **`split_buffer_m`:** for `tile` and `grid`, training buildings within this distance of any val/test
+  building are dropped. This is what guarantees separation: every val/test building ends up at least
+  that far from training, whatever the block size. Refused for `random`, where a buffer around
+  scattered val/test buildings would empty train.
+- **Unique split names:** the module's `data_split` records the full scheme (`grid250m-buffer50m`), so
+  two grid runs with different blocks count as different splits for `load_weights_from`.
+
+**How the block size is chosen:** `src/analysis/split_sweep.py`. For each grid size × buffer (plus
+`random` and `tile` as references, several seeds), it records:
+- val/test-to-nearest-train distances;
+- the similarity of each val/test building to its nearest training building;
+- training data lost to the buffer;
+- the number of val/test blocks.
+
+It also writes a fine-grained correlogram. Similarity is measured on five targets:
+- log footprint, log LOD2 volume and log LOD2 face count, as in Task 2b;
+- two that factor out what the model already gets from LOD1, the quantities that actually matter
+  for leakage:
+  - `roof_ratio` = log(LOD2 volume / LOD1 volume);
+  - `faces_resid` = log face count minus its least-squares fit on log footprint and log LOD1 volume.
+
+**Decision rule:**
+- **Buffer d:** set it to where the correlogram of `faces_resid` and `roof_ratio` has fallen to its
+  long-distance level.
+- **Block B:** the smallest block whose buffer loss is acceptable (≤ 10%). The sweep's CSV shows both
+  directly.
+- **Still needed:** the v5 error-versus-distance check, the decisive model-based test. It is a separate
+  step, not part of this task.
+
+**Files:**
+- Modify:
+  - `src/dataset/splits.py`: `footprint`, `grid_labels`, `buffer_train`, `split_name`;
+  - `src/analysis/spatial_correlation.py`: `_base` moves to `splits.footprint`, and `building_metrics`
+    gains LOD1 volume;
+  - `src/dataset/mesh_dataset.py`: lazy `MeshDataset.xy`;
+  - `src/dataset/mesh_datamodule.py`: `grid`, `split_block_m`, `split_buffer_m`;
+  - `src/utils/config.py`, `src/train_mesh.py`, `src/eval/posthoc_eval.py`.
+- Create: `src/analysis/split_sweep.py`, `src/analysis/plot_split_sweep.py`.
+- Test: `tests/test_splits.py`, `tests/test_spatial_correlation.py`, `tests/test_split_sweep.py`.
+
+**Interfaces:**
+- Produces in `src/dataset/splits.py`:
+  - `footprint(verts, faces) -> (area_m2, centroid_xy)`: the LOD1 base; the bounding-box centre when
+    there is no base;
+  - `grid_labels(xy, block_m) -> list[str]`;
+  - `buffer_train(xy, train_idx, eval_idx, buffer_m) -> (kept_train_idx, n_dropped)`;
+  - `split_name(split, block_m=None, buffer_m=0.0) -> str`.
+- Produces: `MeshDataset.xy: float [N, 2]` (metres, computed on first use).
+- Produces: `MeshDataModule(..., split="random"|"tile"|"grid", split_block_m=None, split_buffer_m=0.0)`
+  and `MeshDataModule.buffer_dropped`.
+- Produces: `TrainingConfig.split_block_m: Optional[float] = None`, `split_buffer_m: float = 0.0`.
+- Produces: `building_metrics(...)` returns
+  `{id: (x, y, footprint_m2, volume_m3, n_faces, lod1_volume_m3)}`.
+- Produces: `python -m src.analysis.split_sweep <subset> --out <dir> [--table buildings.csv]`, which
+  writes `split_sweep.csv`, `correlogram.csv`, `buildings.csv` and `run.json`;
+  `python -m src.analysis.plot_split_sweep <dir>` writes the figures next to them.
+
+- [ ] **Step 1: Run impact** on `building_metrics`, `_base`, `MeshDataModule`, `MeshDataset`,
+  `TrainingConfig`, `train_mesh`, and report it.
+- [ ] **Step 2: Write the failing tests:**
+  - `tests/test_splits.py`:
+    - `test_footprint_is_the_base_area_and_centroid`
+    - `test_footprint_falls_back_to_the_bbox_centre_without_a_base`
+    - `test_grid_labels_bin_by_block_including_negative_coordinates`
+    - `test_buffer_drops_exactly_the_train_buildings_near_eval_ones`
+    - `test_split_name_encodes_scheme_block_and_buffer`
+    - `test_datamodule_grid_split_keeps_blocks_whole_and_applies_the_buffer`
+    - `test_grid_without_a_block_size_and_random_with_a_buffer_are_refused`
+    - update `test_train_mesh_passes_the_split_and_writes_split_json` for `split_name`.
+  - `tests/test_spatial_correlation.py`: the metrics test also checks LOD1 volume.
+  - `tests/test_split_sweep.py`:
+    - `test_targets_factor_out_lod1`
+    - `test_sweep_has_a_row_per_scheme_size_buffer_and_seed`
+    - `test_buffer_guarantees_the_minimum_distance`
+    - `test_bigger_blocks_push_eval_buildings_further_from_train`
+    - `test_main_writes_csvs_and_run_metadata`
+    - `test_plot_writes_figures_from_the_saved_csvs`
+- [ ] **Step 3: Run them and watch them fail.**
+- [ ] **Step 4: Implement.**
+- [ ] **Step 5: Run the tests, then the full suite.**
+- [ ] **Step 6: Commit:** `feat(data): grid split with buffer; block-size sweep script`.
+- [ ] **Step 7 (run, user-requested 2026-10-15):** sweep `cleaner` and plot the figures.
+
+---
+
 ### Task 3: `OrthoImageEncoder` (frozen DINOv3 → image tokens)
 
 **Files:**

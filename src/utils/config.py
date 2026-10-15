@@ -279,6 +279,12 @@ class TrainingConfig:
     # 'random' = per building (every run up to v5); 'tile' = whole 3DBAG tiles
     # per split, see src/analysis/spatial_correlation.py.
     split: str = "random"
+    # Grid split only: block side in metres (choose it with
+    # src/analysis/split_sweep.py).
+    split_block_m: Optional[float] = None
+    # tile/grid only: drop training buildings closer than this to any val/test
+    # building, so every evaluated building is at least this far from training.
+    split_buffer_m: float = 0.0
     lr: float = 1e-3
     max_epochs: int = 100
     gradient_clip_val: Optional[float] = None
