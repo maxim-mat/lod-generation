@@ -69,13 +69,14 @@ def _buffer_lines(ax, rows, column):
     ax.set_xticklabels([f"{s:g}" for s in sizes])
 
 
-def _reference(ax, rows, column, scheme, buffer_m=0):
+def _reference(ax, rows, column, scheme, buffer_m=0, side="right"):
     ref = rows[(rows["scheme"] == scheme) & (rows["buffer_m"] == buffer_m)][column].mean()
     if np.isfinite(ref):
         ax.axhline(ref, color=MUTED, linewidth=1.2, linestyle=(0, (4, 3)))
-        ax.annotate(f"{scheme} split", (1.0, ref), xycoords=("axes fraction", "data"),
-                    xytext=(-4, 3), textcoords="offset points", ha="right", va="bottom",
-                    color=INK2, fontsize=8)
+        right = side == "right"
+        ax.annotate(f"{scheme} split", (1.0 if right else 0.0, ref),
+                    xycoords=("axes fraction", "data"), xytext=(-4 if right else 4, 3),
+                    textcoords="offset points", ha=side, va="bottom", color=INK2, fontsize=8)
 
 
 def _legend(ax, **kw):
@@ -125,7 +126,7 @@ def plot_similarity(rows, path):
         _reference(ax, rows, f"corr_{name}", "tile")
         _style(ax, "grid block side (m)", "correlation with nearest train building")
         ax.set_title(TARGET_LABELS[name], color=INK, fontsize=10, loc="left")
-    _legend(axes[0], loc="upper right")
+    _legend(axes[0], loc="center right")
     fig.suptitle("How alike the nearest training building still is (lower = better separated)",
                  color=INK, fontsize=11, x=0.01, ha="left")
     fig.tight_layout()
@@ -145,7 +146,7 @@ def plot_cost(rows, path):
     g = grid.groupby("block_m")["n_eval_groups"].mean()
     right.plot(g.index, g.values, color=BUFFER_RAMP[1], linewidth=2, marker="o", markersize=5,
                markeredgecolor=SURFACE, markeredgewidth=1.5)
-    _reference(right, rows, "n_eval_groups", "tile")
+    _reference(right, rows, "n_eval_groups", "tile", side="left")
     right.set_xscale("log")
     right.set_yscale("log")
     right.set_xticks(list(g.index))
