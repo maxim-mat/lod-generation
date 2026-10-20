@@ -400,3 +400,57 @@ def test_git_state_keeps_a_diff_with_non_ascii_bytes(tmp_path, monkeypatch):
 
     assert info["dirty"] is True
     assert "Łódź" in diff
+
+
+# ---------------------------------------------------------------- ortho Task 7
+
+def test_image_mode_is_validated():
+    with pytest.raises(ValueError, match="image_mode"):
+        validate_posthoc_config(_cfg(image_mode="random"))
+
+
+def test_shuffled_pairs_each_object_with_another_buildings_image():
+    from src.eval.posthoc_eval import image_source
+    n = 5
+    src = [image_source(k, n, "shuffled") for k in range(n)]
+    assert sorted(src) == list(range(n)) and all(s != k for k, s in enumerate(src))
+    assert [image_source(k, n, "true") for k in range(n)] == list(range(n))
+
+
+def test_shuffled_needs_two_objects():
+    from src.eval.posthoc_eval import image_source
+    with pytest.raises(ValueError, match="two"):
+        image_source(0, 1, "shuffled")
+
+
+class _ImageDataset(_Dataset):
+    """`_Dataset` plus a constant-per-building crop, like `MeshDataset` with ortho_dir."""
+
+    def image(self, i):
+        return torch.full((3, 8, 8), 10 * (i + 1), dtype=torch.uint8)
+
+    def __getitem__(self, i):
+        return {**self.items[i], "image": self.image(i)}
+
+
+@pytest.mark.parametrize("mode", ["true", "shuffled", "none"])
+def test_image_mode_reaches_generate(tmp_path, monkeypatch, mode):
+    model, seen = _model(), []
+    real = type(model).generate
+
+    def spy(self, cond, cond_pad_mask=None, **kw):
+        seen.append((kw.get("image"), kw.get("image_valid")))
+        kw.pop("image"), kw.pop("image_valid", None)
+        return real(self, cond, cond_pad_mask, **kw)
+    monkeypatch.setattr(type(model), "generate", spy)
+    cfg = _small_cfg(image_mode=mode, strategies=[StrategyConfig(kind="greedy")],
+                     metrics=["chamfer"])
+    run_posthoc_eval(cfg, Config(), model, _ImageDataset(), tmp_path / "e")
+
+    image, valid = seen[0]
+    first_pixel = image[:, 0, 0, 0].tolist()
+    assert first_pixel == ([20, 10] if mode == "shuffled" else [10, 20])
+    if mode == "none":
+        assert valid.tolist() == [False, False]
+    else:
+        assert valid is None

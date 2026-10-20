@@ -127,12 +127,32 @@ def expand_strategies(strategies):
     return runs
 
 
+IMAGE_MODES = ("true", "shuffled", "none")
+
+
+def image_source(k, n, mode):
+    """Split position whose image object ``k`` (of ``n``) is scored with.
+
+    ``shuffled`` pairs each object with the one half the split away: never
+    itself for n >= 2, deterministic, and spatially unrelated because the split
+    order is a random permutation. Every other mode keeps the object's own.
+    """
+    if mode != "shuffled":
+        return k
+    if n < 2:
+        raise ValueError("image_mode='shuffled' needs at least two objects in the split.")
+    return (k + n // 2) % n
+
+
 def validate_posthoc_config(cfg):
     """Everything checkable without touching a model, data or checkpoint.
 
     Returns:
         list[DecodeRun]: the expanded strategy grid.
     """
+    if cfg.image_mode not in IMAGE_MODES:
+        raise ValueError(f"Unknown image_mode {cfg.image_mode!r}; expected one of "
+                         f"{list(IMAGE_MODES)}.")
     bad = sorted(set(cfg.metrics) - set(METRICS))
     if bad or not cfg.metrics:
         raise ValueError(f"Unknown or empty metric list {list(cfg.metrics)}; "
@@ -399,6 +419,8 @@ def run_posthoc_eval(cfg, ref_cfg, model, dataset, out_dir, checkpoint=None,
 
     max_new_tokens = generation_budget(ref_cfg)
     pad = specials(model.num_bins)[2]
+    indices = [int(i) for i in indices]
+    position = {k: p for p, k in enumerate(indices)}
     model.eval()
     summary = []
     for run in runs:
@@ -415,16 +437,28 @@ def run_posthoc_eval(cfg, ref_cfg, model, dataset, out_dir, checkpoint=None,
         rows = []
         for start in range(0, len(indices), cfg.batch_size):
             chunk = indices[start:start + cfg.batch_size]
-            batch = mesh_collate_fn([dataset[int(i)] for i in chunk], pad=pad)
+            items = []
+            for k in chunk:
+                item = dataset[k]
+                if "image" in item and cfg.image_mode == "shuffled":
+                    source = indices[image_source(position[k], len(indices), "shuffled")]
+                    full, orig = _resolve(dataset, source)
+                    item = {**item, "image": full.image(orig)}
+                items.append(item)
+            batch = mesh_collate_fn(items, pad=pad)
             batch = {k: v.to(device) if torch.is_tensor(v) else v
                      for k, v in batch.items()}
+            # `none`: every row gets the null token, as image dropout trained it.
+            image_valid = (torch.zeros(len(chunk), dtype=torch.bool, device=device)
+                           if cfg.image_mode == "none" else None)
             seeds = [object_seed(cfg.seed, oid) for oid in batch["ids"]]
 
             started = time.perf_counter()
             with torch.no_grad():
                 cond, tgt, cond_pad, _ = model._prepare(batch)
                 out = model.generate(cond, cond_pad, max_new_tokens=max_new_tokens,
-                                     seeds=seeds, image=batch.get("image"), **kwargs)
+                                     seeds=seeds, image=batch.get("image"),
+                                     image_valid=image_valid, **kwargs)
             seconds = (time.perf_counter() - started) / len(chunk)
 
             batch_rows = _score_batch(model, batch, out, cond, tgt, cond_pad, cfg,
@@ -538,7 +572,8 @@ def main(argv=None):
     base = (Path(cfg.output_dir) if cfg.output_dir else
             Path(ref_cfg.logging.save_dir, ref_cfg.logging.experiment_name,
                  ref_cfg.logging.run_name, "posthoc_eval"))
-    out_dir = base / ckpt.stem / datetime.now().strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    out_dir = base / ckpt.stem / (stamp if cfg.image_mode == "true" else f"{cfg.image_mode}-{stamp}")
     logger.info("[posthoc] %s, %s split (%d objects) -> %s",
                 ckpt.name, cfg.split, len(dataset), out_dir)
     run_posthoc_eval(cfg, ref_cfg, model, dataset, out_dir, checkpoint=info,

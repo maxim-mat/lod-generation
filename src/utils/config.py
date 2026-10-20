@@ -418,6 +418,9 @@ class PosthocEvalConfig:
     batch_size: int = 8
     seed: int = 1234
     device: str = "auto"
+    # Image-conditioned checkpoints only (ignored otherwise):
+    # "true" | "shuffled" (another building's image) | "none" (null token).
+    image_mode: str = "true"
     # None -> <save_dir>/<experiment_name>/<run_name>/posthoc_eval
     output_dir: Optional[str] = None
     strategies: List[StrategyConfig] = field(default_factory=_default_strategies)
