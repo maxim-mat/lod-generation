@@ -139,3 +139,73 @@ def test_best_matches_skips_volume_when_none_ok():
 def test_best_matches_ignores_a_not_ok_volume_winner():
     best = best_matches(_cands(vol_ok=(True, False, True))).set_index("criterion")
     assert best.loc["volume", "cand_id"] == "alike"
+
+
+# ---------------------------------------------------------------- Task 3: run + CLI
+
+class _Stub:
+    """30 boxes 100 m apart on a 6 x 5 lattice, in 6 files; the attributes the precompute reads."""
+
+    def __init__(self):
+        n = 30
+        self.ids = [f"b{i}" for i in range(n)]
+        self.files = [f"Source B/t{i // 5}.city.json" for i in range(n)]
+        origins = [(100.0 * (i % 6), 100.0 * (i // 6)) for i in range(n)]
+        self.pairs = [(box(x, y), box(x, y, h=4 + i % 5)) for i, (x, y) in enumerate(origins)]
+        self.xy = np.array([(x + 5, y + 5) for x, y in origins])
+
+    def __len__(self):
+        return len(self.ids)
+
+
+COLUMNS = ["split", "test_id", "test_tile", "cand_id", "cand_tile", "rank", "distance_m",
+           "symdiff_m3", "rel_symdiff", "vol_ok", "chamfer_m", "test_faces", "cand_faces"]
+
+
+def test_candidate_table_scores_each_unique_pair_once(monkeypatch):
+    calls = []
+    real = sp.pair_metrics
+    monkeypatch.setattr(sp, "pair_metrics", lambda a, b, n: calls.append(1) or real(a, b, n))
+    df = sp.candidate_table(_Stub(), ["tile", "tile-buffer50m"], n_sample=1000, k=4,
+                            n_points=64, seed=42, ratios=(0.6, 0.2, 0.2))
+    unique = len(set(zip(df["test_id"], df["cand_id"])))
+    assert len(calls) == unique < len(df)
+
+
+def test_candidate_table_columns_and_ranks():
+    df = sp.candidate_table(_Stub(), ["random"], n_sample=3, k=4, n_points=64, seed=42,
+                            ratios=(0.6, 0.2, 0.2))
+    assert list(df.columns) == COLUMNS
+    assert df["test_id"].nunique() == 3
+    for _, g in df.groupby("test_id"):
+        assert g["rank"].tolist() == [0, 1, 2, 3]
+        assert g["distance_m"].is_monotonic_increasing
+    assert (df["test_faces"] == 12).all()
+
+
+def test_main_writes_outputs(tmp_path, monkeypatch):
+    monkeypatch.setattr(sp, "load_dataset", lambda cfg: _Stub())
+    out = tmp_path / "pairs"
+    sp.main(["--out", str(out), "--n-sample", "2", "--k", "3", "--n-points", "64",
+             "--workers", "1", "--splits", "random", "tile"])
+    cands = pd.read_csv(out / "candidates.csv")
+    pairs = pd.read_csv(out / "pairs.csv")
+    assert list(cands.columns) == COLUMNS
+    assert set(pairs["criterion"]) == {"distance", "volume", "chamfer"}
+    run = json.loads((out / "run.json").read_text(encoding="utf-8"))
+    assert {"git_commit", "k", "n_points", "n_sample", "seed", "splits", "counts",
+            "data"} <= set(run)
+    assert run["splits"]["tile"] == ["tile", None, 0.0]
+
+
+def test_candidate_table_keeps_its_columns_when_a_split_has_no_test_buildings():
+    df = sp.candidate_table(_Stub(), ["random"], n_sample=5, k=3, n_points=64, seed=42,
+                            ratios=(1.0, 0.0, 0.0))
+    assert df.empty and list(df.columns) == COLUMNS
+
+
+def test_worker_pool_gives_the_same_table_as_inline():
+    kw = dict(n_sample=3, k=3, n_points=64, seed=42, ratios=(0.6, 0.2, 0.2))
+    one = sp.candidate_table(_Stub(), ["random"], workers=1, **kw)
+    two = sp.candidate_table(_Stub(), ["random"], workers=2, **kw)
+    pd.testing.assert_frame_equal(one, two)
