@@ -52,6 +52,10 @@ from src.models.embeddings import SinusoidalPositionEmbedding
 
 logger = logging.getLogger(__name__)
 
+# Parameter-name prefixes (relative to `MeshOPTTransformer`) of the image path,
+# the only keys an image-free checkpoint may lack and the only ones stage A trains.
+IMAGE_PARAM_PREFIXES = ("image_encoder.", "xattn.", "image_segment")
+
 POS_EMBEDS = ("learned", "sinusoidal")
 
 
@@ -886,7 +890,10 @@ class MeshTransformerModule(L.LightningModule):
                  vqvae=None, backbone="scratch", opt_name="facebook/opt-350m",
                  opt_pretrained=True, opt_config=None,
                  tokenization="coord", mask_invalid=False, pos_embed="learned",
-                 opt_max_positions=None, tf_chamfer=False, data_split="random"):
+                 opt_max_positions=None, tf_chamfer=False, data_split="random",
+                 image_encoder=None, image_encoder_config=None, image_fusion="xattn",
+                 image_size=256, image_margin=0.1, image_dropout=0.1,
+                 train_scope="all", backbone_lr_scale=1.0):
         """
         Args:
             num_bins (int): coordinate discretization used by the tokenizer.
@@ -910,13 +917,26 @@ class MeshTransformerModule(L.LightningModule):
                 model trains on (`training.split`). Recorded only, so a
                 checkpoint can be refused as an init for a run on another
                 scheme, whose val/test buildings it has seen.
+            image_encoder (str, optional): Hugging Face DINOv3 id. Given one, the
+                model conditions on the orthophoto crop (`batch["image"]`).
+            image_encoder_config (DINOv3ViTConfig, optional): test hook instead
+                of `image_encoder`; not saved as a hyperparameter.
+            image_fusion (str): 'xattn' (gated cross-attention) | 'prefix'.
+            image_size, image_margin: crop side in pixels and its margin beyond
+                the unit box; must match the dataset's.
+            image_dropout (float): training-time probability of replacing a
+                building's image by the null token.
+            train_scope (str): 'all' | 'image_only' (stage A: only the image
+                path trains).
+            backbone_lr_scale (float): lr multiplier for everything outside the
+                image path of an image-conditioned model.
         """
         super().__init__()
         # The tokenizer is a module, not a hyperparameter: pickling it into the
         # checkpoint would store a second copy of stage 1 in every stage-2 file.
         # `opt_config` likewise -- it is a test hook, and a checkpoint that
         # carried one would rebuild the tiny stand-in instead of the real model.
-        self.save_hyperparameters(ignore=["vqvae", "opt_config"])
+        self.save_hyperparameters(ignore=["vqvae", "opt_config", "image_encoder_config"])
 
         self.num_bins = num_bins
         self.lr = lr
@@ -945,6 +965,20 @@ class MeshTransformerModule(L.LightningModule):
         self.mask_invalid = mask_invalid
         self.tf_chamfer = tf_chamfer
         _check_pos_embed(pos_embed)
+
+        self.uses_image = image_encoder is not None or image_encoder_config is not None
+        self.image_dropout = float(image_dropout)
+        self.backbone_lr_scale = float(backbone_lr_scale)
+        if self.uses_image and backbone != "opt":
+            raise ValueError("Image conditioning needs backbone='opt' (cross-attention hooks "
+                             "and prefix segments are implemented for OPT only).")
+        if train_scope not in ("all", "image_only"):
+            raise ValueError(f"Unknown train_scope {train_scope!r}; expected 'all' or 'image_only'.")
+        if train_scope == "image_only" and not self.uses_image:
+            raise ValueError("train_scope='image_only' needs an image encoder.")
+        image = None if not self.uses_image else {
+            "fusion": image_fusion, "name": image_encoder, "config": image_encoder_config,
+            "image_size": image_size, "beta": image_margin}
 
         self.vqvae = vqvae
         if vqvae is None:
@@ -993,10 +1027,19 @@ class MeshTransformerModule(L.LightningModule):
                 # default. Ignored on the pretrained path, which checks against
                 # its trained rows rather than resizing them.
                 opt_max_positions=opt_max_positions,
+                image=image,
             )
         else:
             raise ValueError(f"Unknown backbone: {backbone!r}. Expected "
                              "'scratch' or 'opt'.")
+
+        if train_scope == "image_only":
+            # Stage A (Flamingo arXiv:2204.14198, LLaVA arXiv:2304.08485): the
+            # image-free model stays frozen and only the new image path learns.
+            # The DINOv3 backbone stays frozen in either scope.
+            for name, p in self.network.named_parameters():
+                p.requires_grad_(name.startswith(IMAGE_PARAM_PREFIXES)
+                                 and not name.startswith("image_encoder.backbone."))
 
     def train(self, mode=True):
         """Keep the frozen tokenizer in eval, whatever Lightning does.
@@ -1149,7 +1192,9 @@ class MeshTransformerModule(L.LightningModule):
         tokenizer.
         """
         cond, tgt, cond_pad_mask, tgt_pad_mask = self._prepare(batch)
-        logits = self.network(cond, tgt, cond_pad_mask, tgt_pad_mask)
+        ctx = self._image_ctx(batch.get("image"), batch.get("image_valid"))
+        img = {} if ctx is None else {"image_ctx": ctx}
+        logits = self.network(cond, tgt, cond_pad_mask, tgt_pad_mask, **img)
 
         targets = tgt[:, 1:]
         pad_mask = tgt_pad_mask
@@ -1163,6 +1208,25 @@ class MeshTransformerModule(L.LightningModule):
             ignore_index=self.pad,
         )
         return loss, logits, targets, (cond, cond_pad_mask)
+
+    def _image_ctx(self, image, valid):
+        """Encode the batch's crops; None for an image-free model.
+
+        Training-time image dropout swaps whole buildings to the null token, so
+        the model keeps working without imagery (and `image_mode: none` in the
+        post-hoc eval measures something the model was trained for).
+        """
+        if not self.uses_image:
+            return None
+        if image is None:
+            raise ValueError("This model is image-conditioned but the batch has no 'image'; "
+                             "set mesh_data.ortho_dir.")
+        if valid is None:
+            valid = torch.ones(image.shape[0], dtype=torch.bool, device=image.device)
+        if self.training and self.image_dropout > 0:
+            keep = torch.rand(valid.shape, device=valid.device) >= self.image_dropout
+            valid = valid & keep
+        return self.network.encode_image(image, valid)
 
     def _token_metrics(self, logits, targets, scale=None):
         """Teacher-forced token statistics. Pure tensor ops -- no host sync.
@@ -1328,6 +1392,13 @@ class MeshTransformerModule(L.LightningModule):
         if self.tf_chamfer and trainer is not None:
             self._log_tf_chamfer(logits, targets, batch, "train", batch_idx,
                                  trainer.log_every_n_steps, condition)
+        if self.uses_image and self.network.image_fusion == "xattn":
+            # Zero at step 0 of stage A; how far they open is how much the
+            # image is used.
+            gates = torch.tanh(self.network.xattn.gates.detach())
+            self.log("train_gate_abs_mean", gates.abs().mean(), on_step=True, on_epoch=False)
+            for i, g in enumerate(gates):
+                self.log(f"train_gate_{i}", g, on_step=True, on_epoch=False)
         return loss
 
     def _eval_step(self, batch, prefix, batch_idx=0):
@@ -1358,10 +1429,12 @@ class MeshTransformerModule(L.LightningModule):
         `requires_grad`, not `self.parameters()`: a frozen VQ-VAE handed to
         AdamW would still accumulate optimizer state for every codebook entry.
 
+        An image-conditioned model splits each group once more: the image
+        path at `lr`, everything else at `lr * backbone_lr_scale` (stage B).
+
         Returns:
-            list: AdamW param groups. The undecayed group is omitted when it is
-            empty, and the decayed one when `weight_decay` is 0, so the
-            optimizer never receives a group with no parameters.
+            list: AdamW param groups, each with its own ``lr``. Empty groups are
+            omitted, so the optimizer never receives a group with no parameters.
         """
         no_decay_ids = set()
         for mod in self.modules():
@@ -1369,8 +1442,9 @@ class MeshTransformerModule(L.LightningModule):
                                 nn.BatchNorm1d, nn.BatchNorm2d)):
                 no_decay_ids |= {id(p) for p in mod.parameters(recurse=False)}
 
-        decay, no_decay, seen = [], [], set()
-        for p in self.parameters():
+        image_prefixes = tuple("network." + p for p in IMAGE_PARAM_PREFIXES)
+        buckets, seen = {}, set()                     # (is_image, decays) -> [params]
+        for name, p in self.named_parameters():
             # Dedup by identity: a tied weight appears under two names, and a
             # parameter handed to AdamW twice is stepped twice.
             if not p.requires_grad or id(p) in seen:
@@ -1378,13 +1452,16 @@ class MeshTransformerModule(L.LightningModule):
             seen.add(id(p))
             # dim() < 2 catches every bias and every norm gain, including those
             # belonging to module types not listed above.
-            (no_decay if id(p) in no_decay_ids or p.dim() < 2 else decay).append(p)
+            decays = not (id(p) in no_decay_ids or p.dim() < 2)
+            is_image = self.uses_image and name.startswith(image_prefixes)
+            buckets.setdefault((is_image, decays), []).append(p)
 
         groups = []
-        if decay:
-            groups.append({"params": decay, "weight_decay": float(self.weight_decay)})
-        if no_decay:
-            groups.append({"params": no_decay, "weight_decay": 0.0})
+        for (is_image, decays), params in sorted(
+                buckets.items(), key=lambda kv: (not kv[0][0], not kv[0][1])):
+            lr = self.lr if (is_image or not self.uses_image) else self.lr * self.backbone_lr_scale
+            groups.append({"params": params, "lr": lr,
+                           "weight_decay": float(self.weight_decay) if decays else 0.0})
         return groups
 
     def configure_optimizers(self):
@@ -1445,7 +1522,42 @@ class MeshTransformerModule(L.LightningModule):
         return {"optimizer": optimizer,
                 "lr_scheduler": {"scheduler": scheduler, "interval": "step"}}
 
-    def _step_logits(self, cond, tgt, cond_pad_mask, cache=None):
+    def load_weights_from(self, path):
+        """Initialise from another run's weights (not a Lightning resume).
+
+        Architecture hyperparameters must match; the only keys allowed to be
+        missing are the image path's, which an image-free checkpoint lacks.
+
+        Raises:
+            ValueError: a mismatched architecture or tokenization, a checkpoint
+                from another split scheme (Task 2a: it has trained on this
+                run's val/test buildings), or any non-image key missing or
+                unexpected.
+
+        Returns:
+            list[str]: the missing (newly initialised) keys.
+        """
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        theirs = ckpt.get("hyper_parameters", {})
+        for key in ("backbone", "tokenization", "num_bins", "pos_embed", "opt_name"):
+            if key in theirs and theirs[key] != self.hparams.get(key):
+                raise ValueError(f"{path}: {key}={theirs[key]!r} but this model has "
+                                 f"{self.hparams.get(key)!r}.")
+        # Checkpoints older than the key were all trained on the random split.
+        if theirs.get("data_split", "random") != self.hparams.get("data_split", "random"):
+            raise ValueError(f"{path} was trained on the {theirs.get('data_split', 'random')!r} "
+                             f"split; this run uses {self.hparams.get('data_split')!r}. Its "
+                             "weights have seen this run's val/test buildings.")
+        missing, unexpected = self.load_state_dict(ckpt["state_dict"], strict=False)
+        stray = [k for k in missing if not k.startswith(
+            tuple("network." + p for p in IMAGE_PARAM_PREFIXES))]
+        if unexpected or stray:
+            raise ValueError(f"{path} does not fit this model: unexpected {unexpected[:5]}, "
+                             f"missing non-image {stray[:5]}.")
+        logger.info("Initialised from %s; %d image keys are new.", path, len(missing))
+        return missing
+
+    def _step_logits(self, cond, tgt, cond_pad_mask, cache=None, image_ctx=None):
         """Next-token logits for each row of `tgt`, with invalid ones masked.
 
         Shared by greedy and beam search so the two cannot drift apart on the
@@ -1460,8 +1572,9 @@ class MeshTransformerModule(L.LightningModule):
             # convention -- it embeds `tgt` entire, and [:, -1] is then the
             # prediction after its last real token.
             step = torch.cat([tgt, torch.full_like(tgt[:, :1], self.pad)], dim=1)
+            img = {} if image_ctx is None else {"image_ctx": image_ctx}
             logits = self.network(cond, step, cond_pad_mask,
-                                  torch.zeros_like(step, dtype=torch.bool))[:, -1]
+                                  torch.zeros_like(step, dtype=torch.bool), **img)[:, -1]
         if self.mask_invalid and self.vqvae is None:
             bad = invalid_logits_mask(tgt, logits.shape[-1], self.num_bins,
                                       tokenization=self.tokenization,
@@ -1471,7 +1584,7 @@ class MeshTransformerModule(L.LightningModule):
 
     @torch.no_grad()
     def _beam_search(self, cond, cond_pad_mask, max_new_tokens, beam_size,
-                     length_penalty, use_cache=True):
+                     length_penalty, use_cache=True, image_ctx=None):
         """Deterministic search for the highest-scoring sequence, not the
         highest-scoring next token.
 
@@ -1503,10 +1616,14 @@ class MeshTransformerModule(L.LightningModule):
         scores[:, 0] = 0.0
         scores = scores.view(-1)
         done = torch.zeros(n * beam_size, dtype=torch.bool, device=device)
-        cache = self.network.new_cache(cond, cond_pad_mask) if use_cache else None
+        if image_ctx is not None:
+            image_ctx = image_ctx.repeat(beam_size)
+        img = {} if image_ctx is None else {"image_ctx": image_ctx}
+        cache = self.network.new_cache(cond, cond_pad_mask, **img) if use_cache else None
 
         for _ in range(max_new_tokens):
-            logits = self._step_logits(cond, tgt, cond_pad_mask, cache)
+            logits = self._step_logits(cond, tgt, cond_pad_mask, cache,
+                                       **({} if cache is not None else img))
             vocab = logits.shape[-1]
             logp = torch.log_softmax(logits.float(), dim=-1)
 
@@ -1527,6 +1644,11 @@ class MeshTransformerModule(L.LightningModule):
             tgt = torch.cat([tgt[order], token.view(-1, 1)], dim=1)
             if cache is not None:
                 cache = self.network.reorder_cache(cache, order)
+            elif image_ctx is not None:
+                # Uncached beams reorder through `tgt[order]` only; the image
+                # must follow its beam (the cache path does it in reorder_cache).
+                image_ctx = image_ctx.select(order)
+                img = {"image_ctx": image_ctx}
             done = done[order] | (token.view(-1) == eos)
             scores = top.reshape(-1)
             if bool(done.all()):
@@ -1541,7 +1663,8 @@ class MeshTransformerModule(L.LightningModule):
     @torch.no_grad()
     def generate(self, cond, cond_pad_mask=None, max_new_tokens=None,
                  temperature=1.0, beam_size=1, length_penalty=1.0,
-                 use_cache=True, top_p=None, min_p=None, seeds=None):
+                 use_cache=True, top_p=None, min_p=None, seeds=None,
+                 image=None, image_valid=None):
         """Decode an LOD2 token sequence from LOD1 tokens.
 
         Args:
@@ -1571,6 +1694,10 @@ class MeshTransformerModule(L.LightningModule):
                 generator, so its tokens do not depend on its batch neighbours.
                 Ignored by greedy and beam decoding. None samples from the
                 global RNG exactly as before these arguments existed.
+            image: ``uint8 [B, 3, S, S]`` mesh-order crops; required by an
+                image-conditioned model, ignored otherwise.
+            image_valid: [B] bool; False rows get the null token (no imagery,
+                or the post-hoc `image_mode: none` control).
 
         Returns:
             Tensor: [B, L] generated tokens, BOS-led, EOS-terminated where the
@@ -1598,7 +1725,11 @@ class MeshTransformerModule(L.LightningModule):
         if seeds is not None and len(seeds) != cond.shape[0]:
             raise ValueError(f"seeds has {len(seeds)} entries for a batch of "
                              f"{cond.shape[0]} rows; pass one seed per row.")
-        budget = self.network.generation_budget(cond.shape[1])
+        ctx = self._image_ctx(image, image_valid) if self.uses_image else None
+        img = {} if ctx is None else {"image_ctx": ctx}
+        n_prefix = ctx.tokens.shape[1] if (ctx is not None and
+                                           self.network.image_fusion == "prefix") else 0
+        budget = self.network.generation_budget(cond.shape[1] + n_prefix)
         if budget < 1:
             raise ValueError(
                 f"A condition of {cond.shape[1]} tokens leaves no room to "
@@ -1614,17 +1745,18 @@ class MeshTransformerModule(L.LightningModule):
             max_new_tokens = budget
         if beam_size > 1:
             return self._beam_search(cond, cond_pad_mask, max_new_tokens,
-                                     beam_size, length_penalty, use_cache)
+                                     beam_size, length_penalty, use_cache, **img)
         tgt = torch.full((cond.shape[0], 1), bos, dtype=torch.long, device=cond.device)
         done = torch.zeros(cond.shape[0], dtype=torch.bool, device=cond.device)
-        cache = self.network.new_cache(cond, cond_pad_mask) if use_cache else None
+        cache = self.network.new_cache(cond, cond_pad_mask, **img) if use_cache else None
         generators = None
         if seeds is not None and temperature > 0:
             generators = [torch.Generator(device=cond.device).manual_seed(int(s))
                           for s in seeds]
 
         for _ in range(max_new_tokens):
-            logits = self._step_logits(cond, tgt, cond_pad_mask, cache)
+            logits = self._step_logits(cond, tgt, cond_pad_mask, cache,
+                                       **({} if cache is not None else img))
 
             if temperature <= 0:
                 nxt = logits.argmax(dim=-1)
