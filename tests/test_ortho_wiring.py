@@ -53,3 +53,11 @@ def test_inference_refuses_image_models():
     cfg.mesh_model.image_encoder = "facebook/dinov3-vitl16-pretrain-lvd1689m"
     with pytest.raises(ValueError, match="orthophoto"):
         _check_config(cfg)
+
+
+@pytest.mark.parametrize("name", ["xattn-a", "xattn-b", "prefix", "smoke"])
+def test_shipped_v6_configs_load(name):
+    from src.utils.initialization import load_config
+    cfg = load_config(Path(f"configs/mesh-v6-ortho-{name}.yaml"), [])
+    assert cfg.mesh_model.image_encoder and cfg.mesh_data.ortho_dir == "ortho"
+    assert cfg.training.split == "tile"

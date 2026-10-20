@@ -1,0 +1,166 @@
+# V6 control arm: the same image tokens as a prefix segment instead of
+# cross-attention (LLaVA arXiv:2304.08485; Idefics2 arXiv:2405.02246 finds
+# prefix wins once the backbone trains). Initialised from v5-tile like stage A.
+# Usage: python main.py --train --config configs/mesh-v6-ortho-prefix.yaml
+#
+# Same as stage A except: image_fusion prefix, train_scope all,
+# backbone_lr_scale 0.1, 10 epochs. Unlike cross-attention there is no zero
+# gate, so step 0 is NOT v5: the prefix shifts OPT's positions.
+
+mode: train
+config_set: mesh
+seed: 42
+
+mesh_data:
+  dataset_dir: data/The Hague/cleaner
+  lod_in: LOD1
+  lod_out: LOD2
+  num_bins: 128
+  margin_lo: [0.0, 0.0, 0.0]
+  margin_hi: [0.0, 0.0, 0.1]
+  # Unchanged from v3 so the corpus filter is the same one; on mini_cleaner 200
+  # kept 97.8% of pairs.
+  max_faces: 200
+  max_files: null
+  tokenization: coord
+  # LOWER than v3's 10, on purpose. `MeshDataset` holds every parsed mesh in
+  # RAM (~1.5-2 GB for 258,923 pairs), and on Windows each dataloader worker is
+  # a spawned process that receives its own pickled copy. At 10 workers that is
+  # 15-20 GB of duplicated dataset before a single batch exists. Raise it only
+  # after watching resident memory on a short run.
+  num_workers: 4
+  persistent_workers: true
+  # Orthophoto crops in the mesh frame (`MeshDataset(ortho_dir=...)`), relative
+  # to dataset_dir. Buildings without full coverage are dropped AFTER the split
+  # (Task 2), so every kept building stays in its baseline split.
+  ortho_dir: ortho
+  image_size: 256
+  image_margin: 0.1
+  image_min_coverage: 1.0
+
+mesh_model:
+  backbone: opt
+  opt_name: facebook/opt-125m
+  # Architecture-only, as the released MeshAnything inference does
+  # (`from_config`, random weights). d_model / n_head / num_layers / max_seq_len
+  # are read from the OPT config on this path and ignored here.
+  opt_pretrained: false
+  dropout: 0.1
+  pos_embed: sinusoidal
+  n_max_triangles: null
+  cond_max_triangles: null
+  max_seq_len: null
+  tokenizer: coord
+  vqvae_ckpt: null
+  mask_invalid: true
+  # DINOv3 ViT-L/16, web weights (gated: `huggingface-cli login` and accept the
+  # licence first). The sat493m variant is the planned ablation.
+  image_encoder: facebook/dinov3-vitl16-pretrain-lvd1689m
+  image_fusion: prefix
+  image_dropout: 0.1
+  # Prefix tokens need OPT to learn to read them, so OPT trains (at 0.1x).
+  train_scope: all
+  backbone_lr_scale: 0.1
+  # v5 retrained on the tile split (Task 9). The random-split v5 checkpoint is
+  # refused by load_weights_from: it has seen this run's val/test tiles.
+  init_from: outputs/initial-runs/mesh-v5-full-opt-coord-tile/checkpoints/best.ckpt   # replace with the real best path
+
+training:
+  batch_size: 4
+  accumulate_grad_batches: 4   # effective batch 16, matching v3
+  train_val_test_split: [0.8, 0.1, 0.1]
+  # Geographic split (Task 2a): whole 3DBAG tiles per split, so val/test
+  # buildings have no training neighbours next door. PROVISIONAL: if the
+  # block-size sweep (outputs/split_sweep) picks a grid split, set
+  # `split: grid` with split_block_m / split_buffer_m here AND in the baseline,
+  # and retrain the baseline on it -- load_weights_from refuses a mismatch.
+  split: tile
+  # New parameters only; Flamingo-scale, not v5's from-scratch 1e-3.
+  lr: 1.0e-4
+  # Applied to WEIGHT MATRICES ONLY -- embeddings, LayerNorm gains and biases
+  # go in a second, undecayed param group (99.4% of the scratch model and 99.6%
+  # of the OPT one is decayed). 0.01 is AdamW's own default, so this value is
+  # what every run so far actually used; what changes is that the 0.6% that
+  # should never have been decayed no longer is.
+  #
+  # Worth being explicit about here rather than inheriting: decoupled decay is
+  # applied every step independently of the gradient, so its strength scales
+  # with lr x steps. At the v3 arms' flat 5e-5 over 94k steps it was a 5% pull;
+  # at 1e-3 with cosine over 30 epochs of this corpus it is ~7x.
+  weight_decay: 0.01
+  # Step interval, as in v5.
+  warmup_steps: 1000
+  # Cosine from the peak down to eta_min = 0.01 * lr, with T_max taken from
+  # Lightning's `estimated_stepping_batches`. That means MAX_EPOCHS SETS THE
+  # ANNEALING HORIZON: it is the real budget, not a safety ceiling, and
+  # shortening it makes the schedule steeper rather than just stopping earlier.
+  lr_scheduler: cosine
+  lr_decay_steps: 50           # step-schedule knobs, unused under cosine
+  lr_decay_rate: 0.5
+  # ~65k optimizer steps on cleaner; the gates show within an epoch. Under
+  # cosine this is also the annealing horizon.
+  max_epochs: 10
+  gradient_clip_val: 1.0
+  # val_gen_chamfer_m: surface error in metres of a FREE-RUNNING generation,
+  # scored against the ground truth through the same tokenizer. Lower is better,
+  # so mode: min.
+  #
+  # NOT val_token_acc, which the v3 runs showed ranks tokenizations in the
+  # opposite order to geometry. NOT val_tf_chamfer_m either: that one is
+  # teacher-forced, so it measures the metric size of a typical token error
+  # rather than what the model produces on its own.
+  #
+  # This metric only exists on epochs where MeshEvalCallback runs, and
+  # `EarlyStopping` is built with Lightning's default strict=True -- a missing
+  # monitor raises rather than being skipped. Hence mesh_eval.every_n_epochs: 1
+  # below. The two settings are coupled; changing one without the other kills
+  # the run on its first validation epoch.
+  early_stopping:
+    enabled: true
+    monitor: val_gen_chamfer_m
+    patience: 2
+    mode: min
+  checkpoint:
+    enabled: true
+    monitor: val_gen_chamfer_m
+    mode: min
+    save_top_k: 3
+    filename: "{epoch:02d}-{val_gen_chamfer_m:.4f}"
+
+trainer:
+  accelerator: auto
+  devices: 1
+  precision: "32"
+  log_every_n_steps: 50
+
+logging:
+  loggers:
+    - wandb
+  project_name: lod-generation
+  experiment_name: initial-runs
+  run_name: mesh-v6-ortho-prefix
+  save_dir: outputs
+  wandb_entity: maxim-lod
+  wandb_offline: false
+  log_model: false
+
+mesh_eval:
+  enabled: true
+  # EVERY epoch, because early stopping and checkpointing read this callback's
+  # `val_gen_chamfer_m`. At ~13k optimizer steps per epoch the cost of 32
+  # beam-5 generations is negligible against the epoch itself.
+  every_n_epochs: 1
+  # 32, not v3's 8. This is now the selection metric, and a mean over 8
+  # buildings is noisy enough that early stopping would fire on the sample
+  # rather than on the model.
+  n_val: 32
+  n_test: 64
+  batch_size: 8
+  n_points: 4096
+  taus: [0.25, 0.5]
+  voxel_m: 0.25
+  save_samples: 8
+  beam_size: 5
+  length_penalty: 1.0
+
+resume_from: null
