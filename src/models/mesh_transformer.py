@@ -657,7 +657,7 @@ class MeshOPTTransformer(MeshEmbedding):
                  cond_dim=None, codebook=None, tokens_per_face=None,
                  dropout=None, opt_config=None,
                  tokenization="coord", num_bins=None, pos_embed="learned",
-                 max_seq_len=None, opt_max_positions=None):
+                 max_seq_len=None, opt_max_positions=None, image=None):
         import copy
 
         from transformers import AutoConfig, OPTConfig, OPTForCausalLM
@@ -725,6 +725,41 @@ class MeshOPTTransformer(MeshEmbedding):
             decoder = self.opt.model.decoder
             decoder.embed_positions = OPTSinusoidalPositions(cfg.hidden_size)
 
+        self.image_fusion = None if image is None else image["fusion"]
+        if image is not None:
+            from src.models.ortho_encoder import OrthoImageEncoder
+            from src.models.ortho_fusion import GatedCrossAttention
+
+            if self.image_fusion not in ("xattn", "prefix"):
+                raise ValueError(f"Unknown image fusion {self.image_fusion!r}; "
+                                 "expected 'xattn' or 'prefix'.")
+            width = cfg.hidden_size if self.image_fusion == "xattn" else cfg.word_embed_proj_dim
+            self.image_encoder = OrthoImageEncoder(
+                width, name=image.get("name"), config=image.get("config"),
+                image_size=image["image_size"], beta=image["beta"])
+            if self.image_fusion == "xattn":
+                self.xattn = GatedCrossAttention(self.opt.model.decoder.layers,
+                                                 cfg.hidden_size, cfg.num_attention_heads)
+            else:
+                # Its own vector rather than a third `segment_embed` row, so the
+                # v5 table keeps its shape and loads unchanged.
+                self.image_segment = nn.Parameter(torch.zeros(cfg.word_embed_proj_dim))
+
+    def encode_image(self, image, valid=None):
+        """``uint8 [B, 3, S, S]`` mesh-order crops -> an `ImageContext`; `valid`
+        False rows get the null token."""
+        from src.models.ortho_fusion import ImageContext
+        return ImageContext(self.image_encoder(image, valid))
+
+    def _image_prefix(self, ctx):
+        return ctx.tokens + self.image_segment
+
+    def _attending(self, ctx):
+        import contextlib
+        if self.image_fusion == "xattn" and ctx is not None:
+            return self.xattn.attending(ctx)
+        return contextlib.nullcontext()
+
     def generation_budget(self, n_cond):
         """Most new target tokens sampleable after a condition of `n_cond`.
 
@@ -741,7 +776,7 @@ class MeshOPTTransformer(MeshEmbedding):
             return self.max_seq_len - 1
         return self.max_seq_len - n_cond
 
-    def new_cache(self, cond, cond_pad_mask=None):
+    def new_cache(self, cond, cond_pad_mask=None, image_ctx=None):
         """Prime OPT's own `DynamicCache` with the condition.
 
         Nothing hand-rolled here: `use_cache=True` is the path the library
@@ -749,13 +784,21 @@ class MeshOPTTransformer(MeshEmbedding):
         each step, because OPT derives its position ids from a cumsum over it --
         so the mask is what keeps a padded condition from shifting the target,
         exactly as in the uncached path.
+
+        With images, prefix tokens are prepended to the mask; cross-attention
+        keeps its own per-layer K/V on the cache's `ImageContext`.
         """
         from transformers import DynamicCache
 
         attn = (torch.ones(cond.shape[:2], dtype=torch.long, device=cond.device)
                 if cond_pad_mask is None else (~cond_pad_mask).long())
+        n_img = 0
+        if image_ctx is not None and self.image_fusion == "prefix":
+            n_img = image_ctx.tokens.shape[1]
+            attn = torch.cat([attn.new_ones(attn.shape[0], n_img), attn], dim=1)
         return {"past": DynamicCache(), "attn": attn, "n_cond": cond.shape[1],
-                "n_tgt": 0, "cond": cond}
+                "n_tgt": 0, "cond": cond, "n_img": n_img,
+                "image": None if image_ctx is None else image_ctx.caching()}
 
     def cached_logits(self, cache, tgt):
         """Next-token logits after appending whatever of `tgt` is not cached yet."""
@@ -767,23 +810,23 @@ class MeshOPTTransformer(MeshEmbedding):
         new = embedded[:, cache["n_tgt"]:]
         if cache["n_tgt"] == 0:
             # First call also carries the condition, which has segment 0.
-            new = torch.cat([self.embed_cond(cache["cond"]), new], dim=1)
-            seg = torch.cat([torch.zeros(cache["n_cond"], dtype=torch.long,
-                                         device=device),
-                             torch.ones(tgt.shape[1], dtype=torch.long,
-                                        device=device)])
+            seg = torch.cat([torch.zeros(cache["n_cond"], dtype=torch.long, device=device),
+                             torch.ones(tgt.shape[1], dtype=torch.long, device=device)])
+            x = torch.cat([self.embed_cond(cache["cond"]), new], dim=1) + self.segment_embed(seg)
+            if cache.get("n_img"):
+                x = torch.cat([self._image_prefix(cache["image"]), x], dim=1)
+            cache["attn"] = torch.cat(
+                [cache["attn"], torch.ones(tgt.shape[0], tgt.shape[1], dtype=torch.long,
+                                           device=device)], dim=1)
         else:
-            seg = torch.ones(new.shape[1], dtype=torch.long, device=device)
+            x = new + self.segment_embed(torch.ones(new.shape[1], dtype=torch.long,
+                                                    device=device))
             cache["attn"] = torch.cat(
-                [cache["attn"], torch.ones(tgt.shape[0], new.shape[1],
-                                           dtype=torch.long, device=device)], dim=1)
-        if cache["n_tgt"] == 0:
-            cache["attn"] = torch.cat(
-                [cache["attn"], torch.ones(tgt.shape[0], tgt.shape[1],
-                                           dtype=torch.long, device=device)], dim=1)
-        x = new + self.segment_embed(seg)
-        out = self.opt(inputs_embeds=x, attention_mask=cache["attn"],
-                       past_key_values=cache["past"], use_cache=True)
+                [cache["attn"], torch.ones(tgt.shape[0], new.shape[1], dtype=torch.long,
+                                           device=device)], dim=1)
+        with self._attending(cache.get("image")):
+            out = self.opt(inputs_embeds=x, attention_mask=cache["attn"],
+                           past_key_values=cache["past"], use_cache=True)
         cache["past"] = out.past_key_values
         cache["n_tgt"] = tgt.shape[1]
         return out.logits[:, -1]
@@ -792,13 +835,19 @@ class MeshOPTTransformer(MeshEmbedding):
     def reorder_cache(cache, order):
         cache["past"].batch_select_indices(order)
         return {**cache, "attn": cache["attn"][order],
-                "cond": cache["cond"][order]}
+                "cond": cache["cond"][order],
+                "image": None if cache.get("image") is None else cache["image"].select(order)}
 
-    def forward(self, cond, tgt, cond_pad_mask=None, tgt_pad_mask=None):
+    def forward(self, cond, tgt, cond_pad_mask=None, tgt_pad_mask=None, image_ctx=None):
         """Next-token logits for the target sequence. Same contract as
-        `MeshTransformer.forward`, so nothing downstream can tell them apart."""
+        `MeshTransformer.forward`, so nothing downstream can tell them apart.
+
+        `image_ctx` (an `ImageContext`) conditions on the orthophoto: prepended
+        as prefix tokens, or attended to through the gated cross-attention."""
         n_cond, n_tgt = cond.shape[1], tgt.shape[1]
-        length = n_cond + n_tgt - 1
+        n_img = (image_ctx.tokens.shape[1]
+                 if self.image_fusion == "prefix" and image_ctx is not None else 0)
+        length = n_img + n_cond + n_tgt - 1
         if self.bounded_positions and length > self.max_seq_len:
             raise ValueError(
                 f"Condition ({n_cond}) plus target ({n_tgt - 1}) is {length}, past "
@@ -809,7 +858,7 @@ class MeshOPTTransformer(MeshEmbedding):
             )
 
         x = torch.cat([self.embed_cond(cond), self.embed_tokens(tgt[:, :-1])], dim=1)
-        segment = (torch.arange(length, device=x.device) >= n_cond).long()
+        segment = (torch.arange(length - n_img, device=x.device) >= n_cond).long()
         x = x + self.segment_embed(segment)
 
         # 1 at real tokens: HF's convention is the opposite of torch's
@@ -818,9 +867,13 @@ class MeshOPTTransformer(MeshEmbedding):
             attn = (~torch.cat([cond_pad_mask, tgt_pad_mask[:, :-1]], dim=1)).long()
         else:
             attn = torch.ones(x.shape[:2], dtype=torch.long, device=x.device)
+        if n_img:
+            x = torch.cat([self._image_prefix(image_ctx), x], dim=1)
+            attn = torch.cat([attn.new_ones(attn.shape[0], n_img), attn], dim=1)
 
-        out = self.opt(inputs_embeds=x, attention_mask=attn)
-        return out.logits[:, n_cond:]
+        with self._attending(image_ctx):
+            out = self.opt(inputs_embeds=x, attention_mask=attn)
+        return out.logits[:, n_img + n_cond:]
 
 
 class MeshTransformerModule(L.LightningModule):
