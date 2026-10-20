@@ -189,6 +189,22 @@ class MeshModelConfig:
     # fork of every layer rather than a config switch.
     pos_embed: str = "learned"
 
+    # Orthophoto conditioning (docs/research/2026-10-14-orthophoto-conditioning.md).
+    # image_encoder: Hugging Face id of a DINOv3 ViT, e.g.
+    #   facebook/dinov3-vitl16-pretrain-lvd1689m (web) or ...-sat493m (satellite);
+    #   gated on the hub -- `huggingface-cli login` and accept the licence first.
+    #   None keeps the model image-free (every run up to v5).
+    image_encoder: Optional[str] = None
+    image_fusion: str = "xattn"        # "xattn" (gated cross-attention) | "prefix"
+    image_dropout: float = 0.1         # training-time rate of replacing the image by the null token
+    # "image_only" = stage A: OPT frozen, only the image path trains.
+    train_scope: str = "all"
+    # Multiplies training.lr for every non-image parameter (stage B: 0.1).
+    backbone_lr_scale: float = 1.0
+    # Weights to start from (a .ckpt), e.g. the v5 best for stage A. Not a resume:
+    # optimizer state and epoch counters start fresh.
+    init_from: Optional[str] = None
+
 @dataclass
 class MeshVQVAEConfig:
     """Stage-1 learned mesh vocabulary (arXiv:2406.10163 §4.2).

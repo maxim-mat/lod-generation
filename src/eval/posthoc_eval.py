@@ -424,7 +424,7 @@ def run_posthoc_eval(cfg, ref_cfg, model, dataset, out_dir, checkpoint=None,
             with torch.no_grad():
                 cond, tgt, cond_pad, _ = model._prepare(batch)
                 out = model.generate(cond, cond_pad, max_new_tokens=max_new_tokens,
-                                     seeds=seeds, **kwargs)
+                                     seeds=seeds, image=batch.get("image"), **kwargs)
             seconds = (time.perf_counter() - started) / len(chunk)
 
             batch_rows = _score_batch(model, batch, out, cond, tgt, cond_pad, cfg,

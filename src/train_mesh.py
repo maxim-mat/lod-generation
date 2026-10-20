@@ -56,6 +56,10 @@ def train_mesh(cfg: Config):
 
     if not cfg.mesh_data.dataset_dir:
         raise ValueError("config_set='mesh' requires mesh_data.dataset_dir to be set.")
+    if cfg.mesh_model.image_encoder and not cfg.mesh_data.ortho_dir:
+        raise ValueError("mesh_model.image_encoder needs mesh_data.ortho_dir (the crops it encodes).")
+    if cfg.mesh_model.init_from and not Path(cfg.mesh_model.init_from).is_file():
+        raise ValueError(f"mesh_model.init_from not found: {cfg.mesh_model.init_from}")
 
     save_dir = Path(cfg.logging.save_dir, cfg.logging.experiment_name, cfg.logging.run_name)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -171,7 +175,16 @@ def train_mesh(cfg: Config):
         tf_chamfer=cfg.mesh_eval.tf_chamfer,
         data_split=split_name(cfg.training.split, cfg.training.split_block_m,
                               cfg.training.split_buffer_m),
+        image_encoder=cfg.mesh_model.image_encoder,
+        image_fusion=cfg.mesh_model.image_fusion,
+        image_size=cfg.mesh_data.image_size,
+        image_margin=cfg.mesh_data.image_margin,
+        image_dropout=cfg.mesh_model.image_dropout,
+        train_scope=cfg.mesh_model.train_scope,
+        backbone_lr_scale=cfg.mesh_model.backbone_lr_scale,
     )
+    if cfg.mesh_model.init_from:
+        model.load_weights_from(cfg.mesh_model.init_from)
     if cfg.mesh_model.backbone == "opt":
         params = sum(p.numel() for p in model.network.opt.parameters())
         # `max_seq_len` is a hard ceiling only while positions are a table; with

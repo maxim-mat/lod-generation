@@ -94,6 +94,9 @@ def _check_config(cfg: Config):
     if not cfg.inference.input_path:
         raise ValueError("inference.input_path must be set to a LOD1 CityJSON file "
                          "or a directory of them.")
+    if cfg.mesh_model.image_encoder:
+        raise ValueError("Image-conditioned checkpoints are not supported by inference yet: "
+                         "it would need an orthophoto crop for every input building.")
     if cfg.mesh_model.tokenizer != "coord":
         # The VQ-VAE path encodes the condition inside `_prepare`, which also
         # tokenizes a ground-truth target that inference does not have.

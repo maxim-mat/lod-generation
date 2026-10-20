@@ -118,7 +118,8 @@ def run_mesh_eval(model, dataset, indices, cfg, max_new_tokens, seed=1234,
             out = model.generate(cond, cond_pad,
                                  max_new_tokens=max_new_tokens, temperature=0.0,
                                  beam_size=cfg.beam_size,
-                                 length_penalty=cfg.length_penalty)
+                                 length_penalty=cfg.length_penalty,
+                                 image=batch.get("image"))
 
         for k, i in enumerate(chunk):
             centre = batch["center"][k].cpu().numpy()
