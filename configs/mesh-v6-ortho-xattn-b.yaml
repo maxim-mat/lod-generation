@@ -67,12 +67,15 @@ training:
   batch_size: 4
   accumulate_grad_batches: 4   # effective batch 16, matching v3
   train_val_test_split: [0.8, 0.1, 0.1]
-  # Geographic split (Task 2a): whole 3DBAG tiles per split, so val/test
-  # buildings have no training neighbours next door. PROVISIONAL: if the
-  # block-size sweep (outputs/split_sweep) picks a grid split, set
-  # `split: grid` with split_block_m / split_buffer_m here AND in the baseline,
-  # and retrain the baseline on it -- load_weights_from refuses a mismatch.
+  # Geographic split (Task 2a): whole 3DBAG tiles per split, plus a 50 m
+  # buffer that drops every training building whose footprint centroid lies
+  # within 50 m of a val/test building (3.4% of train on cleaner, per
+  # outputs/split_sweep). Chosen 2026-10-24 over a grid split: buildings at a
+  # split boundary would otherwise have training roofs inside their orthophoto
+  # crop. This baseline and every v6 config must name the same split
+  # (`tile-buffer50m`) -- load_weights_from refuses an init that differs.
   split: tile
+  split_buffer_m: 50.0
   # New parameters only; Flamingo-scale, not v5's from-scratch 1e-3.
   lr: 1.0e-4
   # Applied to WEIGHT MATRICES ONLY -- embeddings, LayerNorm gains and biases

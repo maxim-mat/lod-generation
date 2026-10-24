@@ -22,10 +22,11 @@ or as prefix tokens in the control arm (LLaVA, arXiv:2304.08485).
    `ortho_manifest.json` and `year_assignment.json` (2022 + 2023 flights,
    already downloaded and parsed). Buildings without full coverage are skipped
    after the split; the count is in each run's `split.json`.
-3. **Split decision.** The v6 configs use `training.split: tile`. That is
-   provisional: if the block-size sweep in `outputs/split_sweep` points to a
-   grid split, change `split` (plus `split_block_m` / `split_buffer_m`) in the
-   baseline and in every v6 config together. `load_weights_from` refuses an
+3. **Split.** `training.split: tile` with `split_buffer_m: 50.0`
+   (`data_split` = `tile-buffer50m`), decided 2026-10-24. The buffer drops
+   training buildings within 50 m of any val/test building (3.4% of train on
+   cleaner), so boundary buildings don't see training roofs in their crop.
+   The baseline and every v6 config name it; `load_weights_from` refuses an
    init trained on a different split, so a mismatch fails at startup rather
    than leaking val/test buildings.
 4. **Baseline.** Train `configs/mesh-v5-full-opt-coord-tile.yaml` (multi-day).
@@ -42,6 +43,10 @@ or as prefix tokens in the control arm (LLaVA, arXiv:2304.08485).
 | 3 | gate check (below) | | |
 | 4 | `mesh-v6-ortho-xattn-b.yaml` (stage B) | stage A best | everything but DINOv3; OPT at 0.1x lr |
 | 5 | `mesh-v6-ortho-prefix.yaml` (control) | v5-tile best | everything but DINOv3; OPT at 0.1x lr |
+
+Prefix only: run step 0, then `mesh-v6-ortho-prefix-smoke.yaml` (mini_cleaner,
+1 epoch; no gates, and step 0 is not v5-tile because the prefix shifts OPT's
+positions), then step 5.
 
 Before each run, replace the `mesh_model.init_from` placeholder with the real
 best checkpoint path (`{epoch:02d}-{val_gen_chamfer_m:.4f}.ckpt` in the

@@ -55,9 +55,30 @@ def test_inference_refuses_image_models():
         _check_config(cfg)
 
 
-@pytest.mark.parametrize("name", ["xattn-a", "xattn-b", "prefix", "smoke"])
+@pytest.mark.parametrize("name", ["xattn-a", "xattn-b", "prefix", "smoke", "prefix-smoke"])
 def test_shipped_v6_configs_load(name):
+    from src.dataset.splits import split_name
     from src.utils.initialization import load_config
     cfg = load_config(Path(f"configs/mesh-v6-ortho-{name}.yaml"), [])
     assert cfg.mesh_model.image_encoder and cfg.mesh_data.ortho_dir == "ortho"
-    assert cfg.training.split == "tile"
+    t = cfg.training
+    assert split_name(t.split, t.split_block_m, t.split_buffer_m) == "tile-buffer50m"
+
+
+def test_v5_tile_baseline_uses_the_v6_split():
+    # load_weights_from refuses an init whose data_split differs, so the
+    # baseline that initialises every v6 run must name the same split.
+    from src.dataset.splits import split_name
+    from src.utils.initialization import load_config
+    t = load_config(Path("configs/mesh-v5-full-opt-coord-tile.yaml"), []).training
+    assert split_name(t.split, t.split_block_m, t.split_buffer_m) == "tile-buffer50m"
+
+
+def test_prefix_smoke_matches_the_prefix_run_but_for_size():
+    from src.utils.initialization import load_config
+    run = load_config(Path("configs/mesh-v6-ortho-prefix.yaml"), [])
+    smoke = load_config(Path("configs/mesh-v6-ortho-prefix-smoke.yaml"), [])
+    for key in ("image_fusion", "train_scope", "backbone_lr_scale", "init_from"):
+        assert getattr(smoke.mesh_model, key) == getattr(run.mesh_model, key)
+    assert smoke.mesh_data.dataset_dir.endswith("mini_cleaner")
+    assert smoke.training.max_epochs == 1 and not smoke.logging.loggers
