@@ -55,14 +55,31 @@ def test_inference_refuses_image_models():
         _check_config(cfg)
 
 
-@pytest.mark.parametrize("name", ["xattn-a", "xattn-b", "prefix", "smoke", "prefix-smoke"])
-def test_shipped_v6_configs_load(name):
+# The prefix arm runs on v5's random split for now (2026-10-24, time), from the
+# random-split v5 checkpoint; the xattn arms keep the tile split.
+@pytest.mark.parametrize("name, split", [("xattn-a", "tile-buffer50m"),
+                                         ("xattn-b", "tile-buffer50m"),
+                                         ("smoke", "tile-buffer50m"),
+                                         ("prefix", "random"), ("prefix-smoke", "random")])
+def test_shipped_v6_configs_load(name, split):
     from src.dataset.splits import split_name
     from src.utils.initialization import load_config
     cfg = load_config(Path(f"configs/mesh-v6-ortho-{name}.yaml"), [])
     assert cfg.mesh_model.image_encoder and cfg.mesh_data.ortho_dir == "ortho"
     t = cfg.training
-    assert split_name(t.split, t.split_block_m, t.split_buffer_m) == "tile-buffer50m"
+    assert split_name(t.split, t.split_block_m, t.split_buffer_m) == split
+
+
+def test_prefix_inits_from_the_v5_run_on_its_split():
+    from src.dataset.splits import split_name
+    from src.utils.initialization import load_config
+    prefix = load_config(Path("configs/mesh-v6-ortho-prefix.yaml"), [])
+    v5 = load_config(Path("configs/mesh-v5-full-opt-coord.yaml"), [])
+    assert "/mesh-v5-full-opt-coord/checkpoints/" in prefix.mesh_model.init_from
+    for t in (prefix.training, v5.training):
+        assert split_name(t.split, t.split_block_m, t.split_buffer_m) == "random"
+    assert prefix.seed == v5.seed
+    assert list(prefix.training.train_val_test_split) == list(v5.training.train_val_test_split)
 
 
 def test_v5_tile_baseline_uses_the_v6_split():

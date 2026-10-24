@@ -1,6 +1,7 @@
 # V6 control arm: the same image tokens as a prefix segment instead of
 # cross-attention (LLaVA arXiv:2304.08485; Idefics2 arXiv:2405.02246 finds
-# prefix wins once the backbone trains). Initialised from v5-tile like stage A.
+# prefix wins once the backbone trains). Initialised from v5 on v5's random split
+# for now (see training.split); stage A will use v5-tile.
 # Usage: python main.py --train --config configs/mesh-v6-ortho-prefix.yaml
 #
 # Same as stage A except: image_fusion prefix, train_scope all,
@@ -61,23 +62,24 @@ mesh_model:
   # Prefix tokens need OPT to learn to read them, so OPT trains (at 0.1x).
   train_scope: all
   backbone_lr_scale: 0.1
-  # v5 retrained on the tile split (Task 9). The random-split v5 checkpoint is
-  # refused by load_weights_from: it has seen this run's val/test tiles.
-  init_from: outputs/initial-runs/mesh-v5-full-opt-coord-tile/checkpoints/best.ckpt   # replace with the real best path
+  # The original v5 (random split), best checkpoint. It predates the
+  # `data_split` hparam, which load_weights_from reads as `random`.
+  init_from: outputs/initial-runs/mesh-v5-full-opt-coord/checkpoints/epoch=20-val_gen_chamfer_m=0.0859.ckpt
 
 training:
   batch_size: 4
   accumulate_grad_batches: 4   # effective batch 16, matching v3
   train_val_test_split: [0.8, 0.1, 0.1]
-  # Geographic split (Task 2a): whole 3DBAG tiles per split, plus a 50 m
-  # buffer that drops every training building whose footprint centroid lies
-  # within 50 m of a val/test building (3.4% of train on cleaner, per
-  # outputs/split_sweep). Chosen 2026-10-24 over a grid split: buildings at a
-  # split boundary would otherwise have training roofs inside their orthophoto
-  # crop. This baseline and every v6 config must name the same split
-  # (`tile-buffer50m`) -- load_weights_from refuses an init that differs.
-  split: tile
-  split_buffer_m: 50.0
+  # v5's per-building random split, FOR NOW (2026-10-24, time constraints):
+  # it lets this run start from the existing v5 checkpoint instead of waiting
+  # for the multi-day v5-tile retrain. Same seed and ratios as v5, and
+  # `random` reproduces v5's split index-for-index, so v5's val/test stay
+  # unseen. The cost is spatial leakage: val/test buildings have training
+  # neighbours a median ~6 m away, and those neighbours' crops show val/test
+  # roofs, so absolute metrics are optimistic. The true-vs-shuffled gap is
+  # still a within-model comparison. The planned split is `tile` +
+  # `split_buffer_m: 50.0` with init_from the v5-tile run (as the xattn configs).
+  split: random
   # New parameters only; Flamingo-scale, not v5's from-scratch 1e-3.
   lr: 1.0e-4
   # Applied to WEIGHT MATRICES ONLY -- embeddings, LayerNorm gains and biases
@@ -141,7 +143,7 @@ logging:
     - wandb
   project_name: lod-generation
   experiment_name: initial-runs
-  run_name: mesh-v6-ortho-prefix
+  run_name: mesh-v6-ortho-prefix-random
   save_dir: outputs
   wandb_entity: maxim-lod
   wandb_offline: false

@@ -44,9 +44,13 @@ or as prefix tokens in the control arm (LLaVA, arXiv:2304.08485).
 | 4 | `mesh-v6-ortho-xattn-b.yaml` (stage B) | stage A best | everything but DINOv3; OPT at 0.1x lr |
 | 5 | `mesh-v6-ortho-prefix.yaml` (control) | v5-tile best | everything but DINOv3; OPT at 0.1x lr |
 
-Prefix only: run step 0, then `mesh-v6-ortho-prefix-smoke.yaml` (mini_cleaner,
-1 epoch; no gates, and step 0 is not v5-tile because the prefix shifts OPT's
-positions), then step 5.
+Prefix only, current (2026-10-24): the prefix configs run on v5's **random**
+split from the original v5 checkpoint, so step 0 is skipped. Run
+`mesh-v6-ortho-prefix-smoke.yaml` (mini_cleaner, 1 epoch; no gates, and step 0
+is not v5 because the prefix shifts OPT's positions), then step 5. Metrics are
+spatially optimistic on this split; compare true vs shuffled, and post-hoc
+against v5's own random-split evaluation. The tile split above still applies
+to the xattn arms and to a later prefix rerun.
 
 Before each run, replace the `mesh_model.init_from` placeholder with the real
 best checkpoint path (`{epoch:02d}-{val_gen_chamfer_m:.4f}.ckpt` in the
