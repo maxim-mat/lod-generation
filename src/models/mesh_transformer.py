@@ -49,7 +49,7 @@ from src.eval.mesh_metrics import (
     surface_distances,
 )
 from src.models.embeddings import SinusoidalPositionEmbedding
-from src.models.prefix_layout import NO_POSITION
+from src.models.prefix_layout import NO_POSITION, mesh_position_ids, prefix_attention_mask
 
 logger = logging.getLogger(__name__)
 
@@ -734,6 +734,12 @@ class MeshOPTTransformer(MeshEmbedding):
             decoder.embed_positions = OPTSinusoidalPositions(cfg.hidden_size)
 
         self.image_fusion = None if image is None else image["fusion"]
+        # Aligned-prefix options (docs/superpowers/specs/2026-11-02-aligned-prefix-design.md).
+        # All off by default, and off means the previous code path, op for op.
+        opts = image or {}
+        self.separate_positions = bool(opts.get("separate_positions", False))
+        self.mask_invalid = bool(opts.get("mask_invalid", False))
+        self.bidirectional = opts.get("prefix_attention", "causal") == "bidirectional"
         if image is not None:
             from src.models.ortho_encoder import OrthoImageEncoder
             from src.models.ortho_fusion import GatedCrossAttention
@@ -741,10 +747,12 @@ class MeshOPTTransformer(MeshEmbedding):
             if self.image_fusion not in ("xattn", "prefix"):
                 raise ValueError(f"Unknown image fusion {self.image_fusion!r}; "
                                  "expected 'xattn' or 'prefix'.")
+            self._check_image_options(image, pos_embed, tokenization, codebook)
             width = cfg.hidden_size if self.image_fusion == "xattn" else cfg.word_embed_proj_dim
             self.image_encoder = OrthoImageEncoder(
                 width, name=image.get("name"), config=image.get("config"),
-                image_size=image["image_size"], beta=image["beta"])
+                image_size=image["image_size"], beta=image["beta"],
+                prefix_grid=image.get("prefix_grid"))
             if self.image_fusion == "xattn":
                 self.xattn = GatedCrossAttention(self.opt.model.decoder.layers,
                                                  cfg.hidden_size, cfg.num_attention_heads)
@@ -753,11 +761,47 @@ class MeshOPTTransformer(MeshEmbedding):
                 # v5 table keeps its shape and loads unchanged.
                 self.image_segment = nn.Parameter(torch.zeros(cfg.word_embed_proj_dim))
 
+    @staticmethod
+    def _check_image_options(image, pos_embed, tokenization, codebook):
+        """Refuse aligned-prefix option combinations that cannot mean anything.
+
+        Raises:
+            ValueError: naming the option and what it needs.
+        """
+        fusion = image["fusion"]
+        separate = image.get("separate_positions", False)
+        attention = image.get("prefix_attention", "causal")
+        if separate and (fusion != "prefix" or pos_embed != "sinusoidal"):
+            raise ValueError("image_separate_positions needs image_fusion='prefix' and "
+                             "pos_embed='sinusoidal' (a learned table has no 'no position').")
+        if image.get("mask_invalid", False) and not separate:
+            raise ValueError("image_mask_invalid needs image_separate_positions: with shared "
+                             "positions, masking the image would move every mesh position.")
+        if attention not in ("causal", "bidirectional"):
+            raise ValueError(f"Unknown image_prefix_attention {attention!r}; expected "
+                             "'causal' or 'bidirectional'.")
+        if attention == "bidirectional" and not separate:
+            raise ValueError("image_prefix_attention='bidirectional' needs image_fusion='prefix' "
+                             "and image_separate_positions.")
+        if image.get("prefix_grid") is not None and fusion != "prefix":
+            raise ValueError("image_prefix_grid pools the prefix tokens; it needs "
+                             "image_fusion='prefix'.")
+        if image.get("vertex_features", False) and (tokenization != "coord" or codebook is not None):
+            raise ValueError("image_vertex_features reads (x, y) bins off coordinate tokens; it "
+                             "needs tokenization='coord' and tokenizer='coord'.")
+
     def encode_image(self, image, valid=None):
         """``uint8 [B, 3, S, S]`` mesh-order crops -> an `ImageContext`; `valid`
-        False rows get the null token."""
-        from src.models.ortho_fusion import ImageContext
-        return ImageContext(self.image_encoder(image, valid))
+        False rows get the null token, or -- under `mask_invalid` -- are masked
+        out of attention instead."""
+        return self.image_encoder.encode(image, valid, use_null=not self.mask_invalid)
+
+    def _img_keep(self, ctx, n_img):
+        """``[B, n_img]`` keep mask of the image keys under separate positions."""
+        valid = ctx.valid
+        if not self.mask_invalid or valid is None:
+            valid = torch.ones(ctx.tokens.shape[0], dtype=torch.bool, device=ctx.tokens.device)
+        return valid[:, None].expand(-1, n_img)
 
     def _image_prefix(self, ctx):
         return ctx.tokens + self.image_segment
@@ -804,9 +848,14 @@ class MeshOPTTransformer(MeshEmbedding):
         if image_ctx is not None and self.image_fusion == "prefix":
             n_img = image_ctx.tokens.shape[1]
             attn = torch.cat([attn.new_ones(attn.shape[0], n_img), attn], dim=1)
-        return {"past": DynamicCache(), "attn": attn, "n_cond": cond.shape[1],
-                "n_tgt": 0, "cond": cond, "n_img": n_img,
-                "image": None if image_ctx is None else image_ctx.caching()}
+        cache = {"past": DynamicCache(), "attn": attn, "n_cond": cond.shape[1],
+                 "n_tgt": 0, "cond": cond, "n_img": n_img,
+                 "image": None if image_ctx is None else image_ctx.caching()}
+        if self.separate_positions and n_img:
+            # Positions and masks are rebuilt from these two, not from `attn`.
+            cache["mesh_keep"] = attn[:, n_img:].bool()
+            cache["img_keep"] = self._img_keep(image_ctx, n_img)
+        return cache
 
     def cached_logits(self, cache, tgt):
         """Next-token logits after appending whatever of `tgt` is not cached yet."""
@@ -832,9 +881,25 @@ class MeshOPTTransformer(MeshEmbedding):
             cache["attn"] = torch.cat(
                 [cache["attn"], torch.ones(tgt.shape[0], new.shape[1], dtype=torch.long,
                                            device=device)], dim=1)
+        layout = {"attention_mask": cache["attn"]}
+        if "mesh_keep" in cache:
+            n_new = new.shape[1]
+            keep = torch.cat([cache["mesh_keep"], cache["mesh_keep"].new_ones(tgt.shape[0], n_new)],
+                             dim=1)
+            cache["mesh_keep"] = keep
+            if cache["n_tgt"] == 0:
+                n_cond = cache["n_cond"]
+                layout = {"attention_mask": prefix_attention_mask(
+                              cache["img_keep"], keep[:, :n_cond], keep[:, n_cond:],
+                              self.bidirectional),
+                          "position_ids": mesh_position_ids(cache["n_img"], keep)}
+            else:
+                # A target row sees every kept key, so a 2-D keep row is its mask.
+                layout = {"attention_mask": torch.cat([cache["img_keep"], keep], dim=1).long(),
+                          "position_ids": mesh_position_ids(0, keep)[:, -n_new:]}
         with self._attending(cache.get("image")):
-            out = self.opt(inputs_embeds=x, attention_mask=cache["attn"],
-                           past_key_values=cache["past"], use_cache=True)
+            out = self.opt(inputs_embeds=x, past_key_values=cache["past"], use_cache=True,
+                           **layout)
         cache["past"] = out.past_key_values
         cache["n_tgt"] = tgt.shape[1]
         return out.logits[:, -1]
@@ -842,9 +907,13 @@ class MeshOPTTransformer(MeshEmbedding):
     @staticmethod
     def reorder_cache(cache, order):
         cache["past"].batch_select_indices(order)
-        return {**cache, "attn": cache["attn"][order],
-                "cond": cache["cond"][order],
-                "image": None if cache.get("image") is None else cache["image"].select(order)}
+        out = {**cache, "attn": cache["attn"][order],
+               "cond": cache["cond"][order],
+               "image": None if cache.get("image") is None else cache["image"].select(order)}
+        for key in ("mesh_keep", "img_keep"):
+            if key in cache:
+                out[key] = cache[key][order]
+        return out
 
     def forward(self, cond, tgt, cond_pad_mask=None, tgt_pad_mask=None, image_ctx=None):
         """Next-token logits for the target sequence. Same contract as
@@ -875,12 +944,21 @@ class MeshOPTTransformer(MeshEmbedding):
             attn = (~torch.cat([cond_pad_mask, tgt_pad_mask[:, :-1]], dim=1)).long()
         else:
             attn = torch.ones(x.shape[:2], dtype=torch.long, device=x.device)
+        layout = None
+        if n_img and self.separate_positions:
+            # Mesh positions count mesh tokens only (spec 3.1), and the mask is
+            # built here so masked-image rows keep a diagonal key (3.2, 3.5).
+            keep = attn.bool()
+            layout = {"attention_mask": prefix_attention_mask(
+                          self._img_keep(image_ctx, n_img), keep[:, :n_cond], keep[:, n_cond:],
+                          self.bidirectional),
+                      "position_ids": mesh_position_ids(n_img, keep)}
         if n_img:
             x = torch.cat([self._image_prefix(image_ctx), x], dim=1)
             attn = torch.cat([attn.new_ones(attn.shape[0], n_img), attn], dim=1)
 
         with self._attending(image_ctx):
-            out = self.opt(inputs_embeds=x, attention_mask=attn)
+            out = self.opt(inputs_embeds=x, **(layout or {"attention_mask": attn}))
         return out.logits[:, n_img + n_cond:]
 
 
