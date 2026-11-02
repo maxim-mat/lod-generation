@@ -250,3 +250,18 @@ def test_cached_matches_uncached_with_vertex_features():
     cond, _, img = batch()
     assert torch.equal(_greedy(m, cond, img, [True, False], False),
                        _greedy(m, cond, img, [True, False], True))
+
+
+def test_cached_step_projects_only_the_new_vertex_rows():
+    m = aligned(**B_ON)
+    _randomise_b(m)
+    cond, _, img = batch()
+    rows = []
+    h = m.image_encoder.vertex_proj.register_forward_hook(
+        lambda mod, args, out: rows.append(args[0].shape[1]))
+    try:
+        _greedy(m, cond, img, [True, True], True, steps=6)
+    finally:
+        h.remove()
+    # The condition once, then exactly one new target row per step.
+    assert sorted(rows) == [1] * 6 + [cond.shape[1]], rows

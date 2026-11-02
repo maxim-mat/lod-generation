@@ -808,7 +808,7 @@ class MeshOPTTransformer(MeshEmbedding):
         out of attention instead."""
         return self.image_encoder.encode(image, valid, use_null=not self.mask_invalid)
 
-    def _vertex_embed(self, ids, offset, ctx):
+    def _vertex_embed(self, ids, offset, ctx, start=0):
         """Per-vertex image features to add to the embeddings of `ids` (spec 3.4).
 
         Zero for every row whose image is invalid, whatever the fusion or
@@ -819,8 +819,11 @@ class MeshOPTTransformer(MeshEmbedding):
             ids: ``[B, L]`` coordinate token ids.
             offset: 0 for the condition, 1 for the BOS-led target input.
             ctx: the batch's `ImageContext`, carrying `maps` and `valid`.
+            start: return rows ``start:`` only. Bins need the earlier ids, so
+                they are read off the whole sequence; only the (per-token)
+                projection is restricted, which keeps a cached step O(1).
         """
-        bx, by, has = vertex_xy_bins(ids, offset, self.num_bins)
+        bx, by, has = (t[:, start:] for t in vertex_xy_bins(ids, offset, self.num_bins))
         feats = self.image_encoder.vertex_features(ctx.maps, bx, by, self.num_bins)
         keep = has if ctx.valid is None else has & ctx.valid[:, None]
         return feats * keep[..., None].to(feats.dtype)
@@ -893,10 +896,10 @@ class MeshOPTTransformer(MeshEmbedding):
         # AMT roles and VQ-VAE face slots stay right, then only the new rows are
         # pushed through the stack.
         embedded = self.embed_tokens(tgt)
+        new = embedded[:, cache["n_tgt"]:]
         vertex = self.vertex_features and cache.get("image") is not None
         if vertex:
-            embedded = embedded + self._vertex_embed(tgt, 1, cache["image"])
-        new = embedded[:, cache["n_tgt"]:]
+            new = new + self._vertex_embed(tgt, 1, cache["image"], start=cache["n_tgt"])
         if cache["n_tgt"] == 0:
             # First call also carries the condition, which has segment 0.
             seg = torch.cat([torch.zeros(cache["n_cond"], dtype=torch.long, device=device),
