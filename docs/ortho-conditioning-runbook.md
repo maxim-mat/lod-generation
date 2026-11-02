@@ -67,6 +67,55 @@ same buildings. With zero gates, step 0 *is* that model, so a large epoch-0 gap
 means a wiring bug, not a learning effect. (The smoke runs on mini_cleaner,
 whose tile split is not cleaner's; it is a plumbing check, not a measurement.)
 
+### Aligned prefix arm (2026-11-02)
+
+`mesh-v6-ortho-prefix-aligned.yaml` is the prefix run with all five
+aligned-prefix changes on (`docs/superpowers/specs/2026-11-02-aligned-prefix-design.md`):
+- separate positions;
+- masking instead of the null token;
+- 8×8 pooling;
+- per-vertex image features;
+- bidirectional image-token attention.
+
+It uses the same random split, `init_from` (v5 epoch 20), lr and epochs as
+`mesh-v6-ortho-prefix.yaml`. Compare it against W&B `7swbxcwh`; that comparison
+reads as "all fixes vs none".
+
+```bash
+python main.py --train --config configs/mesh-v6-ortho-prefix-aligned-smoke.yaml
+python main.py --train --config configs/mesh-v6-ortho-prefix-aligned.yaml
+```
+
+**Smoke pass criteria:** this is a plumbing check only.
+- It finishes an epoch.
+- Losses stay finite.
+- `val_loss` falls.
+
+The v5-equivalence gate is the exact unit test
+`tests/test_aligned_prefix.py::test_masked_image_reproduces_the_image_free_model`.
+There is no v5 number on mini_cleaner to compare a chamfer against.
+
+**Ablations** are one-line overrides of the aligned config, each switching off
+one piece:
+
+| ablation | override | removes |
+|---|---|---|
+| −B | `mesh_model.image_vertex_features=false` | per-vertex lookup |
+| −bidirectional | `mesh_model.image_prefix_attention=causal` | image-token bidirectional attention |
+| −pooling | `mesh_model.image_prefix_grid=null` | back to 256 tokens |
+| −masking | `mesh_model.image_mask_invalid=false` | dropout and `none` go back to the null token |
+
+Overrides are positional dotlist arguments:
+
+```bash
+python main.py --train --config configs/mesh-v6-ortho-prefix-aligned.yaml \
+    mesh_model.image_vertex_features=false logging.run_name=mesh-v6-ortho-prefix-aligned-noB
+```
+
+For each ablation, also set `logging.run_name` to a distinct name. Separate
+positions cannot be switched off alone, because masking and bidirectional
+attention both require it. Its ablation is `7swbxcwh` itself.
+
 ## Post-hoc evaluation with image controls
 
 `image_mode` swaps what each building sees at generation time:

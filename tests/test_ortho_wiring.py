@@ -60,7 +60,9 @@ def test_inference_refuses_image_models():
 @pytest.mark.parametrize("name, split", [("xattn-a", "tile-buffer50m"),
                                          ("xattn-b", "tile-buffer50m"),
                                          ("smoke", "tile-buffer50m"),
-                                         ("prefix", "random"), ("prefix-smoke", "random")])
+                                         ("prefix", "random"), ("prefix-smoke", "random"),
+                                         ("prefix-aligned", "random"),
+                                         ("prefix-aligned-smoke", "random")])
 def test_shipped_v6_configs_load(name, split):
     from src.dataset.splits import split_name
     from src.utils.initialization import load_config
@@ -116,3 +118,34 @@ def test_config_defaults_keep_the_old_prefix():
     assert (m.image_separate_positions, m.image_mask_invalid, m.image_prefix_grid,
             m.image_vertex_features, m.image_prefix_attention, m.image_vertex_width) == \
         (False, False, None, False, "causal", 64)
+
+
+ALIGNED_FLAGS = {"image_separate_positions": True, "image_mask_invalid": True,
+                 "image_prefix_grid": 8, "image_vertex_features": True,
+                 "image_prefix_attention": "bidirectional"}
+
+
+def _flat(cfg):
+    from dataclasses import asdict
+    return {f"{sec}.{k}": v for sec, d in asdict(cfg).items() if isinstance(d, dict)
+            for k, v in d.items()}
+
+
+def test_aligned_differs_from_prefix_only_in_the_new_flags():
+    from src.utils.initialization import load_config
+    run = _flat(load_config(Path("configs/mesh-v6-ortho-prefix.yaml"), []))
+    aligned = _flat(load_config(Path("configs/mesh-v6-ortho-prefix-aligned.yaml"), []))
+    diff = {k for k in run if run[k] != aligned[k]}
+    assert diff == {f"mesh_model.{k}" for k in ALIGNED_FLAGS} | {"logging.run_name"}
+    assert all(aligned[f"mesh_model.{k}"] == v for k, v in ALIGNED_FLAGS.items())
+    assert aligned["logging.run_name"] == "mesh-v6-ortho-prefix-aligned-random"
+
+
+def test_aligned_smoke_matches_aligned_but_for_size():
+    from src.utils.initialization import load_config
+    run = load_config(Path("configs/mesh-v6-ortho-prefix-aligned.yaml"), [])
+    smoke = load_config(Path("configs/mesh-v6-ortho-prefix-aligned-smoke.yaml"), [])
+    for key in (*ALIGNED_FLAGS, "image_fusion", "init_from"):
+        assert getattr(smoke.mesh_model, key) == getattr(run.mesh_model, key), key
+    assert smoke.mesh_data.dataset_dir.endswith("mini_cleaner")
+    assert smoke.training.max_epochs == 1 and not smoke.logging.loggers
