@@ -49,7 +49,12 @@ from src.eval.mesh_metrics import (
     surface_distances,
 )
 from src.models.embeddings import SinusoidalPositionEmbedding
-from src.models.prefix_layout import NO_POSITION, mesh_position_ids, prefix_attention_mask
+from src.models.prefix_layout import (
+    NO_POSITION,
+    mesh_position_ids,
+    prefix_attention_mask,
+    vertex_xy_bins,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -740,6 +745,7 @@ class MeshOPTTransformer(MeshEmbedding):
         self.separate_positions = bool(opts.get("separate_positions", False))
         self.mask_invalid = bool(opts.get("mask_invalid", False))
         self.bidirectional = opts.get("prefix_attention", "causal") == "bidirectional"
+        self.vertex_features = bool(opts.get("vertex_features", False))
         if image is not None:
             from src.models.ortho_encoder import OrthoImageEncoder
             from src.models.ortho_fusion import GatedCrossAttention
@@ -748,11 +754,17 @@ class MeshOPTTransformer(MeshEmbedding):
                 raise ValueError(f"Unknown image fusion {self.image_fusion!r}; "
                                  "expected 'xattn' or 'prefix'.")
             self._check_image_options(image, pos_embed, tokenization, codebook)
+            if self.vertex_features and num_bins is None:
+                raise ValueError("image_vertex_features needs num_bins to dequantize vertex bins.")
             width = cfg.hidden_size if self.image_fusion == "xattn" else cfg.word_embed_proj_dim
             self.image_encoder = OrthoImageEncoder(
                 width, name=image.get("name"), config=image.get("config"),
                 image_size=image["image_size"], beta=image["beta"],
-                prefix_grid=image.get("prefix_grid"))
+                prefix_grid=image.get("prefix_grid"),
+                # Added to input embeddings, so `word_embed_proj_dim` wide under
+                # either fusion (spec 3.4).
+                vertex_dim=cfg.word_embed_proj_dim if self.vertex_features else None,
+                vertex_width=image.get("vertex_width", 64))
             if self.image_fusion == "xattn":
                 self.xattn = GatedCrossAttention(self.opt.model.decoder.layers,
                                                  cfg.hidden_size, cfg.num_attention_heads)
@@ -795,6 +807,23 @@ class MeshOPTTransformer(MeshEmbedding):
         False rows get the null token, or -- under `mask_invalid` -- are masked
         out of attention instead."""
         return self.image_encoder.encode(image, valid, use_null=not self.mask_invalid)
+
+    def _vertex_embed(self, ids, offset, ctx):
+        """Per-vertex image features to add to the embeddings of `ids` (spec 3.4).
+
+        Zero for every row whose image is invalid, whatever the fusion or
+        masking: dropout and the `image_mode: none` control must not see the
+        crop through this path either.
+
+        Args:
+            ids: ``[B, L]`` coordinate token ids.
+            offset: 0 for the condition, 1 for the BOS-led target input.
+            ctx: the batch's `ImageContext`, carrying `maps` and `valid`.
+        """
+        bx, by, has = vertex_xy_bins(ids, offset, self.num_bins)
+        feats = self.image_encoder.vertex_features(ctx.maps, bx, by, self.num_bins)
+        keep = has if ctx.valid is None else has & ctx.valid[:, None]
+        return feats * keep[..., None].to(feats.dtype)
 
     def _img_keep(self, ctx, n_img):
         """``[B, n_img]`` keep mask of the image keys under separate positions."""
@@ -864,12 +893,18 @@ class MeshOPTTransformer(MeshEmbedding):
         # AMT roles and VQ-VAE face slots stay right, then only the new rows are
         # pushed through the stack.
         embedded = self.embed_tokens(tgt)
+        vertex = self.vertex_features and cache.get("image") is not None
+        if vertex:
+            embedded = embedded + self._vertex_embed(tgt, 1, cache["image"])
         new = embedded[:, cache["n_tgt"]:]
         if cache["n_tgt"] == 0:
             # First call also carries the condition, which has segment 0.
             seg = torch.cat([torch.zeros(cache["n_cond"], dtype=torch.long, device=device),
                              torch.ones(tgt.shape[1], dtype=torch.long, device=device)])
-            x = torch.cat([self.embed_cond(cache["cond"]), new], dim=1) + self.segment_embed(seg)
+            cond_x = self.embed_cond(cache["cond"])
+            if vertex:
+                cond_x = cond_x + self._vertex_embed(cache["cond"], 0, cache["image"])
+            x = torch.cat([cond_x, new], dim=1) + self.segment_embed(seg)
             if cache.get("n_img"):
                 x = torch.cat([self._image_prefix(cache["image"]), x], dim=1)
             cache["attn"] = torch.cat(
@@ -934,7 +969,11 @@ class MeshOPTTransformer(MeshEmbedding):
                 "mesh_model.pos_embed=sinusoidal, which has no ceiling."
             )
 
-        x = torch.cat([self.embed_cond(cond), self.embed_tokens(tgt[:, :-1])], dim=1)
+        cond_x, tgt_x = self.embed_cond(cond), self.embed_tokens(tgt[:, :-1])
+        if self.vertex_features and image_ctx is not None:
+            cond_x = cond_x + self._vertex_embed(cond, 0, image_ctx)
+            tgt_x = tgt_x + self._vertex_embed(tgt[:, :-1], 1, image_ctx)
+        x = torch.cat([cond_x, tgt_x], dim=1)
         segment = (torch.arange(length - n_img, device=x.device) >= n_cond).long()
         x = x + self.segment_embed(segment)
 

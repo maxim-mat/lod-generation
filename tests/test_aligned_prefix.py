@@ -200,3 +200,53 @@ def test_cached_matches_uncached(flags):
 def test_invalid_option_combinations_raise(fusion, kw):
     with pytest.raises(ValueError):
         net(fusion, **kw)
+
+
+B_ON = {**NEW, "vertex_features": True}
+
+
+def _randomise_b(m):
+    with torch.no_grad():
+        m.image_encoder.vertex_proj[-1].weight.normal_()
+
+
+def test_vertex_features_start_at_zero():
+    off = aligned(**NEW)
+    on = aligned(off, **B_ON)
+    cond, tgt, img = batch()
+    for valid in ([True, True], [True, False]):
+        with torch.no_grad():
+            a = off(cond, tgt, image_ctx=_ctx(off, img, valid))
+            b = on(cond, tgt, image_ctx=_ctx(on, img, valid))
+        assert torch.equal(a, b), valid
+
+
+def test_vertex_features_follow_the_image():
+    m = aligned(**B_ON)
+    _randomise_b(m)
+    cond, tgt, img = batch()
+    other = torch.randint(0, 255, img.shape, generator=torch.Generator().manual_seed(9),
+                          dtype=torch.uint8)
+    with torch.no_grad():
+        on = [m(cond, tgt, image_ctx=_ctx(m, i, [True, True])) for i in (img, other)]
+        off = [m(cond, tgt, image_ctx=_ctx(m, i, [False, False])) for i in (img, other)]
+    assert not torch.allclose(on[0], on[1], atol=1e-4)
+    assert torch.equal(off[0], off[1])
+
+
+def test_vertex_features_also_work_with_xattn():
+    off = net("xattn")
+    on = net("xattn", vertex_features=True)
+    on.load_state_dict(off.state_dict(), strict=False)
+    cond, tgt, img = batch()
+    with torch.no_grad():
+        assert torch.equal(off(cond, tgt, image_ctx=_ctx(off, img, [True, True])),
+                           on(cond, tgt, image_ctx=_ctx(on, img, [True, True])))
+
+
+def test_cached_matches_uncached_with_vertex_features():
+    m = aligned(**B_ON)
+    _randomise_b(m)
+    cond, _, img = batch()
+    assert torch.equal(_greedy(m, cond, img, [True, False], False),
+                       _greedy(m, cond, img, [True, False], True))

@@ -55,3 +55,30 @@ def prefix_attention_mask(img_keep, cond_keep, tgt_keep, bidirectional):
     mask = allowed[None] & keep[:, None, :]
     mask = mask | ((q == k) & (q < p))[None]
     return mask[:, None]
+
+
+def vertex_xy_bins(ids, offset, num_bins):
+    """Each token's vertex (x-bin, y-bin), where both are already known (spec §3.4).
+
+    Position ``p`` holds coordinate ``c = p - offset`` with axis ``c % 3``:
+    offset 0 for the LOD1 condition, 1 for the target input ``[BOS, t0, ...]``.
+    A y-token (axis 1) reads x from ``p-1`` and y from itself; a z-token (axis
+    2) reads both from ``p-2, p-1``. Only tokens already in the sequence are
+    read, so the result is causal.
+
+    Returns:
+        tuple: ``(bx, by, has)``, each ``[B, L]``; `has` is True at y/z tokens
+        whose vertex x and y are real coordinates (not BOS/EOS/PAD). Bins are 0
+        elsewhere.
+    """
+    b, n = ids.shape
+    pos = torch.arange(n, device=ids.device)
+    c = pos - offset
+    axis = torch.remainder(c, 3)
+    xi = (pos - axis).clamp(min=0)
+    yi = (xi + 1).clamp(max=n - 1)
+    bx = ids.gather(1, xi.expand(b, n))
+    by = ids.gather(1, yi.expand(b, n))
+    has = (((c >= 0) & (axis >= 1))[None] & (bx >= 0) & (bx < num_bins)
+           & (by >= 0) & (by < num_bins))
+    return bx.masked_fill(~has, 0), by.masked_fill(~has, 0), has

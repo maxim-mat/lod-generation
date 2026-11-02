@@ -55,3 +55,16 @@ def test_no_position_sentinel_is_a_zero_vector():
     assert torch.equal(out[0], torch.zeros(8))
     assert torch.equal(out[1], out[2])
     assert out[3].abs().sum() > 0
+
+
+def test_vertex_xy_bins_condition_and_target():
+    from src.models.prefix_layout import vertex_xy_bins
+    nb, pad, bos = 16, 18, 16
+    bx, by, has = vertex_xy_bins(torch.tensor([[1, 2, 3, 4, 5, 6, pad, pad, pad]]), 0, nb)
+    assert has.long().tolist() == [[0, 1, 1, 0, 1, 1, 0, 0, 0]]
+    assert bx[0, [1, 2, 4, 5]].tolist() == [1, 1, 4, 4]
+    assert by[0, [1, 2, 4, 5]].tolist() == [2, 2, 5, 5]
+    bx, by, has = vertex_xy_bins(torch.tensor([[bos, 1, 2, 3, 4]]), 1, nb)
+    assert has.long().tolist() == [[0, 0, 1, 1, 0]]
+    assert (bx[0, 2].item(), by[0, 2].item()) == (1, 2)
+    assert (bx[0, 3].item(), by[0, 3].item()) == (1, 2)
