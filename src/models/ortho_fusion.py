@@ -20,19 +20,31 @@ import torch.nn.functional as F
 
 @dataclass
 class ImageContext:
-    """Image tokens for one batch, plus per-layer cached K/V during decoding."""
+    """Image tokens for one batch, plus per-layer cached K/V during decoding.
+
+    `valid` ([B] bool) says which rows really have an image; `maps` is the
+    ``(fine, coarse)`` pair of mesh-order feature maps the per-vertex features
+    sample (aligned-prefix spec §3.4), None unless that path is on.
+    """
     tokens: torch.Tensor                       # [B, P, D]
     kv: dict = field(default=None)            # layer -> (k, v); None = do not cache
+    valid: torch.Tensor = None                 # [B] bool
+    maps: tuple = None                         # (fine [B,Cf,H,W], coarse [B,C,G,G])
+
+    def _rows(self, pick):
+        return dict(valid=None if self.valid is None else pick(self.valid),
+                    maps=None if self.maps is None else tuple(pick(m) for m in self.maps))
 
     def select(self, order):
         kv = None if self.kv is None else {i: (k[order], v[order]) for i, (k, v) in self.kv.items()}
-        return ImageContext(self.tokens[order], kv)
+        return ImageContext(self.tokens[order], kv, **self._rows(lambda t: t[order]))
 
     def repeat(self, n):
-        return ImageContext(self.tokens.repeat_interleave(n, dim=0))
+        pick = lambda t: t.repeat_interleave(n, dim=0)
+        return ImageContext(pick(self.tokens), **self._rows(pick))
 
     def caching(self):
-        return ImageContext(self.tokens, {})
+        return ImageContext(self.tokens, {}, self.valid, self.maps)
 
 
 class CrossAttention(nn.Module):
