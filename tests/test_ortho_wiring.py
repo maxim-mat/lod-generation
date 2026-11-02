@@ -99,3 +99,20 @@ def test_prefix_smoke_matches_the_prefix_run_but_for_size():
         assert getattr(smoke.mesh_model, key) == getattr(run.mesh_model, key)
     assert smoke.mesh_data.dataset_dir.endswith("mini_cleaner")
     assert smoke.training.max_epochs == 1 and not smoke.logging.loggers
+
+
+def test_check_vertex_margins():
+    from src.train_mesh import check_vertex_margins
+    check_vertex_margins(True, [0, 0, 0], [0, 0, 0.1])
+    check_vertex_margins(False, [0.1, 0, 0], [0, 0, 0.1])
+    with pytest.raises(ValueError, match="margin"):
+        check_vertex_margins(True, [0.1, 0, 0], [0, 0, 0.1])
+    with pytest.raises(ValueError, match="margin"):
+        check_vertex_margins(True, [0, 0, 0], [0, 0.05, 0.1])
+
+
+def test_config_defaults_keep_the_old_prefix():
+    m = Config().mesh_model
+    assert (m.image_separate_positions, m.image_mask_invalid, m.image_prefix_grid,
+            m.image_vertex_features, m.image_prefix_attention, m.image_vertex_width) == \
+        (False, False, None, False, "causal", 64)

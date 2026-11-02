@@ -127,3 +127,82 @@ def test_scratch_backbone_with_an_image_is_refused():
                                   hidden_size=32, intermediate_size=64, num_hidden_layers=1,
                                   num_attention_heads=2, patch_size=16, image_size=S),
                               image_size=S)
+
+
+# ---------------------------------------------------------------------------
+# Aligned prefix flags (docs/superpowers/specs/2026-11-02-aligned-prefix-design.md)
+# ---------------------------------------------------------------------------
+
+ALIGNED = dict(image_fusion="prefix", image_separate_positions=True, image_mask_invalid=True,
+               image_prefix_grid=2, image_vertex_features=True,
+               image_prefix_attention="bidirectional")
+FLAGS = ("image_separate_positions", "image_mask_invalid", "image_prefix_grid",
+         "image_vertex_features", "image_prefix_attention", "image_vertex_width")
+
+
+def _configs():
+    opt = OPTConfig(vocab_size=vocab_size(NUM_BINS), hidden_size=32, word_embed_proj_dim=32,
+                    num_hidden_layers=2, num_attention_heads=4, ffn_dim=64,
+                    max_position_embeddings=512, dropout=0.0)
+    dino = DINOv3ViTConfig(hidden_size=32, intermediate_size=64, num_hidden_layers=2,
+                           num_attention_heads=2, patch_size=16, image_size=S)
+    return {"opt_config": opt, "image_encoder_config": dino}
+
+
+def _save(m, path, drop=()):
+    import lightning as L
+    hp = {k: v for k, v in dict(m.hparams).items() if k not in drop}
+    torch.save({"state_dict": m.state_dict(), "hyper_parameters": hp,
+                "pytorch-lightning_version": L.__version__}, path)
+
+
+def _randomise_b(m):
+    with torch.no_grad():
+        m.network.image_encoder.vertex_proj[-1].weight.normal_()
+
+
+def test_new_flags_round_trip_through_a_checkpoint(tmp_path):
+    m = module(**ALIGNED).eval()
+    _randomise_b(m)
+    path = tmp_path / "aligned.ckpt"
+    _save(m, path)
+    back = MeshTransformerModule.load_from_checkpoint(str(path), **_configs()).eval()
+    for key in FLAGS:
+        assert back.hparams[key] == m.hparams[key], key
+    back.load_state_dict(m.state_dict(), strict=True)
+    # The frozen backbone is not in checkpoints (it comes from the hub); the
+    # tiny test one is random, so carry it over by hand.
+    back.network.image_encoder.backbone.load_state_dict(
+        m.network.image_encoder.backbone.state_dict())
+    b = batch(valid=(True, False))
+    with torch.no_grad():
+        assert torch.equal(m._shared_step(b)[1], back._shared_step(b)[1])
+
+
+def test_old_checkpoint_without_the_keys_gets_defaults(tmp_path):
+    m = module(image_fusion="prefix").eval()
+    path = tmp_path / "old.ckpt"
+    _save(m, path, drop=FLAGS)
+    back = MeshTransformerModule.load_from_checkpoint(str(path), **_configs())
+    net = back.network
+    assert not (net.separate_positions or net.mask_invalid or net.bidirectional
+                or net.vertex_features)
+    assert not hasattr(net.image_encoder, "pixel_cnn")
+    assert net.image_encoder.prefix_grid is None
+
+
+def test_new_flags_need_an_image_model():
+    with pytest.raises(ValueError, match="image"):
+        module(image=False, image_mask_invalid=True)
+
+
+def test_aligned_beam_search_cached_matches_uncached():
+    m = module(**ALIGNED).eval()
+    _randomise_b(m)
+    b = batch(valid=(True, False))
+    for beam in (1, 3):
+        kw = dict(image=b["image"], image_valid=b["image_valid"], temperature=0.0,
+                  beam_size=beam, max_new_tokens=12)
+        off = m.generate(b["cond"], b["cond_pad_mask"], use_cache=False, **kw)
+        on = m.generate(b["cond"], b["cond_pad_mask"], use_cache=True, **kw)
+        assert torch.equal(off, on), beam

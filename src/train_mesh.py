@@ -50,6 +50,23 @@ def _load_vqvae(cfg: Config):
     return vqvae
 
 
+def check_vertex_margins(vertex_features, margin_lo, margin_hi):
+    """Refuse per-vertex image features on a frame with x/y margins.
+
+    `OrthoImageEncoder.vertex_features` maps a bin to the crop by plain
+    dequantization, which is the unit box only when the x/y margins are 0 (true
+    for every v5/v6 config; aligned-prefix spec 3.4).
+
+    Raises:
+        ValueError: `vertex_features` with a non-zero x or y margin.
+    """
+    if vertex_features and any(float(m) != 0.0 for m in (*margin_lo[:2], *margin_hi[:2])):
+        raise ValueError(
+            f"mesh_model.image_vertex_features assumes x/y margins of 0, got margin_lo="
+            f"{list(margin_lo)} margin_hi={list(margin_hi)}: the bin -> pixel lookup would "
+            "read the wrong ground cell.")
+
+
 def train_mesh(cfg: Config):
     """Train `MeshTransformerModule` on (LOD1, LOD2) mesh-token pairs."""
     L.seed_everything(cfg.seed, workers=True)
@@ -58,6 +75,8 @@ def train_mesh(cfg: Config):
         raise ValueError("config_set='mesh' requires mesh_data.dataset_dir to be set.")
     if cfg.mesh_model.image_encoder and not cfg.mesh_data.ortho_dir:
         raise ValueError("mesh_model.image_encoder needs mesh_data.ortho_dir (the crops it encodes).")
+    check_vertex_margins(cfg.mesh_model.image_vertex_features, cfg.mesh_data.margin_lo,
+                         cfg.mesh_data.margin_hi)
     if cfg.mesh_model.init_from and not Path(cfg.mesh_model.init_from).is_file():
         raise ValueError(f"mesh_model.init_from not found: {cfg.mesh_model.init_from}")
 
@@ -182,6 +201,12 @@ def train_mesh(cfg: Config):
         image_dropout=cfg.mesh_model.image_dropout,
         train_scope=cfg.mesh_model.train_scope,
         backbone_lr_scale=cfg.mesh_model.backbone_lr_scale,
+        image_separate_positions=cfg.mesh_model.image_separate_positions,
+        image_mask_invalid=cfg.mesh_model.image_mask_invalid,
+        image_prefix_grid=cfg.mesh_model.image_prefix_grid,
+        image_vertex_features=cfg.mesh_model.image_vertex_features,
+        image_prefix_attention=cfg.mesh_model.image_prefix_attention,
+        image_vertex_width=cfg.mesh_model.image_vertex_width,
     )
     if cfg.mesh_model.init_from:
         model.load_weights_from(cfg.mesh_model.init_from)

@@ -1014,7 +1014,10 @@ class MeshTransformerModule(L.LightningModule):
                  opt_max_positions=None, tf_chamfer=False, data_split="random",
                  image_encoder=None, image_encoder_config=None, image_fusion="xattn",
                  image_size=256, image_margin=0.1, image_dropout=0.1,
-                 train_scope="all", backbone_lr_scale=1.0):
+                 train_scope="all", backbone_lr_scale=1.0,
+                 image_separate_positions=False, image_mask_invalid=False,
+                 image_prefix_grid=None, image_vertex_features=False,
+                 image_prefix_attention="causal", image_vertex_width=64):
         """
         Args:
             num_bins (int): coordinate discretization used by the tokenizer.
@@ -1051,6 +1054,12 @@ class MeshTransformerModule(L.LightningModule):
                 path trains).
             backbone_lr_scale (float): lr multiplier for everything outside the
                 image path of an image-conditioned model.
+            image_separate_positions, image_mask_invalid, image_prefix_grid,
+            image_vertex_features, image_prefix_attention, image_vertex_width:
+                the aligned-prefix options
+                (docs/superpowers/specs/2026-11-02-aligned-prefix-design.md,
+                section 3). Every default is the previous model; a checkpoint
+                whose hyperparameters lack them loads with the defaults.
         """
         super().__init__()
         # The tokenizer is a module, not a hyperparameter: pickling it into the
@@ -1097,9 +1106,20 @@ class MeshTransformerModule(L.LightningModule):
             raise ValueError(f"Unknown train_scope {train_scope!r}; expected 'all' or 'image_only'.")
         if train_scope == "image_only" and not self.uses_image:
             raise ValueError("train_scope='image_only' needs an image encoder.")
+        aligned = {"separate_positions": image_separate_positions,
+                   "mask_invalid": image_mask_invalid, "prefix_grid": image_prefix_grid,
+                   "vertex_features": image_vertex_features,
+                   "prefix_attention": image_prefix_attention,
+                   "vertex_width": image_vertex_width}
+        defaults = {"separate_positions": False, "mask_invalid": False, "prefix_grid": None,
+                    "vertex_features": False, "prefix_attention": "causal", "vertex_width": 64}
+        if not self.uses_image and aligned != defaults:
+            changed = sorted(f"image_{k}" for k in aligned if aligned[k] != defaults[k])
+            raise ValueError(f"{', '.join(changed)} configure the image path, but this model "
+                             "has no image encoder (mesh_model.image_encoder).")
         image = None if not self.uses_image else {
             "fusion": image_fusion, "name": image_encoder, "config": image_encoder_config,
-            "image_size": image_size, "beta": image_margin}
+            "image_size": image_size, "beta": image_margin, **aligned}
 
         self.vqvae = vqvae
         if vqvae is None:

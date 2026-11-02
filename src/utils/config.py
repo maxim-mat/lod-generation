@@ -201,6 +201,23 @@ class MeshModelConfig:
     train_scope: str = "all"
     # Multiplies training.lr for every non-image parameter (stage B: 0.1).
     backbone_lr_scale: float = 1.0
+    # Aligned prefix (docs/superpowers/specs/2026-11-02-aligned-prefix-design.md).
+    # Every default is the previous model, so old configs reproduce old runs.
+    # 3.1: mesh tokens keep v5's position ids; image tokens get none (prefix +
+    # sinusoidal only).
+    image_separate_positions: bool = False
+    # 3.2: dropout / no image masks the image tokens instead of feeding the null
+    # token; needs image_separate_positions.
+    image_mask_invalid: bool = False
+    # 3.3: average-pool the DINOv3 grid to N x N prefix tokens (8 -> 64); None = native.
+    image_prefix_grid: Optional[int] = None
+    # 3.4: add image features sampled at each vertex's (x, y) bin to its y/z
+    # tokens; coordinate tokenization, x/y margins 0. Prefix or xattn.
+    image_vertex_features: bool = False
+    # 3.5: "causal" | "bidirectional" (image queries see all image + LOD1 keys).
+    image_prefix_attention: str = "causal"
+    # Channels of the per-vertex path's stride-4 pixel CNN.
+    image_vertex_width: int = 64
     # Weights to start from (a .ckpt), e.g. the v5 best for stage A. Not a resume:
     # optimizer state and epoch counters start fresh.
     init_from: Optional[str] = None

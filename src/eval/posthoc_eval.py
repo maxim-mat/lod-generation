@@ -563,6 +563,9 @@ def main(argv=None):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
     info = checkpoint_info(ckpt)
     check_tokenization(info["hyper_parameters"], ref_cfg)
+    from src.train_mesh import check_vertex_margins
+    check_vertex_margins(info["hyper_parameters"].get("image_vertex_features", False),
+                         ref_cfg.mesh_data.margin_lo, ref_cfg.mesh_data.margin_hi)
 
     L.seed_everything(cfg.seed, workers=True)
     device = resolve_device(cfg.device)
