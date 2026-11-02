@@ -49,6 +49,7 @@ from src.eval.mesh_metrics import (
     surface_distances,
 )
 from src.models.embeddings import SinusoidalPositionEmbedding
+from src.models.prefix_layout import NO_POSITION
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +126,10 @@ class OPTSinusoidalPositions(nn.Module):
             position_ids = position_ids[:, past_key_values_length:]
         # Padded slots come out of that as -1. They are masked out of attention
         # anyway; clamping just keeps the position well-defined.
-        return self.embed(position_ids.clamp(min=0))
+        out = self.embed(position_ids.clamp(min=0))
+        # Image prefix tokens under separate positions carry no 1-D position
+        # (aligned-prefix spec §3.1); only explicit ids can hold the sentinel.
+        return out.masked_fill((position_ids == NO_POSITION)[..., None], 0.0)
 
 
 def invalid_logits_mask(tgt, vocab, num_bins, tokenization="coord", pad=None):
