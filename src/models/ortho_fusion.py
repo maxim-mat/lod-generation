@@ -6,6 +6,9 @@ at zero, so a model loaded from a text-only (here: image-free) checkpoint is
 reproduced exactly at step 0 and the image's influence grows only as far as it
 lowers the loss.
 
+Optionally each cross-attention is followed by a gated FFN, completing
+Flamingo's GATED XATTN-DENSE block.
+
 Injected by forward pre-hooks on the existing OPT layers rather than by
 subclassing them: OPT's modules -- and therefore every v5 state-dict key --
 stay untouched, and no Hugging Face internals are copied.
@@ -71,18 +74,39 @@ class CrossAttention(nn.Module):
         return self.out(o.transpose(1, 2).reshape(b, l, d)), kv
 
 
+class FeedForward(nn.Module):
+    """Pre-norm two-layer GELU MLP, the dense half of Flamingo's GATED XATTN-DENSE."""
+
+    def __init__(self, dim, hidden):
+        super().__init__()
+        self.net = nn.Sequential(nn.LayerNorm(dim), nn.Linear(dim, hidden), nn.GELU(),
+                                 nn.Linear(hidden, dim))
+
+    def forward(self, h):
+        return self.net(h)
+
+
 class GatedCrossAttention(nn.Module):
     """One gated cross-attention per decoder layer, applied before that layer.
 
     Args:
         layers: OPT's `decoder.layers` ModuleList (hooked, not modified).
         dim, n_head: OPT hidden size and head count.
+        ffn_dim: if given, follow each cross-attention with a gated FFN of this
+            hidden width, as Flamingo's GATED XATTN-DENSE block does
+            (arXiv:2204.14198, section 2.2). Its own tanh gate starts at zero
+            too, so step 0 is still the image-free model. None (the default)
+            builds nothing and keeps the old state-dict keys.
     """
 
-    def __init__(self, layers, dim, n_head):
+    def __init__(self, layers, dim, n_head, ffn_dim=None):
         super().__init__()
         self.blocks = nn.ModuleList(CrossAttention(dim, n_head) for _ in layers)
         self.gates = nn.Parameter(torch.zeros(len(layers)))
+        self.ffns = None
+        if ffn_dim is not None:
+            self.ffns = nn.ModuleList(FeedForward(dim, ffn_dim) for _ in layers)
+            self.ffn_gates = nn.Parameter(torch.zeros(len(layers)))
         self.active = None
         for i, layer in enumerate(layers):
             layer.register_forward_pre_hook(self._hook(i), with_kwargs=True)
@@ -106,6 +130,8 @@ class GatedCrossAttention(nn.Module):
             if ctx.kv is not None:
                 ctx.kv[i] = kv
             h = h + torch.tanh(self.gates[i]).to(h.dtype) * out
+            if self.ffns is not None:
+                h = h + torch.tanh(self.ffn_gates[i]).to(h.dtype) * self.ffns[i](h)
             if args:
                 return (h, *args[1:]), kwargs
             return args, {**kwargs, "hidden_states": h}

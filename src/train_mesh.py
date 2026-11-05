@@ -207,6 +207,7 @@ def train_mesh(cfg: Config):
         image_vertex_features=cfg.mesh_model.image_vertex_features,
         image_prefix_attention=cfg.mesh_model.image_prefix_attention,
         image_vertex_width=cfg.mesh_model.image_vertex_width,
+        image_xattn_ffn=cfg.mesh_model.image_xattn_ffn,
     )
     if cfg.mesh_model.init_from:
         model.load_weights_from(cfg.mesh_model.init_from)

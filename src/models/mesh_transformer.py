@@ -766,8 +766,10 @@ class MeshOPTTransformer(MeshEmbedding):
                 vertex_dim=cfg.word_embed_proj_dim if self.vertex_features else None,
                 vertex_width=image.get("vertex_width", 64))
             if self.image_fusion == "xattn":
-                self.xattn = GatedCrossAttention(self.opt.model.decoder.layers,
-                                                 cfg.hidden_size, cfg.num_attention_heads)
+                # OPT's own FFN width (3072 on opt-125m) for the optional gated FFN.
+                self.xattn = GatedCrossAttention(
+                    self.opt.model.decoder.layers, cfg.hidden_size, cfg.num_attention_heads,
+                    ffn_dim=cfg.ffn_dim if image.get("xattn_ffn", False) else None)
             else:
                 # Its own vector rather than a third `segment_embed` row, so the
                 # v5 table keeps its shape and loads unchanged.
@@ -795,6 +797,9 @@ class MeshOPTTransformer(MeshEmbedding):
         if attention == "bidirectional" and not separate:
             raise ValueError("image_prefix_attention='bidirectional' needs image_fusion='prefix' "
                              "and image_separate_positions.")
+        if image.get("xattn_ffn", False) and fusion != "xattn":
+            raise ValueError("image_xattn_ffn adds a gated FFN after each cross-attention; it "
+                             "needs image_fusion='xattn'.")
         if image.get("prefix_grid") is not None and fusion != "prefix":
             raise ValueError("image_prefix_grid pools the prefix tokens; it needs "
                              "image_fusion='prefix'.")
@@ -1020,7 +1025,8 @@ class MeshTransformerModule(L.LightningModule):
                  train_scope="all", backbone_lr_scale=1.0,
                  image_separate_positions=False, image_mask_invalid=False,
                  image_prefix_grid=None, image_vertex_features=False,
-                 image_prefix_attention="causal", image_vertex_width=64):
+                 image_prefix_attention="causal", image_vertex_width=64,
+                 image_xattn_ffn=False):
         """
         Args:
             num_bins (int): coordinate discretization used by the tokenizer.
@@ -1063,6 +1069,9 @@ class MeshTransformerModule(L.LightningModule):
                 (docs/superpowers/specs/2026-11-02-aligned-prefix-design.md,
                 section 3). Every default is the previous model; a checkpoint
                 whose hyperparameters lack them loads with the defaults.
+            image_xattn_ffn (bool): follow each gated cross-attention with a
+                gated FFN (Flamingo's GATED XATTN-DENSE, arXiv:2204.14198).
+                xattn fusion only; off by default, which is the previous model.
         """
         super().__init__()
         # The tokenizer is a module, not a hyperparameter: pickling it into the
@@ -1113,9 +1122,10 @@ class MeshTransformerModule(L.LightningModule):
                    "mask_invalid": image_mask_invalid, "prefix_grid": image_prefix_grid,
                    "vertex_features": image_vertex_features,
                    "prefix_attention": image_prefix_attention,
-                   "vertex_width": image_vertex_width}
+                   "vertex_width": image_vertex_width, "xattn_ffn": bool(image_xattn_ffn)}
         defaults = {"separate_positions": False, "mask_invalid": False, "prefix_grid": None,
-                    "vertex_features": False, "prefix_attention": "causal", "vertex_width": 64}
+                    "vertex_features": False, "prefix_attention": "causal", "vertex_width": 64,
+                    "xattn_ffn": False}
         if not self.uses_image and aligned != defaults:
             changed = sorted(f"image_{k}" for k in aligned if aligned[k] != defaults[k])
             raise ValueError(f"{', '.join(changed)} configure the image path, but this model "
@@ -1543,6 +1553,12 @@ class MeshTransformerModule(L.LightningModule):
             self.log("train_gate_abs_mean", gates.abs().mean(), on_step=True, on_epoch=False)
             for i, g in enumerate(gates):
                 self.log(f"train_gate_{i}", g, on_step=True, on_epoch=False)
+            if self.network.xattn.ffns is not None:
+                gates = torch.tanh(self.network.xattn.ffn_gates.detach())
+                self.log("train_ffn_gate_abs_mean", gates.abs().mean(), on_step=True,
+                         on_epoch=False)
+                for i, g in enumerate(gates):
+                    self.log(f"train_ffn_gate_{i}", g, on_step=True, on_epoch=False)
         return loss
 
     def _eval_step(self, batch, prefix, batch_idx=0):

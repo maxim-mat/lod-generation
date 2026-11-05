@@ -1,12 +1,15 @@
-# V6 stage A: gated cross-attention from the frozen v5 (tile split) into a
-# frozen DINOv3 encoding of the building's orthophoto crop.
+# V6 stage A: gated cross-attention from the frozen v5 (random split, epoch 20)
+# into a frozen DINOv3 encoding of the building's orthophoto crop.
 # Usage: python main.py --train --config configs/mesh-v6-ortho-xattn-a.yaml
 # Runbook: docs/ortho-conditioning-runbook.md
 #
 # Only the image path trains. The gates start at zero (Flamingo,
-# arXiv:2204.14198), so step 0 of this run IS the v5-tile model: epoch-0
-# `val_gen_chamfer_m` must sit within noise of the baseline on the same
-# buildings, and any later gain is the image's.
+# arXiv:2204.14198), so step 0 of this run IS v5 epoch 20. Its
+# val_gen_chamfer_m was 0.0859 on exactly the 32 val buildings
+# MeshEvalCallback scores here: same seed, split and n_val, and eval_indices
+# depends only on len(val). That holds while split.json shows
+# skipped_no_image = 0. So epoch-0 `val_gen_chamfer_m` well above 0.0859 means
+# the image path is hurting, and any gain below it is the image's.
 #
 # Gate to stage B (docs/research/2026-10-14-orthophoto-conditioning.md 4.3),
 # move on only when all hold:
@@ -71,27 +74,35 @@ mesh_model:
   image_encoder: facebook/dinov3-vitl16-pretrain-lvd1689m
   image_fusion: xattn
   image_dropout: 0.1
+  # Flamingo's GATED XATTN-DENSE (arXiv:2204.14198): a zero-gated FFN after
+  # each cross-attention (added 2026-11-05). With OPT frozen in stage A it is
+  # the only nonlinear, per-token transform between the attended image
+  # features and OPT. Both gates start at 0, so step 0 is still v5.
+  # ~4.7M params per layer on opt-125m. Ablate: mesh_model.image_xattn_ffn=false
+  image_xattn_ffn: true
   # Stage A: OPT frozen, only the image path (projector, coordinate embedding,
   # null token, cross-attention, gates) trains.
   train_scope: image_only
   backbone_lr_scale: 1.0
-  # v5 retrained on the tile split (Task 9). The random-split v5 checkpoint is
-  # refused by load_weights_from: it has seen this run's val/test tiles.
-  init_from: outputs/initial-runs/mesh-v5-full-opt-coord-tile/checkpoints/best.ckpt   # replace with the real best path
+  # The original v5 (random split), best checkpoint, as the prefix arms use.
+  # It predates the `data_split` hparam, which load_weights_from reads as
+  # `random`. On the planned tile split this becomes the v5-tile best instead.
+  init_from: outputs/initial-runs/mesh-v5-full-opt-coord/checkpoints/epoch=20-val_gen_chamfer_m=0.0859.ckpt
 
 training:
   batch_size: 4
   accumulate_grad_batches: 4   # effective batch 16, matching v3
   train_val_test_split: [0.8, 0.1, 0.1]
-  # Geographic split (Task 2a): whole 3DBAG tiles per split, plus a 50 m
-  # buffer that drops every training building whose footprint centroid lies
-  # within 50 m of a val/test building (3.4% of train on cleaner, per
-  # outputs/split_sweep). Chosen 2026-10-24 over a grid split: buildings at a
-  # split boundary would otherwise have training roofs inside their orthophoto
-  # crop. This baseline and every v6 config must name the same split
-  # (`tile-buffer50m`) -- load_weights_from refuses an init that differs.
-  split: tile
-  split_buffer_m: 50.0
+  # v5's per-building random split, FOR NOW (as the prefix arms, 2026-10-24,
+  # time constraints): it lets stage A start from the existing v5 checkpoint
+  # instead of waiting for the multi-day v5-tile retrain. Same seed and ratios
+  # as v5, and `random` reproduces v5's split index-for-index, so v5's
+  # val/test stay unseen. The cost is spatial leakage: val/test buildings have
+  # training neighbours a median ~6 m away, and those neighbours' crops show
+  # val/test roofs, so absolute metrics are optimistic. The true-vs-shuffled
+  # gap is still a within-model comparison. The planned split is `tile` +
+  # `split_buffer_m: 50.0`, with init_from the v5-tile run.
+  split: random
   # New parameters only; Flamingo-scale, not v5's from-scratch 1e-3.
   lr: 1.0e-4
   # Applied to WEIGHT MATRICES ONLY -- embeddings, LayerNorm gains and biases
@@ -155,7 +166,7 @@ logging:
     - wandb
   project_name: lod-generation
   experiment_name: initial-runs
-  run_name: mesh-v6-ortho-xattn-a
+  run_name: mesh-v6-ortho-xattn-a-random
   save_dir: outputs
   wandb_entity: maxim-lod
   wandb_offline: false
