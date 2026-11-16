@@ -55,11 +55,12 @@ def test_inference_refuses_image_models():
         _check_config(cfg)
 
 
-# The prefix arm runs on v5's random split for now (2026-10-24, time), from the
-# random-split v5 checkpoint; the xattn arms keep the tile split.
-@pytest.mark.parametrize("name, split", [("xattn-a", "tile-buffer50m"),
-                                         ("xattn-b", "tile-buffer50m"),
-                                         ("smoke", "tile-buffer50m"),
+# Every v6 arm runs on v5's random split for now (prefix 2026-10-24, xattn
+# 2026-11-05; time), from the random-split v5 checkpoint. The planned split is
+# tile-buffer50m (see the v5-tile baseline test below).
+@pytest.mark.parametrize("name, split", [("xattn-a", "random"),
+                                         ("xattn-b", "random"),
+                                         ("smoke", "random"),
                                          ("prefix", "random"), ("prefix-smoke", "random"),
                                          ("prefix-aligned", "random"),
                                          ("prefix-aligned-smoke", "random")])
@@ -72,16 +73,17 @@ def test_shipped_v6_configs_load(name, split):
     assert split_name(t.split, t.split_block_m, t.split_buffer_m) == split
 
 
-def test_prefix_inits_from_the_v5_run_on_its_split():
+@pytest.mark.parametrize("name", ["prefix", "xattn-a", "smoke"])
+def test_v6_inits_from_the_v5_run_on_its_split(name):
     from src.dataset.splits import split_name
     from src.utils.initialization import load_config
-    prefix = load_config(Path("configs/mesh-v6-ortho-prefix.yaml"), [])
+    run = load_config(Path(f"configs/mesh-v6-ortho-{name}.yaml"), [])
     v5 = load_config(Path("configs/mesh-v5-full-opt-coord.yaml"), [])
-    assert "/mesh-v5-full-opt-coord/checkpoints/" in prefix.mesh_model.init_from
-    for t in (prefix.training, v5.training):
+    assert "/mesh-v5-full-opt-coord/checkpoints/" in run.mesh_model.init_from
+    for t in (run.training, v5.training):
         assert split_name(t.split, t.split_block_m, t.split_buffer_m) == "random"
-    assert prefix.seed == v5.seed
-    assert list(prefix.training.train_val_test_split) == list(v5.training.train_val_test_split)
+    assert run.seed == v5.seed
+    assert list(run.training.train_val_test_split) == list(v5.training.train_val_test_split)
 
 
 def test_v5_tile_baseline_uses_the_v6_split():
@@ -116,8 +118,16 @@ def test_check_vertex_margins():
 def test_config_defaults_keep_the_old_prefix():
     m = Config().mesh_model
     assert (m.image_separate_positions, m.image_mask_invalid, m.image_prefix_grid,
-            m.image_vertex_features, m.image_prefix_attention, m.image_vertex_width) == \
-        (False, False, None, False, "causal", 64)
+            m.image_vertex_features, m.image_prefix_attention, m.image_vertex_width,
+            m.image_xattn_ffn) == (False, False, None, False, "causal", 64, False)
+
+
+@pytest.mark.parametrize("name, ffn", [("xattn-a", True), ("xattn-b", True), ("smoke", True),
+                                       ("prefix", False), ("prefix-aligned", False)])
+def test_gated_ffn_is_on_in_the_xattn_configs_only(name, ffn):
+    from src.utils.initialization import load_config
+    cfg = load_config(Path(f"configs/mesh-v6-ortho-{name}.yaml"), [])
+    assert cfg.mesh_model.image_xattn_ffn is ffn
 
 
 ALIGNED_FLAGS = {"image_separate_positions": True, "image_mask_invalid": True,

@@ -218,6 +218,9 @@ class MeshModelConfig:
     image_prefix_attention: str = "causal"
     # Channels of the per-vertex path's stride-4 pixel CNN.
     image_vertex_width: int = 64
+    # xattn only: a zero-gated FFN after each gated cross-attention, completing
+    # Flamingo's GATED XATTN-DENSE block (arXiv:2204.14198). Off = the old block.
+    image_xattn_ffn: bool = False
     # Weights to start from (a .ckpt), e.g. the v5 best for stage A. Not a resume:
     # optimizer state and epoch counters start fresh.
     init_from: Optional[str] = None

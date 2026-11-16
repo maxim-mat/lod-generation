@@ -49,8 +49,23 @@ split from the original v5 checkpoint, so step 0 is skipped. Run
 `mesh-v6-ortho-prefix-smoke.yaml` (mini_cleaner, 1 epoch; no gates, and step 0
 is not v5 because the prefix shifts OPT's positions), then step 5. Metrics are
 spatially optimistic on this split; compare true vs shuffled, and post-hoc
-against v5's own random-split evaluation. The tile split above still applies
-to the xattn arms and to a later prefix rerun.
+against v5's own random-split evaluation.
+
+Xattn, current (2026-11-05): the xattn configs moved to the same random split
+and the same v5 epoch-20 init (run names `mesh-v6-ortho-xattn-{a,b}-random`),
+so step 0 is skipped there too. Stage A's step 0 is exactly v5 epoch 20. That
+model scored `val_gen_chamfer_m` 0.0859 on the same 32 val buildings, so this
+is the epoch-0 reference (valid while `split.json` shows `skipped_no_image`
+= 0). The smoke has no logger; read its gates from the checkpoint (command in
+`mesh-v6-ortho-smoke.yaml`). The tile split above remains the plan for a later
+rerun of both arms.
+
+The xattn configs also set `mesh_model.image_xattn_ffn: true` (2026-11-05). This
+adds a zero-gated FFN after each cross-attention, completing Flamingo's GATED
+XATTN-DENSE block. Its gates log as `train_ffn_gate_{i}` and
+`train_ffn_gate_abs_mean`, next to `train_gate_*`. Step 0 is still v5. Ablate it
+with `mesh_model.image_xattn_ffn=false logging.run_name=<name>-noffn`. A
+stage-A checkpoint only initialises a stage B with the same setting.
 
 Before each run, replace the `mesh_model.init_from` placeholder with the real
 best checkpoint path (`{epoch:02d}-{val_gen_chamfer_m:.4f}.ckpt` in the

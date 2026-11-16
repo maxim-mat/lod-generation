@@ -56,26 +56,26 @@ mesh_model:
   image_encoder: facebook/dinov3-vitl16-pretrain-lvd1689m
   image_fusion: xattn
   image_dropout: 0.1
+  # Flamingo's GATED XATTN-DENSE (arXiv:2204.14198): a zero-gated FFN after
+  # each cross-attention (added 2026-11-05). With OPT frozen in stage A it is
+  # the only nonlinear, per-token transform between the attended image
+  # features and OPT. Both gates start at 0, so step 0 is still v5.
+  # ~4.7M params per layer on opt-125m. Ablate: mesh_model.image_xattn_ffn=false
+  image_xattn_ffn: true
   # Stage B: everything but DINOv3 trains; OPT at 0.1x the image path's lr.
   train_scope: all
   backbone_lr_scale: 0.1
   # Stage A's best checkpoint (a separate run, so each stage selects and
   # reproduces on its own).
-  init_from: outputs/initial-runs/mesh-v6-ortho-xattn-a/checkpoints/best.ckpt   # replace with stage A's best checkpoint path
+  init_from: outputs/initial-runs/mesh-v6-ortho-xattn-a-random/checkpoints/best.ckpt   # replace with stage A's best checkpoint path
 
 training:
   batch_size: 4
   accumulate_grad_batches: 4   # effective batch 16, matching v3
   train_val_test_split: [0.8, 0.1, 0.1]
-  # Geographic split (Task 2a): whole 3DBAG tiles per split, plus a 50 m
-  # buffer that drops every training building whose footprint centroid lies
-  # within 50 m of a val/test building (3.4% of train on cleaner, per
-  # outputs/split_sweep). Chosen 2026-10-24 over a grid split: buildings at a
-  # split boundary would otherwise have training roofs inside their orthophoto
-  # crop. This baseline and every v6 config must name the same split
-  # (`tile-buffer50m`) -- load_weights_from refuses an init that differs.
-  split: tile
-  split_buffer_m: 50.0
+  # v5's random split, for now, as in configs/mesh-v6-ortho-xattn-a.yaml (see
+  # there for the leakage caveat). Planned: `tile` + `split_buffer_m: 50.0`.
+  split: random
   # New parameters only; Flamingo-scale, not v5's from-scratch 1e-3.
   lr: 1.0e-4
   # Applied to WEIGHT MATRICES ONLY -- embeddings, LayerNorm gains and biases
@@ -139,7 +139,7 @@ logging:
     - wandb
   project_name: lod-generation
   experiment_name: initial-runs
-  run_name: mesh-v6-ortho-xattn-b
+  run_name: mesh-v6-ortho-xattn-b-random
   save_dir: outputs
   wandb_entity: maxim-lod
   wandb_offline: false
