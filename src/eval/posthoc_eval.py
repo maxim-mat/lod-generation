@@ -16,6 +16,7 @@ import itertools
 import json
 import logging
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -34,10 +35,12 @@ from omegaconf import OmegaConf
 from src.analysis.exact_volume import exact_pair_volumes
 from src.dataset.mesh_dataset import (amt_detokenize, detokenize, mesh_collate_fn,
                                       specials)
-from src.eval.mesh_eval import _resolve, _to_metres, eval_indices
-from src.eval.mesh_metrics import (chamfer_distance, hausdorff_max, hausdorff_p95,
-                                   is_watertight_mesh, roof_submesh,
-                                   surface_distances)
+from src.eval.face_match import (COUNT_COLUMNS, FACE_SCORE_COLUMNS, face_scores,
+                                 match_rates)
+from src.eval.mesh_eval import _resolve, eval_indices
+from src.eval.mesh_metrics import (chamfer_distance, chamfer_floor, chamfer_ratio,
+                                   hausdorff_max, hausdorff_p95, is_watertight_mesh,
+                                   roof_submesh, surface_distances)
 from src.eval.sinkhorn import mesh_sinkhorn
 from src.utils.config import PosthocEvalConfig, SinkhornConfig
 from src.utils.initialization import load_config
@@ -55,6 +58,12 @@ SPLITS = ("train", "val", "test")
 # Per-reference numeric columns that summaries average. Order is CSV order.
 METRIC_COLUMNS = ("chamfer_m", "hausdorff_p95_m", "hausdorff_max_m", "symdiff_m3",
                   "rel_symdiff", "sinkhorn_m", "roof_chamfer_m")
+# Reference-free columns that summaries also average (the raw counts are not).
+EXTRA_COLUMNS = (tuple(c for c in FACE_SCORE_COLUMNS if c not in COUNT_COLUMNS)
+                 + ("lod1_chamfer_norm",))
+
+# The do-nothing baseline: the decoded LOD1 condition scored as the generation.
+LOD1_COPY = "lod1_copy"
 
 # Which StrategyConfig fields each kind reads, in run-name order.
 STRATEGY_PARAMS = {
@@ -79,6 +88,8 @@ class DecodeRun:
     def generate_kwargs(self):
         """Keyword arguments for `MeshTransformerModule.generate`, seeds excluded."""
         p = self.params
+        if self.kind == LOD1_COPY:
+            return {}
         if self.kind == "greedy":
             return {"temperature": 0.0}
         if self.kind == "beam":
@@ -167,6 +178,12 @@ def validate_posthoc_config(cfg):
         raise ValueError(f"batch_size must be >= 1, got {cfg.batch_size}.")
     if not cfg.strategies:
         raise ValueError("At least one strategy is required.")
+    if not cfg.reference_configs:
+        raise ValueError("reference_configs is empty: name at least one training config.")
+    if len(cfg.checkpoints) != len(cfg.reference_configs):
+        raise ValueError(f"checkpoints has {len(cfg.checkpoints)} entries but "
+                         f"reference_configs has {len(cfg.reference_configs)}; they "
+                         "pair by position (null = the run's best checkpoint).")
     return expand_strategies(cfg.strategies)
 
 
@@ -354,34 +371,124 @@ def _summarize(run, rows, cfg):
         if "roof_chamfer" in cfg.metrics:
             out[f"roof_defined_pct_vs_{ref}"] = (
                 100.0 * np.isfinite(df[f"roof_chamfer_m_vs_{ref}"].astype(float)).mean())
+    for col in EXTRA_COLUMNS:
+        if col in df:
+            out[f"{col}_mean"] = df[col].mean()
+            out[f"{col}_median"] = df[col].median()
+    if set(COUNT_COLUMNS) <= set(df):
+        # face_match's micro average: rates of the counts pooled over the split.
+        micro = match_rates(df[list(COUNT_COLUMNS)].sum().to_dict())
+        out.update({f"{k}_micro": v for k, v in micro.items()})
     return out
 
 
-def _score_batch(model, batch, out, cond, tgt, cond_pad, cfg, seeds, seconds, device):
-    """Decode each generated sequence and score it against its references."""
+SAMPLE_COLUMN = "roof_chamfer_m_vs_lod2"
+
+
+def select_samples(df, column=SAMPLE_COLUMN, k=5):
+    """Object ids of the ``k`` best, most typical and worst rows by ``column``.
+
+    Rows where ``column`` is NaN are not ranked. ``good`` runs best first,
+    ``bad`` worst first, ``avg`` closest-to-the-median first. With fewer than
+    ``3 * k`` rows the buckets overlap rather than come up short.
+
+    Returns:
+        dict: ``{"good": [...], "avg": [...], "bad": [...]}``.
+    """
+    ranked = df[np.isfinite(df[column].astype(float))].sort_values(column, kind="stable")
+    ids = ranked["object_id"].astype(str)
+    dist = (ranked[column] - ranked[column].median()).abs()
+    return {"good": ids.head(k).tolist(),
+            "avg": ids[dist.sort_values(kind="stable").index[:k]].tolist(),
+            "bad": ids.iloc[::-1].head(k).tolist()}
+
+
+def write_samples(run_dir, picks, meshes, rows):
+    """One LOD1 | LOD2 | generated plotly page per picked object.
+
+    Args:
+        picks: `select_samples` output.
+        meshes: object id -> ``{"lod1", "lod2", "gen"}`` metre meshes.
+        rows: this run's `objects.csv` rows, for the titles.
+
+    Returns:
+        list[Path]: the files written, in bucket then rank order.
+    """
+    from src.visualize_mesh import mesh_figure, side_by_side
+
+    by_id = {str(r["object_id"]): r for r in rows}
+    out_dir = Path(run_dir) / "samples"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for bucket in ("good", "avg", "bad"):
+        for rank, oid in enumerate(picks.get(bucket, []), start=1):
+            m, row = meshes[oid], by_id[oid]
+            panels = [("LOD1 input", m["lod1"], "#898781"),
+                      ("LOD2 truth", m["lod2"], "#2a78d6"),
+                      (f"generated ({Path(run_dir).name})", m["gen"], "#eda100")]
+            fig = side_by_side([mesh_figure(*mesh, color=c) for _, mesh, c in panels],
+                               [f"{name}, {len(mesh[1])} tris" for name, mesh, _ in panels])
+            fig.update_layout(title=(
+                f"[{bucket} #{rank}] {oid} | roof chamfer {row.get(SAMPLE_COLUMN, np.nan):.3f} m"
+                f" | chamfer {row.get('chamfer_m_vs_lod2', np.nan):.3f} m"
+                f" | face F1 {row.get('face_f1', np.nan):.3f}"))
+            path = out_dir / f"{bucket}_{rank}_{re.sub(r'[^\w.-]', '_', oid)}.html"
+            fig.write_html(path, include_plotlyjs="cdn")
+            paths.append(path)
+    return paths
+
+
+def _lod1_unit(model, batch, k):
+    """The LOD1 condition of item ``k``, decoded to the unit box."""
     inverse = amt_detokenize if model.tokenization == "amt" else detokenize
-    rows = []
+    return inverse(batch["cond"][k].cpu().numpy(), model.num_bins)
+
+
+def _score_batch(model, batch, gen_unit, eos_emitted, cfg, seeds, seconds, device):
+    """Score each item's unit-box generation against its references.
+
+    Args:
+        gen_unit: one ``(verts, faces)`` in the unit box per item: a decoded
+            generation, or the decoded condition for `LOD1_COPY`.
+        eos_emitted: one bool per item, or None when nothing was generated.
+
+    Returns:
+        tuple: (rows, meshes) where ``meshes`` maps object id to the metre
+        ``lod1`` / ``lod2`` / ``gen`` meshes the samples are drawn from.
+    """
+    with torch.no_grad():
+        cond, tgt, cond_pad, _ = model._prepare(batch)
+    rows, meshes = [], {}
     for k, oid in enumerate(batch["ids"]):
         centre = batch["center"][k].cpu().numpy()
         scale = batch["scale"][k].cpu().numpy()
         item_cond = model._item_cond((cond, cond_pad), k)
-        gen = _to_metres(model, out[k].cpu(), centre, scale, item_cond)
         # Both references go through the tokenizer round trip, as in run_mesh_eval.
-        lod2 = _to_metres(model, tgt[k].cpu(), centre, scale, item_cond)
-        v1, f1 = inverse(batch["cond"][k].cpu().numpy(), model.num_bins)
-        lod1 = (v1 * scale + centre, f1)
+        units = {"gen": gen_unit[k],
+                 "lod2": model.decode_tokens(tgt[k].cpu(), cond=item_cond),
+                 "lod1": _lod1_unit(model, batch, k)}
+        metres = {name: (np.asarray(v) * scale + centre, f) for name, (v, f) in units.items()}
+        gen, lod1, lod2 = metres["gen"], metres["lod1"], metres["lod2"]
         refs = {"lod1": lod1, "lod2": lod2}
 
         row = {"object_id": str(oid), "seed": seeds[k],
                "n_faces_lod1": len(lod1[1]), "n_faces_lod2": len(lod2[1]),
-               "eos_emitted": bool((out[k] == model.eos).any()),
+               "eos_emitted": float("nan") if eos_emitted is None else eos_emitted[k],
                "decode_ok": bool(len(gen[1]) > 0), "gen_seconds": seconds}
         row.update(score_object(gen, {name: refs[name] for name in cfg.references},
                                 cfg.metrics, n_points=cfg.n_points,
                                 sinkhorn_cfg=cfg.sinkhorn, seed=SURFACE_SEED,
                                 device=device))
+        row.update(face_scores(units["gen"], units["lod2"], units["lod1"], scale,
+                               model.num_bins))
+        if "chamfer_m_vs_lod1" in row:
+            # Below 1: the generation sits closer to LOD1 than the truth does.
+            row["lod1_chamfer_norm"] = chamfer_ratio(
+                row["chamfer_m_vs_lod1"],
+                chamfer_floor(lod1, lod2, cfg.n_points, seed=SURFACE_SEED))
         rows.append(row)
-    return rows
+        meshes[str(oid)] = metres
+    return rows, meshes
 
 
 def run_posthoc_eval(cfg, ref_cfg, model, dataset, out_dir, checkpoint=None,
@@ -423,7 +530,7 @@ def run_posthoc_eval(cfg, ref_cfg, model, dataset, out_dir, checkpoint=None,
     position = {k: p for p, k in enumerate(indices)}
     model.eval()
     summary = []
-    for run in runs:
+    for run in runs + [DecodeRun(name=LOD1_COPY, kind=LOD1_COPY, params={})]:
         run_dir = out_dir / run.name
         run_dir.mkdir(exist_ok=True)
         kwargs = run.generate_kwargs()
@@ -434,7 +541,7 @@ def run_posthoc_eval(cfg, ref_cfg, model, dataset, out_dir, checkpoint=None,
             "surface_seed": SURFACE_SEED})
         logger.info("[posthoc] %s: %d objects", run.name, len(indices))
 
-        rows = []
+        rows, meshes = [], {}
         for start in range(0, len(indices), cfg.batch_size):
             chunk = indices[start:start + cfg.batch_size]
             items = []
@@ -453,21 +560,41 @@ def run_posthoc_eval(cfg, ref_cfg, model, dataset, out_dir, checkpoint=None,
                            if cfg.image_mode == "none" else None)
             seeds = [object_seed(cfg.seed, oid) for oid in batch["ids"]]
 
-            started = time.perf_counter()
-            with torch.no_grad():
-                cond, tgt, cond_pad, _ = model._prepare(batch)
-                out = model.generate(cond, cond_pad, max_new_tokens=max_new_tokens,
-                                     seeds=seeds, image=batch.get("image"),
-                                     image_valid=image_valid, **kwargs)
-            seconds = (time.perf_counter() - started) / len(chunk)
+            if run.kind == LOD1_COPY:
+                gen_unit = [_lod1_unit(model, batch, k) for k in range(len(chunk))]
+                eos, seconds = None, 0.0
+            else:
+                started = time.perf_counter()
+                with torch.no_grad():
+                    cond, _, cond_pad, _ = model._prepare(batch)
+                    out = model.generate(cond, cond_pad, max_new_tokens=max_new_tokens,
+                                         seeds=seeds, image=batch.get("image"),
+                                         image_valid=image_valid, **kwargs)
+                seconds = (time.perf_counter() - started) / len(chunk)
+                # The VQ-VAE decoder reads this item's encoded condition.
+                gen_unit = [model.decode_tokens(out[k].cpu(),
+                                                cond=model._item_cond((cond, cond_pad), k))
+                            for k in range(len(chunk))]
+                eos = [bool((out[k] == model.eos).any()) for k in range(len(chunk))]
 
-            batch_rows = _score_batch(model, batch, out, cond, tgt, cond_pad, cfg,
-                                      seeds, seconds, device)
+            batch_rows, batch_meshes = _score_batch(model, batch, gen_unit, eos, cfg,
+                                                    seeds, seconds, device)
             # Flushed per batch: a crash keeps every finished object.
             _append_csv(run_dir / "objects.csv", batch_rows)
             rows.extend(batch_rows)
+            # ponytail: every mesh of the run stays in memory (~100 MB on a
+            # 25k split) until the samples are picked; regenerate the picks
+            # instead if a larger split ever runs out of RAM.
+            meshes.update(batch_meshes)
 
         summary.append(_summarize(run, rows, cfg))
+        if SAMPLE_COLUMN in rows[0]:
+            write_samples(run_dir, select_samples(pd.DataFrame(rows)), meshes, rows)
+        else:
+            logger.warning("[posthoc] %s: no %s column, so no samples (needs the "
+                           "roof_chamfer metric and the lod2 reference)",
+                           run.name, SAMPLE_COLUMN)
+        del meshes
         pd.DataFrame(summary).to_csv(out_dir / "summary.csv", index=False)
     return summary
 
@@ -551,38 +678,81 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-    # Cheapest checks first: nothing below touches data until all of these pass.
+    # Cheapest checks first, for EVERY model: a bad last entry must fail in
+    # seconds, not after the first models have generated for days.
     cfg = load_posthoc_config(args.config, args.overrides)
     validate_posthoc_config(cfg)
-    ref_cfg = load_config(Path(cfg.reference_config), list(cfg.reference_overrides))
-    if ref_cfg.config_set != "mesh":
-        raise ValueError(f"reference config has config_set={ref_cfg.config_set!r}; "
-                         "post-hoc eval scores mesh-transformer runs (config_set: mesh).")
-    ckpt = Path(cfg.checkpoint)
-    if not ckpt.is_file():
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
-    info = checkpoint_info(ckpt)
-    check_tokenization(info["hyper_parameters"], ref_cfg)
     from src.train_mesh import check_vertex_margins
-    check_vertex_margins(info["hyper_parameters"].get("image_vertex_features", False),
-                         ref_cfg.mesh_data.margin_lo, ref_cfg.mesh_data.margin_hi)
+    models = []
+    for ref_path, ckpt_arg in zip(cfg.reference_configs, cfg.checkpoints):
+        ref_cfg = load_config(Path(ref_path), list(cfg.reference_overrides))
+        if ref_cfg.config_set != "mesh":
+            raise ValueError(f"{ref_path} has config_set={ref_cfg.config_set!r}; post-hoc "
+                             "eval scores mesh-transformer runs (config_set: mesh).")
+        ckpt = resolve_checkpoint(ref_cfg, ckpt_arg)
+        info = checkpoint_info(ckpt)
+        check_tokenization(info["hyper_parameters"], ref_cfg)
+        check_vertex_margins(info["hyper_parameters"].get("image_vertex_features", False),
+                             ref_cfg.mesh_data.margin_lo, ref_cfg.mesh_data.margin_hi)
+        models.append((ref_cfg, ckpt, info))
+    names = [ref_cfg.logging.run_name for ref_cfg, _, _ in models]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        raise ValueError(f"Two entries share logging.run_name {dupes}, so they would "
+                         "write into one directory. Score them in separate calls.")
 
-    L.seed_everything(cfg.seed, workers=True)
     device = resolve_device(cfg.device)
-    dataset, sizes = build_split(ref_cfg, cfg.split)
-    model = load_model(ref_cfg, ckpt, device)
-
-    base = (Path(cfg.output_dir) if cfg.output_dir else
-            Path(ref_cfg.logging.save_dir, ref_cfg.logging.experiment_name,
-                 ref_cfg.logging.run_name, "posthoc_eval"))
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    out_dir = base / ckpt.stem / (stamp if cfg.image_mode == "true" else f"{cfg.image_mode}-{stamp}")
-    logger.info("[posthoc] %s, %s split (%d objects) -> %s",
-                ckpt.name, cfg.split, len(dataset), out_dir)
-    run_posthoc_eval(cfg, ref_cfg, model, dataset, out_dir, checkpoint=info,
-                     split_sizes=sizes, device=device)
-    logger.info("[posthoc] done: %s", out_dir)
-    return out_dir
+    root = (Path(cfg.output_dir or "outputs/posthoc_eval")
+            / (stamp if cfg.image_mode == "true" else f"{cfg.image_mode}-{stamp}"))
+    combined = []
+    for (ref_cfg, ckpt, info), name in zip(models, names):
+        # Re-seeded per model, so a model's rows do not depend on its position.
+        L.seed_everything(cfg.seed, workers=True)
+        dataset, sizes = build_split(ref_cfg, cfg.split)
+        model = load_model(ref_cfg, ckpt, device)
+        logger.info("[posthoc] %s (%s), %s split (%d objects) -> %s",
+                    name, ckpt.name, cfg.split, len(dataset), root / name)
+        summary = run_posthoc_eval(cfg, ref_cfg, model, dataset, root / name,
+                                   checkpoint=info, split_sizes=sizes, device=device)
+        combined.extend({"model": name, **row} for row in summary)
+        # Rewritten after each model: a crash keeps every finished one.
+        pd.DataFrame(combined).to_csv(root / "summary.csv", index=False)
+        del model
+        if str(device).startswith("cuda"):
+            torch.cuda.empty_cache()
+    logger.info("[posthoc] done: %s", root)
+    return root
+
+
+def resolve_checkpoint(ref_cfg, checkpoint):
+    """The checkpoint file to score for one reference config.
+
+    A given path must exist. ``None`` takes the run's lowest
+    ``val_gen_chamfer_m=<x>.ckpt`` (what training selects on), else its
+    ``last.ckpt``, from ``<save_dir>/<experiment_name>/<run_name>/checkpoints``.
+
+    Raises:
+        FileNotFoundError: the path, or every candidate, is missing.
+    """
+    if checkpoint is not None:
+        path = Path(checkpoint)
+        if not path.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {path}")
+        return path
+    lg = ref_cfg.logging
+    ckpt_dir = Path(lg.save_dir, lg.experiment_name, lg.run_name, "checkpoints")
+    scored = []
+    for p in ckpt_dir.glob("*.ckpt"):
+        m = re.search(r"val_gen_chamfer_m=([0-9.]+)\.ckpt$", p.name)
+        if m:
+            scored.append((float(m.group(1)), p.name, p))
+    if scored:
+        return min(scored)[2]
+    if (ckpt_dir / "last.ckpt").is_file():
+        return ckpt_dir / "last.ckpt"
+    raise FileNotFoundError(f"No val_gen_chamfer_m checkpoint and no last.ckpt in "
+                            f"{ckpt_dir}; set its entry in checkpoints explicitly.")
 
 
 if __name__ == "__main__":

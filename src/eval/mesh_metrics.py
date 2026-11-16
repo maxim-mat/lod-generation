@@ -389,21 +389,30 @@ def roof_submesh(verts, faces, up=_UP):
     empty = (np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64))
     v = np.asarray(verts, dtype=float).reshape(-1, 3)
     f = np.asarray(faces, dtype=np.int64).reshape(-1, 3)
-    if len(f) == 0:
-        return empty
-
-    a, b, c = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
-    cross = np.cross(b - a, c - a)
-    norm = np.linalg.norm(cross, axis=1)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        nz = np.where(norm > 0, cross[:, 2] / norm, 0.0)
-
-    roof = f[nz > up]
+    roof = f[roof_mask(v, f, up)]
     if len(roof) == 0:
         return empty
     used, inverse = np.unique(roof, return_inverse=True)
     # reshape: numpy 2.0.0 returned `inverse` in the input's shape, others flat.
     return v[used], inverse.reshape(-1, 3).astype(np.int64)
+
+
+def roof_mask(verts, faces, up=_UP):
+    """``[F]`` bool: the winding-derived unit normal has ``z > up``.
+
+    The one roof rule `roof_submesh` and `face_match.face_scores` share. Pass metres,
+    not unit-box bins: the bin grid is scaled per axis, which tilts normals.
+    """
+    v = np.asarray(verts, dtype=float).reshape(-1, 3)
+    f = np.asarray(faces, dtype=np.int64).reshape(-1, 3)
+    if len(f) == 0:
+        return np.zeros(0, dtype=bool)
+    a, b, c = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
+    cross = np.cross(b - a, c - a)
+    norm = np.linalg.norm(cross, axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        nz = np.where(norm > 0, cross[:, 2] / norm, 0.0)
+    return nz > up
 
 
 def roof_height_error(gen, gt):

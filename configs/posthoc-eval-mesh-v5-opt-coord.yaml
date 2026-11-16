@@ -5,10 +5,10 @@
 # Guide: docs/posthoc-eval-runbook.md
 #
 # Only eval settings live here. The corpus, the split seed, the tokenizer and
-# the model shape all come from `reference_config`, so this file cannot
+# the model shape all come from `reference_configs`, so this file cannot
 # silently describe a different dataset than the checkpoint was trained on.
 
-reference_config: configs/mesh-v5-full-opt-coord.yaml
+reference_configs: [configs/mesh-v5-full-opt-coord.yaml]
 
 # `save_last: True` is set in setup_utils, so every run has a last.ckpt.
 # For the SELECTED model use the best-scoring file instead --
@@ -16,16 +16,16 @@ reference_config: configs/mesh-v5-full-opt-coord.yaml
 # this run's checkpoint monitor is val_gen_chamfer_m, not the last epoch.
 # NOTE (2026-09-16): no mesh-v5-* run directory exists locally yet, so this
 # path is where the run WILL write, not a file on disk today.
-checkpoint: outputs/initial-runs/mesh-v5-full-opt-coord/checkpoints/last.ckpt
+checkpoints: [outputs/initial-runs/mesh-v5-full-opt-coord/checkpoints/last.ckpt]
 
 # Dot-list applied to the reference config. Use it when the corpus has moved --
 # e.g. ["mesh_data.dataset_dir=data/The Hague/mini_remote"] -- rather than
 # editing the training config, which would change what the run means.
 reference_overrides: []
 
-split: val
+split: test
 
-# 256 of the ~25,892 val objects (the reference config's own arithmetic: train
+# 256 of the ~25,892 test objects (the reference config's own arithmetic: train
 # 207,138 = 80% of 258,923). The subsample is seeded, so every strategy and
 # every re-run scores the SAME buildings -- that is what makes two rows
 # comparable. null scores the whole split: 7 strategies x 25.9k objects, one of
@@ -39,7 +39,7 @@ batch_size: 8
 
 seed: 1234
 device: auto
-output_dir: null   # -> outputs/initial-runs/mesh-v5-full-opt-coord/posthoc_eval
+output_dir: null   # -> outputs/posthoc_eval/<stamp>/mesh-v5-full-opt-coord
 
 # The default grid: greedy, two beam widths, top-p and min-p at two
 # temperatures. Sampled runs draw one generation per object, seeded from

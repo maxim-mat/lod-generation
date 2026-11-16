@@ -17,8 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _cfg(**kw):
-    kw.setdefault("reference_config", "unused.yaml")
-    kw.setdefault("checkpoint", "unused.ckpt")
+    kw.setdefault("reference_configs", ["unused.yaml"])
+    kw.setdefault("checkpoints", ["unused.ckpt"])
     return PosthocEvalConfig(**kw)
 
 
@@ -69,6 +69,8 @@ def test_duplicate_run_names_are_rejected():
     ({"split": "holdout"}, "split"),
     ({"strategies": []}, "strategy"),
     ({"batch_size": 0}, "batch_size"),
+    ({"checkpoints": ["a", "b"]}, "checkpoints"),
+    ({"reference_configs": [], "checkpoints": []}, "reference_configs"),
 ])
 def test_validation_fails_fast(kw, match):
     with pytest.raises(ValueError, match=match):
@@ -77,8 +79,8 @@ def test_validation_fails_fast(kw, match):
 
 def test_loading_merges_yaml_and_overrides(tmp_path):
     path = tmp_path / "eval.yaml"
-    path.write_text("reference_config: configs/mesh-v5-full-coord.yaml\n"
-                    "checkpoint: some.ckpt\n"
+    path.write_text("reference_configs: [configs/mesh-v5-full-coord.yaml]\n"
+                    "checkpoints: [some.ckpt]\n"
                     "strategies:\n  - {kind: beam, beam_size: [2]}\n")
     cfg = load_posthoc_config(path, ["max_objects=16", "sinkhorn.blur_m=0.2"])
     assert cfg.max_objects == 16 and cfg.sinkhorn.blur_m == 0.2
@@ -87,7 +89,7 @@ def test_loading_merges_yaml_and_overrides(tmp_path):
 
 def test_loading_rejects_unknown_keys(tmp_path):
     path = tmp_path / "eval.yaml"
-    path.write_text("reference_config: a.yaml\ncheckpoint: b.ckpt\n"
+    path.write_text("reference_configs: [a.yaml]\ncheckpoints: [b.ckpt]\n"
                     "strategies:\n  - {kind: beam, beams: [3]}\n")
     with pytest.raises(OmegaConfBaseException):
         load_posthoc_config(path, [])
@@ -95,14 +97,18 @@ def test_loading_rejects_unknown_keys(tmp_path):
 
 def test_loading_requires_a_checkpoint(tmp_path):
     path = tmp_path / "eval.yaml"
-    path.write_text("reference_config: a.yaml\n")
+    path.write_text("reference_configs: [a.yaml]\n")
     with pytest.raises(OmegaConfBaseException):
         load_posthoc_config(path, [])
 
 
-def test_the_shipped_config_is_valid():
-    cfg = load_posthoc_config(ROOT / "configs" / "posthoc-eval.yaml", [])
-    assert len(validate_posthoc_config(cfg)) == 7
+def test_every_shipped_posthoc_config_is_valid():
+    paths = sorted((ROOT / "configs").glob("posthoc-eval*.yaml"))
+    assert len(paths) >= 3
+    for path in paths:
+        cfg = load_posthoc_config(path, [])
+        assert validate_posthoc_config(cfg), path.name
+        assert len(cfg.reference_configs) == len(cfg.checkpoints), path.name
 
 
 # ---------------------------------------------------------------- Task 5
@@ -181,6 +187,7 @@ import pandas as pd
 import torch
 
 from src.dataset.mesh_dataset import specials
+from src.eval.face_match import FACE_SCORE_COLUMNS
 from src.eval.posthoc_eval import checkpoint_info, object_seed, run_posthoc_eval
 from src.models.mesh_transformer import MeshTransformerModule
 from src.utils.config import Config
@@ -234,7 +241,22 @@ OBJECT_COLUMNS = [
     "gen_seconds", "n_faces_gen", "watertight_gen",
 ] + [f"{m}_vs_{ref}" for ref in ("lod1", "lod2")
      for m in ("chamfer_m", "hausdorff_p95_m", "hausdorff_max_m", "symdiff_m3",
-               "rel_symdiff", "vol_ok", "vol_note", "sinkhorn_m", "roof_chamfer_m")]
+               "rel_symdiff", "vol_ok", "vol_note", "sinkhorn_m", "roof_chamfer_m")
+] + list(FACE_SCORE_COLUMNS) + ["lod1_chamfer_norm"]
+
+
+def _perfect(monkeypatch, model):
+    """Make `generate` hand back the batch's own target: a perfect generation."""
+    stash, prepare = {}, model._prepare
+
+    def spy_prepare(batch):
+        out = prepare(batch)
+        stash["tgt"] = out[1]
+        return out
+    monkeypatch.setattr(model, "_prepare", spy_prepare)
+    monkeypatch.setattr(type(model), "generate",
+                        lambda self, cond, cond_pad_mask=None, **kw: stash["tgt"])
+    return model
 
 
 def test_object_seed_is_stable_and_distinct():
@@ -263,7 +285,7 @@ def test_end_to_end_writes_one_row_per_object_per_run(tmp_path):
                                checkpoint=checkpoint_info(ckpt),
                                split_sizes={"train": 0, "val": 2, "test": 0})
 
-    names = [r.name for r in expand_strategies(cfg.strategies)]
+    names = [r.name for r in expand_strategies(cfg.strategies)] + ["lod1_copy"]
     assert [row["run"] for row in summary] == names
     for name in names:
         df = pd.read_csv(out / name / "objects.csv")
@@ -276,12 +298,71 @@ def test_end_to_end_writes_one_row_per_object_per_run(tmp_path):
                      "checkpoint.json", "split.json", "summary.csv"):
         assert (out / artifact).is_file(), artifact
     table = pd.read_csv(out / "summary.csv")
-    assert len(table) == 7
+    assert len(table) == 8
     assert {"watertight_pct", "decode_rate", "eos_rate", "chamfer_m_vs_lod2_mean",
             "chamfer_m_vs_lod2_median", "vol_defined_pct_vs_lod1",
-            "roof_defined_pct_vs_lod2"} <= set(table.columns)
+            "roof_defined_pct_vs_lod2", "face_f1_mean", "roof_face_f1_mean",
+            "gen_copy_norm_mean", "lod1_chamfer_norm_mean", "gen_precision_micro",
+            "gen_copy_micro"} <= set(table.columns)
     split = json.loads((out / "split.json").read_text())
     assert split["n_evaluated"] == 2 and split["split_sizes"]["val"] == 2
+
+
+def test_lod1_copy_scores_the_condition_as_its_generation(tmp_path):
+    cfg = _small_cfg(strategies=[StrategyConfig(kind="greedy")], metrics=["chamfer"])
+    run_posthoc_eval(cfg, Config(), _model(), _Dataset(), tmp_path / "e")
+    df = pd.read_csv(tmp_path / "e" / "lod1_copy" / "objects.csv")
+    assert (df["n_faces_gen"] == df["n_faces_lod1"]).all()
+    assert np.allclose(df["chamfer_m_vs_lod1"], 0.0, atol=1e-9)
+    assert (df["gen_copy"] == 1.0).all()
+    assert df["eos_emitted"].isna().all()
+
+
+def test_a_perfect_generation_scores_perfectly(tmp_path, monkeypatch):
+    model = _perfect(monkeypatch, _model())
+    cfg = _small_cfg(strategies=[StrategyConfig(kind="greedy")], metrics=["chamfer"])
+    run_posthoc_eval(cfg, Config(), model, _Dataset(), tmp_path / "e")
+    df = pd.read_csv(tmp_path / "e" / "greedy" / "objects.csv")
+    assert (df["face_f1"] == 1.0).all() and (df["face_acc"] == 1.0).all()
+    assert np.allclose(df["chamfer_m_vs_lod2"], 0.0, atol=1e-9)
+
+
+def test_select_samples_buckets():
+    from src.eval.posthoc_eval import select_samples
+    df = pd.DataFrame({"object_id": [f"o{i}" for i in range(21)] + ["n1", "n2"],
+                       "roof_chamfer_m_vs_lod2": list(range(21)) + [np.nan, np.nan]})
+    picks = select_samples(df)
+    assert picks["good"] == ["o0", "o1", "o2", "o3", "o4"]
+    assert picks["bad"] == ["o20", "o19", "o18", "o17", "o16"]
+    assert set(picks["avg"]) == {"o8", "o9", "o10", "o11", "o12"}
+    assert picks["avg"][0] == "o10"
+
+
+def test_select_samples_with_few_rows():
+    from src.eval.posthoc_eval import select_samples
+    df = pd.DataFrame({"object_id": ["a", "b", "c"],
+                       "roof_chamfer_m_vs_lod2": [0.3, 0.1, 0.2]})
+    picks = select_samples(df)
+    assert all(len(ids) == 3 for ids in picks.values())
+
+
+def test_sample_file_names_are_sanitized(tmp_path):
+    from src.eval.posthoc_eval import write_samples
+    box = _box()
+    meshes = {"a/b:c": {"lod1": box, "lod2": _box(0.5), "gen": box}}
+    rows = [{"object_id": "a/b:c", "roof_chamfer_m_vs_lod2": 0.5,
+             "chamfer_m_vs_lod2": 0.2, "face_f1": 0.0}]
+    paths = write_samples(tmp_path, {"good": ["a/b:c"], "avg": [], "bad": []}, meshes, rows)
+    assert paths == [tmp_path / "samples" / "good_1_a_b_c.html"]
+    assert "plotly" in paths[0].read_text(encoding="utf-8")
+
+
+def test_samples_are_written_per_run(tmp_path, monkeypatch):
+    model = _perfect(monkeypatch, _model())
+    cfg = _small_cfg(strategies=[StrategyConfig(kind="greedy")],
+                     metrics=["chamfer", "roof_chamfer"])
+    run_posthoc_eval(cfg, Config(), model, _Dataset(), tmp_path / "e")
+    assert list((tmp_path / "e" / "greedy" / "samples").glob("*.html"))
 
 
 def test_a_rerun_reproduces_every_row(tmp_path):
@@ -339,8 +420,8 @@ def _write(tmp_path, text):
 
 
 def test_main_rejects_a_bad_metric_before_reading_anything(tmp_path):
-    path = _write(tmp_path, "reference_config: does/not/exist.yaml\n"
-                            "checkpoint: nope.ckpt\nmetrics: [emd]\n")
+    path = _write(tmp_path, "reference_configs: [does/not/exist.yaml]\n"
+                            "checkpoints: [nope.ckpt]\nmetrics: [emd]\n")
     with pytest.raises(ValueError, match="metric"):
         main(["--config", str(path)])
 
@@ -348,19 +429,88 @@ def test_main_rejects_a_bad_metric_before_reading_anything(tmp_path):
 def test_main_rejects_a_non_mesh_reference(tmp_path):
     ref = tmp_path / "ref.yaml"
     ref.write_text("config_set: mesh_vqvae\n")
-    path = _write(tmp_path, f"reference_config: {ref.as_posix()}\ncheckpoint: nope.ckpt\n")
+    path = _write(tmp_path, f"reference_configs: [{ref.as_posix()}]\ncheckpoints: [nope.ckpt]\n")
     with pytest.raises(ValueError, match="config_set"):
         main(["--config", str(path)])
 
 
-def test_main_checks_the_checkpoint_before_loading_data(tmp_path, monkeypatch):
-    ref = (ROOT / "configs" / "mesh-v5-full-coord.yaml").as_posix()
-    missing = (tmp_path / "nope.ckpt").as_posix()
-    path = _write(tmp_path, f"reference_config: {ref}\ncheckpoint: {missing}\n")
+def _ref(tmp_path, run_name):
+    path = tmp_path / f"{run_name}.yaml"
+    path.write_text(f"config_set: mesh\nlogging: {{run_name: {run_name}}}\n")
+    return path.as_posix()
+
+
+def _ckpt(tmp_path, name):
+    path = tmp_path / f"{name}.ckpt"
+    torch.save({"epoch": 0, "global_step": 0, "hyper_parameters": {}}, path)
+    return path.as_posix()
+
+
+def _no_data(monkeypatch):
     monkeypatch.setattr(posthoc, "build_split", lambda *a, **k: pytest.fail(
-        "the dataset was loaded before the checkpoint was checked"))
+        "the dataset was loaded before every model was checked"))
+
+
+def test_main_preflights_every_model_before_loading_data(tmp_path, monkeypatch):
+    refs = [_ref(tmp_path, "m1"), _ref(tmp_path, "m2")]
+    missing = (tmp_path / "nope.ckpt").as_posix()
+    path = _write(tmp_path, f"reference_configs: [{refs[0]}, {refs[1]}]\n"
+                            f"checkpoints: [{_ckpt(tmp_path, 'ok')}, {missing}]\n")
+    _no_data(monkeypatch)
     with pytest.raises(FileNotFoundError, match="nope.ckpt"):
         main(["--config", str(path)])
+
+
+def test_duplicate_run_names_are_rejected_in_preflight(tmp_path, monkeypatch):
+    ref = _ref(tmp_path, "m1")
+    ckpt = _ckpt(tmp_path, "ok")
+    path = _write(tmp_path, f"reference_configs: [{ref}, {ref}]\n"
+                            f"checkpoints: [{ckpt}, {ckpt}]\n")
+    _no_data(monkeypatch)
+    with pytest.raises(ValueError, match="run_name"):
+        main(["--config", str(path)])
+
+
+def test_main_scores_every_model_into_one_table(tmp_path, monkeypatch):
+    refs = [_ref(tmp_path, "m1"), _ref(tmp_path, "m2")]
+    ckpts = [_ckpt(tmp_path, "c1"), _ckpt(tmp_path, "c2")]
+    out = tmp_path / "out"
+    path = _write(tmp_path, f"reference_configs: [{refs[0]}, {refs[1]}]\n"
+                            f"checkpoints: [{ckpts[0]}, {ckpts[1]}]\n"
+                            f"strategies: [{{kind: greedy}}]\nmetrics: [chamfer]\n"
+                            f"batch_size: 2\nn_points: 256\noutput_dir: {out.as_posix()}\n")
+    monkeypatch.setattr(posthoc, "build_split", lambda *a, **k: (
+        _Dataset(), {"train": 0, "val": 0, "test": 2}))
+    monkeypatch.setattr(posthoc, "load_model", lambda *a, **k: _model())
+
+    root = main(["--config", str(path)])
+
+    table = pd.read_csv(root / "summary.csv")
+    assert table["model"].tolist() == ["m1", "m1", "m2", "m2"]
+    assert table["run"].tolist() == ["greedy", "lod1_copy"] * 2
+    assert list(table.columns)[0] == "model"
+    assert (root / "m2" / "greedy" / "objects.csv").is_file()
+    assert (root / "m1" / "checkpoint.json").is_file()
+
+
+def test_resolve_checkpoint(tmp_path):
+    from src.eval.posthoc_eval import resolve_checkpoint
+    ref = Config()
+    ref.logging.save_dir = tmp_path.as_posix()
+    ref.logging.experiment_name, ref.logging.run_name = "exp", "run"
+    ckpts = tmp_path / "exp" / "run" / "checkpoints"
+    ckpts.mkdir(parents=True)
+    with pytest.raises(FileNotFoundError, match="checkpoints"):
+        resolve_checkpoint(ref, None)
+    (ckpts / "last.ckpt").touch()
+    assert resolve_checkpoint(ref, None) == ckpts / "last.ckpt"
+    for name in ("epoch=03-val_gen_chamfer_m=0.2100.ckpt",
+                 "epoch=05-val_gen_chamfer_m=0.1800.ckpt"):
+        (ckpts / name).touch()
+    assert resolve_checkpoint(ref, None).name == "epoch=05-val_gen_chamfer_m=0.1800.ckpt"
+    assert resolve_checkpoint(ref, str(ckpts / "last.ckpt")) == ckpts / "last.ckpt"
+    with pytest.raises(FileNotFoundError):
+        resolve_checkpoint(ref, str(tmp_path / "nope.ckpt"))
 
 
 def test_main_checks_tokenization_before_loading_data(tmp_path, monkeypatch):
@@ -368,7 +518,7 @@ def test_main_checks_tokenization_before_loading_data(tmp_path, monkeypatch):
     torch.save({"epoch": 0, "global_step": 0,
                 "hyper_parameters": {"tokenization": "amt"}}, ckpt)
     ref = (ROOT / "configs" / "mesh-v5-full-coord.yaml").as_posix()   # coord run
-    path = _write(tmp_path, f"reference_config: {ref}\ncheckpoint: {ckpt.as_posix()}\n")
+    path = _write(tmp_path, f"reference_configs: [{ref}]\ncheckpoints: [{ckpt.as_posix()}]\n")
     monkeypatch.setattr(posthoc, "build_split", lambda *a, **k: pytest.fail(
         "the dataset was loaded before tokenization was checked"))
     with pytest.raises(ValueError, match="tokenization"):

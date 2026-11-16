@@ -20,17 +20,26 @@ python -m src.eval.posthoc_eval --config configs/posthoc-eval-mesh-v5-opt-coord.
 
 ## 1. How the config layers
 
-The eval YAML holds **only** eval settings and names a training config:
+The eval YAML holds **only** eval settings and names one or more training
+configs, each paired by position with a checkpoint:
 
 ```yaml
-reference_config: configs/mesh-v5-full-opt-coord.yaml
-checkpoint: outputs/initial-runs/mesh-v5-full-opt-coord/checkpoints/last.ckpt
+reference_configs: [configs/mesh-v5-full-opt-coord.yaml]
+checkpoints: [outputs/initial-runs/mesh-v5-full-opt-coord/checkpoints/last.ckpt]
 ```
 
+A `null` checkpoint picks that run's lowest `val_gen_chamfer_m=<x>.ckpt`, falling
+back to `last.ckpt`. `configs/posthoc-eval-all.yaml` scores v5-tile and the three
+v6 arms in one call. Before any data loads, every entry is checked: the config,
+the checkpoint, the tokenizer, the vertex margins and a unique `logging.run_name`.
+A typo in the last model therefore fails in seconds.
+
 Corpus, split ratios, split seed, tokenizer, bins, margins and model shape all
-come from that reference, loaded with the same `load_config` training uses. So
-the split is rebuilt exactly as the run saw it, and the eval cannot silently
-describe a different dataset than the weights were fit on.
+come from each reference, loaded with the same `load_config` training uses. So
+each split is rebuilt exactly as its run saw it, and the eval cannot silently
+describe a different dataset than the weights were fit on. Each model is scored
+on **its own** split (`split: test` by default), so rows compare within a model,
+not across models whose splits differ.
 
 When the corpus has moved, override the reference rather than editing it:
 
@@ -129,21 +138,38 @@ batch, so a crash keeps the finished rows, but re-running starts from the top.
 ## 5. Output layout
 
 ```
-outputs/initial-runs/<run>/posthoc_eval/<ckpt-stem>/<timestamp>/
-  eval_config.yaml         resolved eval config
-  reference_config.yaml    resolved training config, overrides applied
-  environment.json         git commit + dirty flag + status, library versions, device, argv
-  git_diff.patch           written only when the tree was dirty
-  checkpoint.json          path, sha256, epoch, global_step, hyper_parameters
-  split.json               dataset_dir, split sizes, sha256 of the evaluated id list
-  summary.csv              one row per strategy
-  <run_name>/objects.csv   one row per building
-  <run_name>/run.json      exact generate() kwargs, budget, seeds, batch_size
+<output_dir or outputs/posthoc_eval>/<timestamp or mode-timestamp>/
+  summary.csv                  THE main table: one row per model x strategy, `model` first
+  <run_name>/                  one per model
+    eval_config.yaml           resolved eval config
+    reference_config.yaml      resolved training config, overrides applied
+    environment.json           git commit + dirty flag + status, library versions, device, argv
+    git_diff.patch             written only when the tree was dirty
+    checkpoint.json            path, sha256, epoch, global_step, hyper_parameters
+    split.json                 dataset_dir, split sizes, sha256 of the evaluated id list
+    summary.csv                this model's rows of the main table
+    <strategy>/objects.csv     the expanded table: one row per building
+    <strategy>/run.json        exact generate() kwargs, budget, seeds, batch_size
+    <strategy>/samples/*.html  good/avg/bad buildings, LOD1 | LOD2 | generated
+    lod1_copy/...              the baseline, laid out like a strategy
 ```
+
+`lod1_copy` uses the decoded LOD1 condition as the "generation" and scores it
+exactly like a model output. It is the do-nothing floor on the same buildings,
+so read every strategy against it. Its `eos_emitted` is NaN and `gen_seconds` is 0.
+
+**Samples.** For each model and strategy, buildings are ranked by
+`roof_chamfer_m_vs_lod2`, and buildings where it is NaN are left out. The page
+`good_<rank>_<id>.html` holds the 5 lowest, `avg_*` the 5 nearest the median,
+and `bad_*` the 5 highest. The values are in metres, so small buildings lean
+towards `good`. Samples need the `roof_chamfer` metric and the `lod2` reference;
+otherwise a warning is logged and none are written. Every generated mesh of a
+run is held in memory until its samples are written, so a crash keeps the CSV
+rows but not the samples.
 
 `objects.csv` columns: `object_id`, `seed`, face counts for generated/LOD1/LOD2,
 `eos_emitted`, `decode_ok`, `gen_seconds`, `watertight_gen`, then each metric
-suffixed `_vs_lod1` and `_vs_lod2`:
+suffixed `_vs_lod1` and `_vs_lod2`, then the reference-free columns below:
 
 | column | meaning |
 |---|---|
@@ -152,6 +178,33 @@ suffixed `_vs_lod1` and `_vs_lod2`:
 | `symdiff_m3`, `rel_symdiff`, `vol_ok`, `vol_note` | exact CSG symmetric difference; NaN unless both solids are closed |
 | `sinkhorn_m` | debiased Sinkhorn divergence, metres |
 | `roof_chamfer_m` | chamfer between the upward-facing parts only |
+
+The reference-free columns use the face matching in `src/eval/face_match.py`
+(`face_scores`). A face is its canonical 9-token row: the three quantized
+corners, rotated so the (z, y, x)-smallest corner leads. Sequence position and
+vertex order are ignored, but **reversed winding is a different face**. Faces
+collapsed by quantization are dropped. Generation, LOD2 and LOD1 share each
+building's frame, so the match is exact.
+
+| column | meaning |
+|---|---|
+| `n_gen` … `gt_not_lod1` | `face_match`'s raw counts, kept so `face_match.summarize` can pool them |
+| `gen_precision` / `gen_recall` | generated faces found in GT / GT faces the model produced |
+| `gen_copy` | generated faces found in LOD1: the model's copy rate |
+| `gt_copy` | GT faces found in LOD1: how much copying the data itself rewards |
+| `spurious_copy`, `novel_recall`, `copy_recall`, `lod1_precision` | as documented in `face_match.RATE_COLUMNS` |
+| `face_acc` / `face_f1` | Jaccard (there are no true negatives) and F1, both from the counts |
+| `gen_copy_norm` | `gen_copy / gt_copy`; **> 1 copies LOD1 more than the truth does** |
+| `roof_face_{acc,precision,recall,f1}` | the same over faces whose metre-space normal has z > 0.1 |
+| `lod1_chamfer_norm` | `chamfer_m_vs_lod1` over chamfer(LOD1, LOD2); **< 1 sits closer to LOD1 than the truth does** |
+
+Precision and the copy rates follow `face_match`: NaN when the denominator is
+empty. `face_acc` and `face_f1` are NaN only when both sides are empty, so a
+failed generation scores 0 on them and pulls the mean down instead of dropping
+out. `summary.csv` also reports every face rate as `_micro` (counts pooled over
+the split, which weighs large buildings more) next to the per-building
+`_mean`/`_median`. `lod1_chamfer_norm` is NaN where LOD1 and LOD2 are within
+1 mm (`chamfer_ratio`).
 
 `summary.csv` adds mean and median per metric, `watertight_pct`, `decode_rate`,
 `eos_rate`, and `vol_defined_pct` / `roof_defined_pct` — read those last two
@@ -167,7 +220,15 @@ so these numbers are comparable with the `val_gen_chamfer_m` curves in W&B.
 
 Scored against LOD2 the metrics say how close the generation is to the truth.
 Scored against LOD1 they say how far it moved from its own input — a run that
-matches LOD1 more closely than LOD2 has learned to copy its condition.
+matches LOD1 more closely than LOD2 has learned to copy its condition. Two
+columns put a number on that, each normalized by what the truth itself does:
+
+- `lod1_chamfer_norm < 1` means it is geometrically closer to the box than the
+  truth is.
+- `gen_copy_norm > 1` means it echoes whole LOD1 faces more often than the
+  truth contains them.
+
+The `lod1_copy` row of each model is the floor on that model's own buildings.
 
 The do-nothing floor, measured on the first `cleaner` tile (8 buildings,
 `tests/test_metric_sanity_real.py`, means of LOD1 scored against its own LOD2):

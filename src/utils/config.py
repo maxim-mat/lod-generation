@@ -422,17 +422,19 @@ def _default_strategies():
 
 @dataclass
 class PosthocEvalConfig:
-    """Post-hoc scoring of one mesh-transformer checkpoint under many decoders.
+    """Post-hoc scoring of mesh-transformer checkpoints under many decoders.
 
     Holds only eval settings. Data, split seed, tokenizer and model shape all
-    come from `reference_config`, the run's own training config, so the split
-    and the vocabulary cannot drift from what the checkpoint was trained on.
+    come from each entry of `reference_configs`, that run's own training
+    config, so a split and a vocabulary cannot drift from what its checkpoint
+    was trained on. `checkpoints` pairs with it by position; ``null`` picks
+    the run's lowest `val_gen_chamfer_m` checkpoint, else its last.ckpt.
     """
-    reference_config: str = MISSING
-    checkpoint: str = MISSING
-    # Dot-list applied to the reference, e.g. a relocated dataset_dir.
+    reference_configs: List[str] = MISSING
+    checkpoints: List[Optional[str]] = MISSING
+    # Dot-list applied to every reference, e.g. a relocated dataset_dir.
     reference_overrides: List[str] = field(default_factory=list)
-    split: str = "val"
+    split: str = "test"
     # None scores the whole split; else a seeded subsample via eval_indices.
     max_objects: Optional[int] = None
     batch_size: int = 8
@@ -441,7 +443,7 @@ class PosthocEvalConfig:
     # Image-conditioned checkpoints only (ignored otherwise):
     # "true" | "shuffled" (another building's image) | "none" (null token).
     image_mode: str = "true"
-    # None -> <save_dir>/<experiment_name>/<run_name>/posthoc_eval
+    # None -> outputs/posthoc_eval; one <stamp>/<run_name>/ per model under it.
     output_dir: Optional[str] = None
     strategies: List[StrategyConfig] = field(default_factory=_default_strategies)
     metrics: List[str] = field(default_factory=lambda: [
