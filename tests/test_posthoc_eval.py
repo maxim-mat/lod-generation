@@ -187,7 +187,7 @@ import pandas as pd
 import torch
 
 from src.dataset.mesh_dataset import specials
-from src.eval.mesh_metrics import FACE_COLUMNS
+from src.eval.face_match import FACE_SCORE_COLUMNS
 from src.eval.posthoc_eval import checkpoint_info, object_seed, run_posthoc_eval
 from src.models.mesh_transformer import MeshTransformerModule
 from src.utils.config import Config
@@ -242,7 +242,7 @@ OBJECT_COLUMNS = [
 ] + [f"{m}_vs_{ref}" for ref in ("lod1", "lod2")
      for m in ("chamfer_m", "hausdorff_p95_m", "hausdorff_max_m", "symdiff_m3",
                "rel_symdiff", "vol_ok", "vol_note", "sinkhorn_m", "roof_chamfer_m")
-] + list(FACE_COLUMNS) + ["lod1_chamfer_norm"]
+] + list(FACE_SCORE_COLUMNS) + ["lod1_chamfer_norm"]
 
 
 def _perfect(monkeypatch, model):
@@ -302,7 +302,8 @@ def test_end_to_end_writes_one_row_per_object_per_run(tmp_path):
     assert {"watertight_pct", "decode_rate", "eos_rate", "chamfer_m_vs_lod2_mean",
             "chamfer_m_vs_lod2_median", "vol_defined_pct_vs_lod1",
             "roof_defined_pct_vs_lod2", "face_f1_mean", "roof_face_f1_mean",
-            "lod1_vert_copy_norm_mean", "lod1_chamfer_norm_mean"} <= set(table.columns)
+            "gen_copy_norm_mean", "lod1_chamfer_norm_mean", "gen_precision_micro",
+            "gen_copy_micro"} <= set(table.columns)
     split = json.loads((out / "split.json").read_text())
     assert split["n_evaluated"] == 2 and split["split_sizes"]["val"] == 2
 
@@ -313,7 +314,7 @@ def test_lod1_copy_scores_the_condition_as_its_generation(tmp_path):
     df = pd.read_csv(tmp_path / "e" / "lod1_copy" / "objects.csv")
     assert (df["n_faces_gen"] == df["n_faces_lod1"]).all()
     assert np.allclose(df["chamfer_m_vs_lod1"], 0.0, atol=1e-9)
-    assert (df["lod1_vert_copy_rate"] == 1.0).all()
+    assert (df["gen_copy"] == 1.0).all()
     assert df["eos_emitted"].isna().all()
 
 

@@ -135,3 +135,24 @@ generation step, and its seeds and `gen_seconds` are recorded as such.
 - Exact column order and summary naming, following the existing `_summarize`
   pattern.
 - How `lod1_copy` reuses the batch and scoring code path.
+
+## Revision 2026-11-16: aligned with `src/eval/face_match.py`
+
+`main` gained `src/eval/face_match.py` (2026-11-13), the project's own definition
+of face matching and face-level copying, while this branch was in flight. To keep
+a single definition of "face precision" and "copy rate" in the project, the
+discrete columns above were replaced by `face_match.face_scores`:
+
+- A face is `face_set`'s canonical 9-token row. Reversed winding is a different
+  face, faces collapsed by quantization are dropped, and matching uses sets, not
+  multisets.
+- `face_match`'s counts and rates are written as they are (`gen_precision`,
+  `gen_recall`, `gen_copy`, `gt_copy`, ...). Precision and copy rates are NaN on
+  an empty denominator, which is that module's convention.
+- Added on top: `face_acc` (Jaccard) and `face_f1` from the counts. Both are 0
+  when one side is empty, so failed generations still count. Also added:
+  `gen_copy_norm = gen_copy / gt_copy` and the four `roof_face_*` columns.
+- The vertex-level `lod1_vert_copy_rate` / `_norm` are dropped. The module's
+  rationale: "a shared vertex says little, a shared face is something the model
+  could have echoed".
+- `summary.csv` adds face_match's micro averages (`<rate>_micro`).

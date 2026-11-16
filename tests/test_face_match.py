@@ -206,3 +206,96 @@ def test_split_face_match_with_a_real_model():
     assert len(df) == 3 and (df["n_gt"] == 12).all()
     assert (df["gen_in_gt"] <= df["n_gen"]).all() and (df["gen_in_lod1"] <= df["n_gen"]).all()
     assert (df["gt_in_lod1"] == df["n_lod1"]).all()
+
+
+# ---------------------------------------------------------------- face_scores
+# The per-building columns posthoc_eval writes: face_match's counts and rates,
+# plus Jaccard / F1 from the counts, the copy rate over the truth's, and roofs.
+
+from src.eval.face_match import FACE_SCORE_COLUMNS, face_scores
+
+S = np.ones(3)
+
+
+def _bins(v, f):
+    """A mesh given in grid bins, as the unit-box mesh `decode_tokens` returns."""
+    return dequantize(np.asarray(v), NUM_BINS), np.asarray(f)
+
+
+def _score(gen, gt, lod1=None, scale=S):
+    lod1 = lod1 if lod1 is not None else (np.zeros((0, 3)), np.zeros((0, 3), int))
+    return face_scores(gen, gt, lod1, scale, NUM_BINS)
+
+
+def _four():
+    v = [[0, 0, 0], [5, 0, 0], [0, 5, 0], [5, 5, 0], [0, 0, 5], [9, 9, 9]]
+    return v, [[0, 1, 2], [1, 3, 2], [0, 1, 4], [2, 3, 5]]
+
+
+def _roof_box(top):
+    """Closed 10 x 10 x top box in bins; faces 2 and 3 are the upward-facing roof."""
+    v = [[0, 0, 0], [10, 0, 0], [10, 10, 0], [0, 10, 0],
+         [0, 0, top], [10, 0, top], [10, 10, top], [0, 10, top]]
+    f = [[0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7], [0, 1, 5], [0, 5, 4],
+         [1, 2, 6], [1, 6, 5], [2, 3, 7], [2, 7, 6], [3, 0, 4], [3, 4, 7]]
+    return v, f
+
+
+def test_face_scores_columns_in_order():
+    gt = _bins(*_four())
+    assert tuple(_score(gt, gt)) == FACE_SCORE_COLUMNS
+
+
+def test_face_scores_reuse_face_match():
+    v, f = _four()
+    gen, gt, lod1 = _bins(v, f[:3]), _bins(v, f[1:]), _bins(v, f[::2])
+    out = _score(gen, gt, lod1)
+    sets = [face_set(*m, NUM_BINS) for m in (gen, gt, lod1)]
+    counts = face_match(*sets)
+    expected = {**counts, **match_rates(counts)}
+    assert {k: out[k] for k in expected} == pytest.approx(expected, nan_ok=True)
+
+
+def test_acc_and_f1_come_from_the_counts():
+    v, f = _four()
+    v = v + [[3, 3, 3]]
+    out = _score(_bins(v, f[:2] + [[0, 4, 6]]), _bins(v, f))
+    assert out["face_acc"] == pytest.approx(2 / 5)
+    assert out["face_f1"] == pytest.approx(4 / 7)
+
+
+def test_a_failed_generation_scores_zero_not_nan():
+    empty = (np.zeros((0, 3)), np.zeros((0, 3), int))
+    gt = _bins(*_four())
+    one = _score(empty, gt)
+    assert one["face_acc"] == 0.0 and one["face_f1"] == 0.0 and one["gen_recall"] == 0.0
+    assert math.isnan(one["gen_precision"])        # face_match's convention
+    both = _score(empty, empty)
+    assert math.isnan(both["face_acc"]) and math.isnan(both["face_f1"])
+
+
+def test_gen_copy_norm_is_the_copy_rate_over_the_truths():
+    v, f = _four()
+    lod1 = _bins(v, f[:3])
+    gen = _bins(v, f)                              # 3 of 4 faces from LOD1
+    gt = _bins(v, [f[0], f[1], [0, 4, 5], [1, 4, 5]])   # 2 of 4
+    assert _score(gen, gt, lod1)["gen_copy_norm"] == pytest.approx(1.5)
+    disjoint = _bins(v, [[0, 4, 5], [1, 4, 5]])
+    assert math.isnan(_score(gen, disjoint, lod1)["gen_copy_norm"])
+
+
+def test_roof_classification_uses_metre_scale():
+    tri = _bins([[0, 0, 0], [10, 0, 0], [0, 1, 10]], [[0, 1, 2]])
+    flat = _score(tri, tri, scale=np.array([1.0, 1.0, 1.0]))
+    assert all(math.isnan(flat[f"roof_face_{k}"]) for k in ("acc", "f1"))
+    stretched = _score(tri, tri, scale=np.array([1.0, 2.0, 1.0]))
+    assert stretched["roof_face_f1"] == 1.0
+
+
+def test_roof_scores_see_only_roof_faces():
+    v, f = _roof_box(10)
+    lifted = v + [[0, 0, 12], [10, 0, 12], [10, 10, 12], [0, 10, 12]]
+    gen_f = f[:2] + [[8, 9, 10], [8, 10, 11]] + f[4:]
+    out = _score(_bins(lifted, gen_f), _bins(v, f))
+    assert out["gen_recall"] == pytest.approx(10 / 12)
+    assert out["roof_face_recall"] == 0.0 and out["roof_face_f1"] == 0.0

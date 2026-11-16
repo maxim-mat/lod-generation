@@ -34,12 +34,13 @@ from omegaconf import OmegaConf
 
 from src.analysis.exact_volume import exact_pair_volumes
 from src.dataset.mesh_dataset import (amt_detokenize, detokenize, mesh_collate_fn,
-                                      quantize, specials)
+                                      specials)
+from src.eval.face_match import (COUNT_COLUMNS, FACE_SCORE_COLUMNS, face_scores,
+                                 match_rates)
 from src.eval.mesh_eval import _resolve, eval_indices
-from src.eval.mesh_metrics import (FACE_COLUMNS, chamfer_distance, chamfer_floor,
-                                   chamfer_ratio, face_set_metrics, hausdorff_max,
-                                   hausdorff_p95, is_watertight_mesh, roof_submesh,
-                                   surface_distances)
+from src.eval.mesh_metrics import (chamfer_distance, chamfer_floor, chamfer_ratio,
+                                   hausdorff_max, hausdorff_p95, is_watertight_mesh,
+                                   roof_submesh, surface_distances)
 from src.eval.sinkhorn import mesh_sinkhorn
 from src.utils.config import PosthocEvalConfig, SinkhornConfig
 from src.utils.initialization import load_config
@@ -57,8 +58,9 @@ SPLITS = ("train", "val", "test")
 # Per-reference numeric columns that summaries average. Order is CSV order.
 METRIC_COLUMNS = ("chamfer_m", "hausdorff_p95_m", "hausdorff_max_m", "symdiff_m3",
                   "rel_symdiff", "sinkhorn_m", "roof_chamfer_m")
-# Reference-free columns that summaries also average.
-EXTRA_COLUMNS = FACE_COLUMNS + ("lod1_chamfer_norm",)
+# Reference-free columns that summaries also average (the raw counts are not).
+EXTRA_COLUMNS = (tuple(c for c in FACE_SCORE_COLUMNS if c not in COUNT_COLUMNS)
+                 + ("lod1_chamfer_norm",))
 
 # The do-nothing baseline: the decoded LOD1 condition scored as the generation.
 LOD1_COPY = "lod1_copy"
@@ -373,6 +375,10 @@ def _summarize(run, rows, cfg):
         if col in df:
             out[f"{col}_mean"] = df[col].mean()
             out[f"{col}_median"] = df[col].median()
+    if set(COUNT_COLUMNS) <= set(df):
+        # face_match's micro average: rates of the counts pooled over the split.
+        micro = match_rates(df[list(COUNT_COLUMNS)].sum().to_dict())
+        out.update({f"{k}_micro": v for k, v in micro.items()})
     return out
 
 
@@ -473,8 +479,8 @@ def _score_batch(model, batch, gen_unit, eos_emitted, cfg, seeds, seconds, devic
                                 cfg.metrics, n_points=cfg.n_points,
                                 sinkhorn_cfg=cfg.sinkhorn, seed=SURFACE_SEED,
                                 device=device))
-        bins = {name: (quantize(v, model.num_bins), f) for name, (v, f) in units.items()}
-        row.update(face_set_metrics(bins["gen"], bins["lod2"], bins["lod1"], scale))
+        row.update(face_scores(units["gen"], units["lod2"], units["lod1"], scale,
+                               model.num_bins))
         if "chamfer_m_vs_lod1" in row:
             # Below 1: the generation sits closer to LOD1 than the truth does.
             row["lod1_chamfer_norm"] = chamfer_ratio(

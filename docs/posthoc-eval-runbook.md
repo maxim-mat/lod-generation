@@ -179,23 +179,32 @@ suffixed `_vs_lod1` and `_vs_lod2`, then the reference-free columns below:
 | `sinkhorn_m` | debiased Sinkhorn divergence, metres |
 | `roof_chamfer_m` | chamfer between the upward-facing parts only |
 
-The reference-free columns compare quantized vertex bins. That is exact, because
-the generation, LOD2 and LOD1 share each building's frame.
+The reference-free columns use the face matching in `src/eval/face_match.py`
+(`face_scores`). A face is its canonical 9-token row: the three quantized
+corners, rotated so the (z, y, x)-smallest corner leads. Sequence position and
+vertex order are ignored, but **reversed winding is a different face**. Faces
+collapsed by quantization are dropped. Generation, LOD2 and LOD1 share each
+building's frame, so the match is exact.
 
 | column | meaning |
 |---|---|
-| `face_acc` | \|G ∩ T\| / \|G ∪ T\| over faces as multisets (Jaccard, since there are no true negatives) |
-| `face_precision` / `face_recall` / `face_f1` | \|G ∩ T\| / \|G\|, \|G ∩ T\| / \|T\|, harmonic mean |
-| `roof_face_*` | the same four over faces whose metre-space normal has z > 0.1 |
-| `lod1_vert_copy_rate` | share of generated vertices that are LOD1 vertices |
-| `lod1_vert_copy_norm` | that rate over the truth's own rate; **> 1 copies LOD1 more than the truth does** |
+| `n_gen` … `gt_not_lod1` | `face_match`'s raw counts, kept so `face_match.summarize` can pool them |
+| `gen_precision` / `gen_recall` | generated faces found in GT / GT faces the model produced |
+| `gen_copy` | generated faces found in LOD1: the model's copy rate |
+| `gt_copy` | GT faces found in LOD1: how much copying the data itself rewards |
+| `spurious_copy`, `novel_recall`, `copy_recall`, `lod1_precision` | as documented in `face_match.RATE_COLUMNS` |
+| `face_acc` / `face_f1` | Jaccard (there are no true negatives) and F1, both from the counts |
+| `gen_copy_norm` | `gen_copy / gt_copy`; **> 1 copies LOD1 more than the truth does** |
+| `roof_face_{acc,precision,recall,f1}` | the same over faces whose metre-space normal has z > 0.1 |
 | `lod1_chamfer_norm` | `chamfer_m_vs_lod1` over chamfer(LOD1, LOD2); **< 1 sits closer to LOD1 than the truth does** |
 
-A face is the unordered set of its three vertex bins, so sequence position,
-vertex order and winding are all ignored. The face metrics are NaN only when
-both sides are empty. A failed generation scores 0, so it pulls the mean down
-instead of dropping out of it. `lod1_chamfer_norm` is NaN where LOD1 and LOD2
-are within 1 mm (`chamfer_ratio`).
+Precision and the copy rates follow `face_match`: NaN when the denominator is
+empty. `face_acc` and `face_f1` are NaN only when both sides are empty, so a
+failed generation scores 0 on them and pulls the mean down instead of dropping
+out. `summary.csv` also reports every face rate as `_micro` (counts pooled over
+the split, which weighs large buildings more) next to the per-building
+`_mean`/`_median`. `lod1_chamfer_norm` is NaN where LOD1 and LOD2 are within
+1 mm (`chamfer_ratio`).
 
 `summary.csv` adds mean and median per metric, `watertight_pct`, `decode_rate`,
 `eos_rate`, and `vol_defined_pct` / `roof_defined_pct` — read those last two
@@ -216,8 +225,8 @@ columns put a number on that, each normalized by what the truth itself does:
 
 - `lod1_chamfer_norm < 1` means it is geometrically closer to the box than the
   truth is.
-- `lod1_vert_copy_norm > 1` means it reuses the box's exact coordinates more
-  than the truth does.
+- `gen_copy_norm > 1` means it echoes whole LOD1 faces more often than the
+  truth contains them.
 
 The `lod1_copy` row of each model is the floor on that model's own buildings.
 

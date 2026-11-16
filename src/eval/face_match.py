@@ -22,6 +22,7 @@ import pandas as pd
 
 from src.dataset.mesh_dataset import (NUM_BINS, amt_detokenize, detokenize,
                                       mesh_collate_fn, quantize, specials)
+from src.eval.mesh_metrics import roof_mask
 
 COUNT_COLUMNS = (
     "n_gen", "n_gt", "n_lod1",
@@ -147,6 +148,58 @@ def summarize(df, by=None):
     parts = {key: one(group) for key, group in df.groupby(by, sort=False)}
     names = [by] if isinstance(by, str) else list(by)
     return pd.concat(parts, names=names)
+
+
+ROOF_COLUMNS = ("roof_face_acc", "roof_face_precision", "roof_face_recall",
+                "roof_face_f1")
+FACE_SCORE_COLUMNS = (COUNT_COLUMNS + RATE_COLUMNS
+                      + ("face_acc", "face_f1", "gen_copy_norm") + ROOF_COLUMNS)
+
+
+def _acc_f1(n_gen, n_gt, hit):
+    """Jaccard and F1 from the counts: 0 when one side is empty, NaN when both are.
+
+    Unlike precision, these stay defined for a failed (empty) generation, so a
+    per-building mean counts it against the model instead of skipping it.
+    """
+    if n_gen + n_gt == 0:
+        return math.nan, math.nan
+    return hit / (n_gen + n_gt - hit), 2 * hit / (n_gen + n_gt)
+
+
+def face_scores(gen, gt, lod1, scale, num_bins=NUM_BINS):
+    """Every per-building face column `posthoc_eval` writes.
+
+    The counts and rates of `face_match` / `match_rates`, plus ``face_acc``
+    (Jaccard; there are no true negatives), ``face_f1``, ``gen_copy_norm`` --
+    the model's copy rate over the truth's own, above 1 when it copies LOD1
+    more than the data does -- and the same accuracy/precision/recall/F1 over
+    roof faces only.
+
+    Args:
+        gen, gt, lod1: ``(verts [V, 3] in the unit box, faces [F, 3])``.
+        scale: ``[3]`` metres per unit-box axis. Roofs are judged on metre
+            normals (`roof_mask`), since the per-axis scaling tilts them.
+        num_bins: the tokenizer's grid.
+
+    Returns:
+        dict keyed by `FACE_SCORE_COLUMNS`.
+    """
+    sets = [face_set(v, f, num_bins) for v, f in (gen, gt, lod1)]
+    counts = face_match(*sets)
+    rates = match_rates(counts)
+    acc, f1 = _acc_f1(counts["n_gen"], counts["n_gt"], counts["gen_in_gt"])
+    norm = (rates["gen_copy"] / rates["gt_copy"]
+            if rates["gt_copy"] > 0 and not math.isnan(rates["gen_copy"]) else math.nan)
+
+    scale = np.asarray(scale, dtype=float).reshape(3)
+    roof_g, roof_t = (face_set(v, np.asarray(f, dtype=np.int64).reshape(-1, 3)[
+        roof_mask(np.asarray(v, dtype=float) * scale, f)], num_bins) for v, f in (gen, gt))
+    hit = len(roof_g & roof_t)
+    roof_acc, roof_f1 = _acc_f1(len(roof_g), len(roof_t), hit)
+    roof = (roof_acc, _ratio(hit, len(roof_g)), _ratio(hit, len(roof_t)), roof_f1)
+    return {**counts, **rates, "face_acc": acc, "face_f1": f1, "gen_copy_norm": norm,
+            **dict(zip(ROOF_COLUMNS, roof))}
 
 
 def split_face_match(model, dataset, generate, batch_size=16, limit=None, device=None,
