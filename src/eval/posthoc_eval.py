@@ -16,6 +16,7 @@ import itertools
 import json
 import logging
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -369,6 +370,62 @@ def _summarize(run, rows, cfg):
     return out
 
 
+SAMPLE_COLUMN = "roof_chamfer_m_vs_lod2"
+
+
+def select_samples(df, column=SAMPLE_COLUMN, k=5):
+    """Object ids of the ``k`` best, most typical and worst rows by ``column``.
+
+    Rows where ``column`` is NaN are not ranked. ``good`` runs best first,
+    ``bad`` worst first, ``avg`` closest-to-the-median first. With fewer than
+    ``3 * k`` rows the buckets overlap rather than come up short.
+
+    Returns:
+        dict: ``{"good": [...], "avg": [...], "bad": [...]}``.
+    """
+    ranked = df[np.isfinite(df[column].astype(float))].sort_values(column, kind="stable")
+    ids = ranked["object_id"].astype(str)
+    dist = (ranked[column] - ranked[column].median()).abs()
+    return {"good": ids.head(k).tolist(),
+            "avg": ids[dist.sort_values(kind="stable").index[:k]].tolist(),
+            "bad": ids.iloc[::-1].head(k).tolist()}
+
+
+def write_samples(run_dir, picks, meshes, rows):
+    """One LOD1 | LOD2 | generated plotly page per picked object.
+
+    Args:
+        picks: `select_samples` output.
+        meshes: object id -> ``{"lod1", "lod2", "gen"}`` metre meshes.
+        rows: this run's `objects.csv` rows, for the titles.
+
+    Returns:
+        list[Path]: the files written, in bucket then rank order.
+    """
+    from src.visualize_mesh import mesh_figure, side_by_side
+
+    by_id = {str(r["object_id"]): r for r in rows}
+    out_dir = Path(run_dir) / "samples"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for bucket in ("good", "avg", "bad"):
+        for rank, oid in enumerate(picks.get(bucket, []), start=1):
+            m, row = meshes[oid], by_id[oid]
+            panels = [("LOD1 input", m["lod1"], "#898781"),
+                      ("LOD2 truth", m["lod2"], "#2a78d6"),
+                      (f"generated ({Path(run_dir).name})", m["gen"], "#eda100")]
+            fig = side_by_side([mesh_figure(*mesh, color=c) for _, mesh, c in panels],
+                               [f"{name}, {len(mesh[1])} tris" for name, mesh, _ in panels])
+            fig.update_layout(title=(
+                f"[{bucket} #{rank}] {oid} | roof chamfer {row.get(SAMPLE_COLUMN, np.nan):.3f} m"
+                f" | chamfer {row.get('chamfer_m_vs_lod2', np.nan):.3f} m"
+                f" | face F1 {row.get('face_f1', np.nan):.3f}"))
+            path = out_dir / f"{bucket}_{rank}_{re.sub(r'[^\w.-]', '_', oid)}.html"
+            fig.write_html(path, include_plotlyjs="cdn")
+            paths.append(path)
+    return paths
+
+
 def _lod1_unit(model, batch, k):
     """The LOD1 condition of item ``k``, decoded to the unit box."""
     inverse = amt_detokenize if model.tokenization == "amt" else detokenize
@@ -472,7 +529,7 @@ def run_posthoc_eval(cfg, ref_cfg, model, dataset, out_dir, checkpoint=None,
             "surface_seed": SURFACE_SEED})
         logger.info("[posthoc] %s: %d objects", run.name, len(indices))
 
-        rows = []
+        rows, meshes = [], {}
         for start in range(0, len(indices), cfg.batch_size):
             chunk = indices[start:start + cfg.batch_size]
             items = []
@@ -508,13 +565,24 @@ def run_posthoc_eval(cfg, ref_cfg, model, dataset, out_dir, checkpoint=None,
                             for k in range(len(chunk))]
                 eos = [bool((out[k] == model.eos).any()) for k in range(len(chunk))]
 
-            batch_rows, _ = _score_batch(model, batch, gen_unit, eos, cfg, seeds,
-                                         seconds, device)
+            batch_rows, batch_meshes = _score_batch(model, batch, gen_unit, eos, cfg,
+                                                    seeds, seconds, device)
             # Flushed per batch: a crash keeps every finished object.
             _append_csv(run_dir / "objects.csv", batch_rows)
             rows.extend(batch_rows)
+            # ponytail: every mesh of the run stays in memory (~100 MB on a
+            # 25k split) until the samples are picked; regenerate the picks
+            # instead if a larger split ever runs out of RAM.
+            meshes.update(batch_meshes)
 
         summary.append(_summarize(run, rows, cfg))
+        if SAMPLE_COLUMN in rows[0]:
+            write_samples(run_dir, select_samples(pd.DataFrame(rows)), meshes, rows)
+        else:
+            logger.warning("[posthoc] %s: no %s column, so no samples (needs the "
+                           "roof_chamfer metric and the lod2 reference)",
+                           run.name, SAMPLE_COLUMN)
+        del meshes
         pd.DataFrame(summary).to_csv(out_dir / "summary.csv", index=False)
     return summary
 

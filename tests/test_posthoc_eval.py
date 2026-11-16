@@ -320,6 +320,44 @@ def test_a_perfect_generation_scores_perfectly(tmp_path, monkeypatch):
     assert np.allclose(df["chamfer_m_vs_lod2"], 0.0, atol=1e-9)
 
 
+def test_select_samples_buckets():
+    from src.eval.posthoc_eval import select_samples
+    df = pd.DataFrame({"object_id": [f"o{i}" for i in range(21)] + ["n1", "n2"],
+                       "roof_chamfer_m_vs_lod2": list(range(21)) + [np.nan, np.nan]})
+    picks = select_samples(df)
+    assert picks["good"] == ["o0", "o1", "o2", "o3", "o4"]
+    assert picks["bad"] == ["o20", "o19", "o18", "o17", "o16"]
+    assert set(picks["avg"]) == {"o8", "o9", "o10", "o11", "o12"}
+    assert picks["avg"][0] == "o10"
+
+
+def test_select_samples_with_few_rows():
+    from src.eval.posthoc_eval import select_samples
+    df = pd.DataFrame({"object_id": ["a", "b", "c"],
+                       "roof_chamfer_m_vs_lod2": [0.3, 0.1, 0.2]})
+    picks = select_samples(df)
+    assert all(len(ids) == 3 for ids in picks.values())
+
+
+def test_sample_file_names_are_sanitized(tmp_path):
+    from src.eval.posthoc_eval import write_samples
+    box = _box()
+    meshes = {"a/b:c": {"lod1": box, "lod2": _box(0.5), "gen": box}}
+    rows = [{"object_id": "a/b:c", "roof_chamfer_m_vs_lod2": 0.5,
+             "chamfer_m_vs_lod2": 0.2, "face_f1": 0.0}]
+    paths = write_samples(tmp_path, {"good": ["a/b:c"], "avg": [], "bad": []}, meshes, rows)
+    assert paths == [tmp_path / "samples" / "good_1_a_b_c.html"]
+    assert "plotly" in paths[0].read_text(encoding="utf-8")
+
+
+def test_samples_are_written_per_run(tmp_path, monkeypatch):
+    model = _perfect(monkeypatch, _model())
+    cfg = _small_cfg(strategies=[StrategyConfig(kind="greedy")],
+                     metrics=["chamfer", "roof_chamfer"])
+    run_posthoc_eval(cfg, Config(), model, _Dataset(), tmp_path / "e")
+    assert list((tmp_path / "e" / "greedy" / "samples").glob("*.html"))
+
+
 def test_a_rerun_reproduces_every_row(tmp_path):
     cfg = _small_cfg(strategies=[
         StrategyConfig(kind="top_p", top_p=[0.95], temperature=[1.2]),
