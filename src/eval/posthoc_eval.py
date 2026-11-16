@@ -33,10 +33,11 @@ from omegaconf import OmegaConf
 
 from src.analysis.exact_volume import exact_pair_volumes
 from src.dataset.mesh_dataset import (amt_detokenize, detokenize, mesh_collate_fn,
-                                      specials)
-from src.eval.mesh_eval import _resolve, _to_metres, eval_indices
-from src.eval.mesh_metrics import (chamfer_distance, hausdorff_max, hausdorff_p95,
-                                   is_watertight_mesh, roof_submesh,
+                                      quantize, specials)
+from src.eval.mesh_eval import _resolve, eval_indices
+from src.eval.mesh_metrics import (FACE_COLUMNS, chamfer_distance, chamfer_floor,
+                                   chamfer_ratio, face_set_metrics, hausdorff_max,
+                                   hausdorff_p95, is_watertight_mesh, roof_submesh,
                                    surface_distances)
 from src.eval.sinkhorn import mesh_sinkhorn
 from src.utils.config import PosthocEvalConfig, SinkhornConfig
@@ -55,6 +56,11 @@ SPLITS = ("train", "val", "test")
 # Per-reference numeric columns that summaries average. Order is CSV order.
 METRIC_COLUMNS = ("chamfer_m", "hausdorff_p95_m", "hausdorff_max_m", "symdiff_m3",
                   "rel_symdiff", "sinkhorn_m", "roof_chamfer_m")
+# Reference-free columns that summaries also average.
+EXTRA_COLUMNS = FACE_COLUMNS + ("lod1_chamfer_norm",)
+
+# The do-nothing baseline: the decoded LOD1 condition scored as the generation.
+LOD1_COPY = "lod1_copy"
 
 # Which StrategyConfig fields each kind reads, in run-name order.
 STRATEGY_PARAMS = {
@@ -79,6 +85,8 @@ class DecodeRun:
     def generate_kwargs(self):
         """Keyword arguments for `MeshTransformerModule.generate`, seeds excluded."""
         p = self.params
+        if self.kind == LOD1_COPY:
+            return {}
         if self.kind == "greedy":
             return {"temperature": 0.0}
         if self.kind == "beam":
@@ -354,34 +362,64 @@ def _summarize(run, rows, cfg):
         if "roof_chamfer" in cfg.metrics:
             out[f"roof_defined_pct_vs_{ref}"] = (
                 100.0 * np.isfinite(df[f"roof_chamfer_m_vs_{ref}"].astype(float)).mean())
+    for col in EXTRA_COLUMNS:
+        if col in df:
+            out[f"{col}_mean"] = df[col].mean()
+            out[f"{col}_median"] = df[col].median()
     return out
 
 
-def _score_batch(model, batch, out, cond, tgt, cond_pad, cfg, seeds, seconds, device):
-    """Decode each generated sequence and score it against its references."""
+def _lod1_unit(model, batch, k):
+    """The LOD1 condition of item ``k``, decoded to the unit box."""
     inverse = amt_detokenize if model.tokenization == "amt" else detokenize
-    rows = []
+    return inverse(batch["cond"][k].cpu().numpy(), model.num_bins)
+
+
+def _score_batch(model, batch, gen_unit, eos_emitted, cfg, seeds, seconds, device):
+    """Score each item's unit-box generation against its references.
+
+    Args:
+        gen_unit: one ``(verts, faces)`` in the unit box per item: a decoded
+            generation, or the decoded condition for `LOD1_COPY`.
+        eos_emitted: one bool per item, or None when nothing was generated.
+
+    Returns:
+        tuple: (rows, meshes) where ``meshes`` maps object id to the metre
+        ``lod1`` / ``lod2`` / ``gen`` meshes the samples are drawn from.
+    """
+    with torch.no_grad():
+        cond, tgt, cond_pad, _ = model._prepare(batch)
+    rows, meshes = [], {}
     for k, oid in enumerate(batch["ids"]):
         centre = batch["center"][k].cpu().numpy()
         scale = batch["scale"][k].cpu().numpy()
         item_cond = model._item_cond((cond, cond_pad), k)
-        gen = _to_metres(model, out[k].cpu(), centre, scale, item_cond)
         # Both references go through the tokenizer round trip, as in run_mesh_eval.
-        lod2 = _to_metres(model, tgt[k].cpu(), centre, scale, item_cond)
-        v1, f1 = inverse(batch["cond"][k].cpu().numpy(), model.num_bins)
-        lod1 = (v1 * scale + centre, f1)
+        units = {"gen": gen_unit[k],
+                 "lod2": model.decode_tokens(tgt[k].cpu(), cond=item_cond),
+                 "lod1": _lod1_unit(model, batch, k)}
+        metres = {name: (np.asarray(v) * scale + centre, f) for name, (v, f) in units.items()}
+        gen, lod1, lod2 = metres["gen"], metres["lod1"], metres["lod2"]
         refs = {"lod1": lod1, "lod2": lod2}
 
         row = {"object_id": str(oid), "seed": seeds[k],
                "n_faces_lod1": len(lod1[1]), "n_faces_lod2": len(lod2[1]),
-               "eos_emitted": bool((out[k] == model.eos).any()),
+               "eos_emitted": float("nan") if eos_emitted is None else eos_emitted[k],
                "decode_ok": bool(len(gen[1]) > 0), "gen_seconds": seconds}
         row.update(score_object(gen, {name: refs[name] for name in cfg.references},
                                 cfg.metrics, n_points=cfg.n_points,
                                 sinkhorn_cfg=cfg.sinkhorn, seed=SURFACE_SEED,
                                 device=device))
+        bins = {name: (quantize(v, model.num_bins), f) for name, (v, f) in units.items()}
+        row.update(face_set_metrics(bins["gen"], bins["lod2"], bins["lod1"], scale))
+        if "chamfer_m_vs_lod1" in row:
+            # Below 1: the generation sits closer to LOD1 than the truth does.
+            row["lod1_chamfer_norm"] = chamfer_ratio(
+                row["chamfer_m_vs_lod1"],
+                chamfer_floor(lod1, lod2, cfg.n_points, seed=SURFACE_SEED))
         rows.append(row)
-    return rows
+        meshes[str(oid)] = metres
+    return rows, meshes
 
 
 def run_posthoc_eval(cfg, ref_cfg, model, dataset, out_dir, checkpoint=None,
@@ -423,7 +461,7 @@ def run_posthoc_eval(cfg, ref_cfg, model, dataset, out_dir, checkpoint=None,
     position = {k: p for p, k in enumerate(indices)}
     model.eval()
     summary = []
-    for run in runs:
+    for run in runs + [DecodeRun(name=LOD1_COPY, kind=LOD1_COPY, params={})]:
         run_dir = out_dir / run.name
         run_dir.mkdir(exist_ok=True)
         kwargs = run.generate_kwargs()
@@ -453,16 +491,25 @@ def run_posthoc_eval(cfg, ref_cfg, model, dataset, out_dir, checkpoint=None,
                            if cfg.image_mode == "none" else None)
             seeds = [object_seed(cfg.seed, oid) for oid in batch["ids"]]
 
-            started = time.perf_counter()
-            with torch.no_grad():
-                cond, tgt, cond_pad, _ = model._prepare(batch)
-                out = model.generate(cond, cond_pad, max_new_tokens=max_new_tokens,
-                                     seeds=seeds, image=batch.get("image"),
-                                     image_valid=image_valid, **kwargs)
-            seconds = (time.perf_counter() - started) / len(chunk)
+            if run.kind == LOD1_COPY:
+                gen_unit = [_lod1_unit(model, batch, k) for k in range(len(chunk))]
+                eos, seconds = None, 0.0
+            else:
+                started = time.perf_counter()
+                with torch.no_grad():
+                    cond, _, cond_pad, _ = model._prepare(batch)
+                    out = model.generate(cond, cond_pad, max_new_tokens=max_new_tokens,
+                                         seeds=seeds, image=batch.get("image"),
+                                         image_valid=image_valid, **kwargs)
+                seconds = (time.perf_counter() - started) / len(chunk)
+                # The VQ-VAE decoder reads this item's encoded condition.
+                gen_unit = [model.decode_tokens(out[k].cpu(),
+                                                cond=model._item_cond((cond, cond_pad), k))
+                            for k in range(len(chunk))]
+                eos = [bool((out[k] == model.eos).any()) for k in range(len(chunk))]
 
-            batch_rows = _score_batch(model, batch, out, cond, tgt, cond_pad, cfg,
-                                      seeds, seconds, device)
+            batch_rows, _ = _score_batch(model, batch, gen_unit, eos, cfg, seeds,
+                                         seconds, device)
             # Flushed per batch: a crash keeps every finished object.
             _append_csv(run_dir / "objects.csv", batch_rows)
             rows.extend(batch_rows)

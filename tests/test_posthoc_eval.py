@@ -181,6 +181,7 @@ import pandas as pd
 import torch
 
 from src.dataset.mesh_dataset import specials
+from src.eval.mesh_metrics import FACE_COLUMNS
 from src.eval.posthoc_eval import checkpoint_info, object_seed, run_posthoc_eval
 from src.models.mesh_transformer import MeshTransformerModule
 from src.utils.config import Config
@@ -234,7 +235,22 @@ OBJECT_COLUMNS = [
     "gen_seconds", "n_faces_gen", "watertight_gen",
 ] + [f"{m}_vs_{ref}" for ref in ("lod1", "lod2")
      for m in ("chamfer_m", "hausdorff_p95_m", "hausdorff_max_m", "symdiff_m3",
-               "rel_symdiff", "vol_ok", "vol_note", "sinkhorn_m", "roof_chamfer_m")]
+               "rel_symdiff", "vol_ok", "vol_note", "sinkhorn_m", "roof_chamfer_m")
+] + list(FACE_COLUMNS) + ["lod1_chamfer_norm"]
+
+
+def _perfect(monkeypatch, model):
+    """Make `generate` hand back the batch's own target: a perfect generation."""
+    stash, prepare = {}, model._prepare
+
+    def spy_prepare(batch):
+        out = prepare(batch)
+        stash["tgt"] = out[1]
+        return out
+    monkeypatch.setattr(model, "_prepare", spy_prepare)
+    monkeypatch.setattr(type(model), "generate",
+                        lambda self, cond, cond_pad_mask=None, **kw: stash["tgt"])
+    return model
 
 
 def test_object_seed_is_stable_and_distinct():
@@ -263,7 +279,7 @@ def test_end_to_end_writes_one_row_per_object_per_run(tmp_path):
                                checkpoint=checkpoint_info(ckpt),
                                split_sizes={"train": 0, "val": 2, "test": 0})
 
-    names = [r.name for r in expand_strategies(cfg.strategies)]
+    names = [r.name for r in expand_strategies(cfg.strategies)] + ["lod1_copy"]
     assert [row["run"] for row in summary] == names
     for name in names:
         df = pd.read_csv(out / name / "objects.csv")
@@ -276,12 +292,32 @@ def test_end_to_end_writes_one_row_per_object_per_run(tmp_path):
                      "checkpoint.json", "split.json", "summary.csv"):
         assert (out / artifact).is_file(), artifact
     table = pd.read_csv(out / "summary.csv")
-    assert len(table) == 7
+    assert len(table) == 8
     assert {"watertight_pct", "decode_rate", "eos_rate", "chamfer_m_vs_lod2_mean",
             "chamfer_m_vs_lod2_median", "vol_defined_pct_vs_lod1",
-            "roof_defined_pct_vs_lod2"} <= set(table.columns)
+            "roof_defined_pct_vs_lod2", "face_f1_mean", "roof_face_f1_mean",
+            "lod1_vert_copy_norm_mean", "lod1_chamfer_norm_mean"} <= set(table.columns)
     split = json.loads((out / "split.json").read_text())
     assert split["n_evaluated"] == 2 and split["split_sizes"]["val"] == 2
+
+
+def test_lod1_copy_scores_the_condition_as_its_generation(tmp_path):
+    cfg = _small_cfg(strategies=[StrategyConfig(kind="greedy")], metrics=["chamfer"])
+    run_posthoc_eval(cfg, Config(), _model(), _Dataset(), tmp_path / "e")
+    df = pd.read_csv(tmp_path / "e" / "lod1_copy" / "objects.csv")
+    assert (df["n_faces_gen"] == df["n_faces_lod1"]).all()
+    assert np.allclose(df["chamfer_m_vs_lod1"], 0.0, atol=1e-9)
+    assert (df["lod1_vert_copy_rate"] == 1.0).all()
+    assert df["eos_emitted"].isna().all()
+
+
+def test_a_perfect_generation_scores_perfectly(tmp_path, monkeypatch):
+    model = _perfect(monkeypatch, _model())
+    cfg = _small_cfg(strategies=[StrategyConfig(kind="greedy")], metrics=["chamfer"])
+    run_posthoc_eval(cfg, Config(), model, _Dataset(), tmp_path / "e")
+    df = pd.read_csv(tmp_path / "e" / "greedy" / "objects.csv")
+    assert (df["face_f1"] == 1.0).all() and (df["face_acc"] == 1.0).all()
+    assert np.allclose(df["chamfer_m_vs_lod2"], 0.0, atol=1e-9)
 
 
 def test_a_rerun_reproduces_every_row(tmp_path):
