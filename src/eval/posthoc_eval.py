@@ -432,7 +432,10 @@ def write_samples(run_dir, picks, meshes, rows):
                 f"[{bucket} #{rank}] {oid} | roof chamfer {row.get(SAMPLE_COLUMN, np.nan):.3f} m"
                 f" | chamfer {row.get('chamfer_m_vs_lod2', np.nan):.3f} m"
                 f" | face F1 {row.get('face_f1', np.nan):.3f}"))
-            path = out_dir / f"{bucket}_{rank}_{re.sub(r'[^\w.-]', '_', oid)}.html"
+            # sanitised outside the f-string: a backslash inside an f-string
+            # expression is a SyntaxError before Python 3.12
+            safe_oid = re.sub(r"[^\w.-]", "_", oid)
+            path = out_dir / f"{bucket}_{rank}_{safe_oid}.html"
             fig.write_html(path, include_plotlyjs="cdn")
             paths.append(path)
     return paths
