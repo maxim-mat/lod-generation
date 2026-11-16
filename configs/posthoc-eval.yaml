@@ -2,22 +2,22 @@
 # Usage: python -m src.eval.posthoc_eval --config configs/posthoc-eval.yaml [dot.overrides]
 #
 # Holds only eval settings. Data, split seed, tokenizer and model shape come from
-# `reference_config`, the run's own training config.
+# `reference_configs`, the run's own training config.
 
-reference_config: configs/mesh-v5-full-coord.yaml
-checkpoint: outputs/initial-runs/mesh-v5-full-coord/checkpoints/last.ckpt
+reference_configs: [configs/mesh-v5-full-coord.yaml]
+checkpoints: [outputs/initial-runs/mesh-v5-full-coord/checkpoints/last.ckpt]
 # Dot-list applied to the reference, e.g.
 #   ["mesh_data.dataset_dir=data/The Hague/mini_remote"]
 reference_overrides: []
 
-split: val
+split: test
 # null scores the whole split (~26k objects on cleaner). Set e.g. 256 for a
 # first pass; the subsample is seeded, so it is the same buildings every time.
 max_objects: null
 batch_size: 8
 seed: 1234
 device: auto
-output_dir: null      # null -> <save_dir>/<experiment_name>/<run_name>/posthoc_eval
+output_dir: null      # null -> outputs/posthoc_eval/<stamp>/<run_name>
 
 # List-valued params expand as a cartesian product within each strategy.
 strategies:

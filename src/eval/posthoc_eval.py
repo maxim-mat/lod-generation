@@ -176,6 +176,12 @@ def validate_posthoc_config(cfg):
         raise ValueError(f"batch_size must be >= 1, got {cfg.batch_size}.")
     if not cfg.strategies:
         raise ValueError("At least one strategy is required.")
+    if not cfg.reference_configs:
+        raise ValueError("reference_configs is empty: name at least one training config.")
+    if len(cfg.checkpoints) != len(cfg.reference_configs):
+        raise ValueError(f"checkpoints has {len(cfg.checkpoints)} entries but "
+                         f"reference_configs has {len(cfg.reference_configs)}; they "
+                         "pair by position (null = the run's best checkpoint).")
     return expand_strategies(cfg.strategies)
 
 
@@ -666,38 +672,81 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-    # Cheapest checks first: nothing below touches data until all of these pass.
+    # Cheapest checks first, for EVERY model: a bad last entry must fail in
+    # seconds, not after the first models have generated for days.
     cfg = load_posthoc_config(args.config, args.overrides)
     validate_posthoc_config(cfg)
-    ref_cfg = load_config(Path(cfg.reference_config), list(cfg.reference_overrides))
-    if ref_cfg.config_set != "mesh":
-        raise ValueError(f"reference config has config_set={ref_cfg.config_set!r}; "
-                         "post-hoc eval scores mesh-transformer runs (config_set: mesh).")
-    ckpt = Path(cfg.checkpoint)
-    if not ckpt.is_file():
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt}")
-    info = checkpoint_info(ckpt)
-    check_tokenization(info["hyper_parameters"], ref_cfg)
     from src.train_mesh import check_vertex_margins
-    check_vertex_margins(info["hyper_parameters"].get("image_vertex_features", False),
-                         ref_cfg.mesh_data.margin_lo, ref_cfg.mesh_data.margin_hi)
+    models = []
+    for ref_path, ckpt_arg in zip(cfg.reference_configs, cfg.checkpoints):
+        ref_cfg = load_config(Path(ref_path), list(cfg.reference_overrides))
+        if ref_cfg.config_set != "mesh":
+            raise ValueError(f"{ref_path} has config_set={ref_cfg.config_set!r}; post-hoc "
+                             "eval scores mesh-transformer runs (config_set: mesh).")
+        ckpt = resolve_checkpoint(ref_cfg, ckpt_arg)
+        info = checkpoint_info(ckpt)
+        check_tokenization(info["hyper_parameters"], ref_cfg)
+        check_vertex_margins(info["hyper_parameters"].get("image_vertex_features", False),
+                             ref_cfg.mesh_data.margin_lo, ref_cfg.mesh_data.margin_hi)
+        models.append((ref_cfg, ckpt, info))
+    names = [ref_cfg.logging.run_name for ref_cfg, _, _ in models]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        raise ValueError(f"Two entries share logging.run_name {dupes}, so they would "
+                         "write into one directory. Score them in separate calls.")
 
-    L.seed_everything(cfg.seed, workers=True)
     device = resolve_device(cfg.device)
-    dataset, sizes = build_split(ref_cfg, cfg.split)
-    model = load_model(ref_cfg, ckpt, device)
-
-    base = (Path(cfg.output_dir) if cfg.output_dir else
-            Path(ref_cfg.logging.save_dir, ref_cfg.logging.experiment_name,
-                 ref_cfg.logging.run_name, "posthoc_eval"))
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    out_dir = base / ckpt.stem / (stamp if cfg.image_mode == "true" else f"{cfg.image_mode}-{stamp}")
-    logger.info("[posthoc] %s, %s split (%d objects) -> %s",
-                ckpt.name, cfg.split, len(dataset), out_dir)
-    run_posthoc_eval(cfg, ref_cfg, model, dataset, out_dir, checkpoint=info,
-                     split_sizes=sizes, device=device)
-    logger.info("[posthoc] done: %s", out_dir)
-    return out_dir
+    root = (Path(cfg.output_dir or "outputs/posthoc_eval")
+            / (stamp if cfg.image_mode == "true" else f"{cfg.image_mode}-{stamp}"))
+    combined = []
+    for (ref_cfg, ckpt, info), name in zip(models, names):
+        # Re-seeded per model, so a model's rows do not depend on its position.
+        L.seed_everything(cfg.seed, workers=True)
+        dataset, sizes = build_split(ref_cfg, cfg.split)
+        model = load_model(ref_cfg, ckpt, device)
+        logger.info("[posthoc] %s (%s), %s split (%d objects) -> %s",
+                    name, ckpt.name, cfg.split, len(dataset), root / name)
+        summary = run_posthoc_eval(cfg, ref_cfg, model, dataset, root / name,
+                                   checkpoint=info, split_sizes=sizes, device=device)
+        combined.extend({"model": name, **row} for row in summary)
+        # Rewritten after each model: a crash keeps every finished one.
+        pd.DataFrame(combined).to_csv(root / "summary.csv", index=False)
+        del model
+        if str(device).startswith("cuda"):
+            torch.cuda.empty_cache()
+    logger.info("[posthoc] done: %s", root)
+    return root
+
+
+def resolve_checkpoint(ref_cfg, checkpoint):
+    """The checkpoint file to score for one reference config.
+
+    A given path must exist. ``None`` takes the run's lowest
+    ``val_gen_chamfer_m=<x>.ckpt`` (what training selects on), else its
+    ``last.ckpt``, from ``<save_dir>/<experiment_name>/<run_name>/checkpoints``.
+
+    Raises:
+        FileNotFoundError: the path, or every candidate, is missing.
+    """
+    if checkpoint is not None:
+        path = Path(checkpoint)
+        if not path.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {path}")
+        return path
+    lg = ref_cfg.logging
+    ckpt_dir = Path(lg.save_dir, lg.experiment_name, lg.run_name, "checkpoints")
+    scored = []
+    for p in ckpt_dir.glob("*.ckpt"):
+        m = re.search(r"val_gen_chamfer_m=([0-9.]+)\.ckpt$", p.name)
+        if m:
+            scored.append((float(m.group(1)), p.name, p))
+    if scored:
+        return min(scored)[2]
+    if (ckpt_dir / "last.ckpt").is_file():
+        return ckpt_dir / "last.ckpt"
+    raise FileNotFoundError(f"No val_gen_chamfer_m checkpoint and no last.ckpt in "
+                            f"{ckpt_dir}; set its entry in checkpoints explicitly.")
 
 
 if __name__ == "__main__":

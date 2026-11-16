@@ -126,19 +126,18 @@ attention both require it. Its ablation is `7swbxcwh` itself.
 - `none`: the learned null token, the same thing image dropout trained the
   model on.
 
-Make a post-hoc config for the run, with `reference_config` set to the v6
-training config and `checkpoint` set to its best checkpoint. Then:
+`configs/posthoc-eval-all.yaml` lists v5-tile and the three v6 arms. A `null`
+checkpoint picks each run's best by `val_gen_chamfer_m`. Then:
 
 ```bash
-python -m src.eval.posthoc_eval --config configs/posthoc-eval-<run>.yaml image_mode=true
-python -m src.eval.posthoc_eval --config configs/posthoc-eval-<run>.yaml image_mode=shuffled
-python -m src.eval.posthoc_eval --config configs/posthoc-eval-<run>.yaml image_mode=none
+python -m src.eval.posthoc_eval --config configs/posthoc-eval-all.yaml image_mode=true
+python -m src.eval.posthoc_eval --config configs/posthoc-eval-all.yaml image_mode=shuffled
+python -m src.eval.posthoc_eval --config configs/posthoc-eval-all.yaml image_mode=none
 ```
 
-Outputs go to `<run>/posthoc_eval/<ckpt>/<stamp>` for `true` and
-`<run>/posthoc_eval/<ckpt>/<mode>-<stamp>` for the others. Score the v5-tile
-baseline with its own post-hoc config. `image_mode` has no effect on an
-image-free model.
+Outputs go to `outputs/posthoc_eval/<stamp>/<run_name>/` for `true` and
+`outputs/posthoc_eval/<mode>-<stamp>/<run_name>/` for the others. `image_mode`
+has no effect on the image-free v5, so its three runs agree up to sampling.
 
 ## Stratified comparison
 
