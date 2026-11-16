@@ -24,6 +24,7 @@ testable on its own -- same rule as `building_features.py`.
 """
 import importlib.util
 import logging
+from collections import Counter
 
 import numpy as np
 import trimesh
@@ -389,21 +390,106 @@ def roof_submesh(verts, faces, up=_UP):
     empty = (np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64))
     v = np.asarray(verts, dtype=float).reshape(-1, 3)
     f = np.asarray(faces, dtype=np.int64).reshape(-1, 3)
-    if len(f) == 0:
-        return empty
-
-    a, b, c = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
-    cross = np.cross(b - a, c - a)
-    norm = np.linalg.norm(cross, axis=1)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        nz = np.where(norm > 0, cross[:, 2] / norm, 0.0)
-
-    roof = f[nz > up]
+    roof = f[roof_mask(v, f, up)]
     if len(roof) == 0:
         return empty
     used, inverse = np.unique(roof, return_inverse=True)
     # reshape: numpy 2.0.0 returned `inverse` in the input's shape, others flat.
     return v[used], inverse.reshape(-1, 3).astype(np.int64)
+
+
+def roof_mask(verts, faces, up=_UP):
+    """``[F]`` bool: the winding-derived unit normal has ``z > up``.
+
+    The one roof rule `roof_submesh` and `face_set_metrics` share. Pass metres,
+    not unit-box bins: the bin grid is scaled per axis, which tilts normals.
+    """
+    v = np.asarray(verts, dtype=float).reshape(-1, 3)
+    f = np.asarray(faces, dtype=np.int64).reshape(-1, 3)
+    if len(f) == 0:
+        return np.zeros(0, dtype=bool)
+    a, b, c = v[f[:, 0]], v[f[:, 1]], v[f[:, 2]]
+    cross = np.cross(b - a, c - a)
+    norm = np.linalg.norm(cross, axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        nz = np.where(norm > 0, cross[:, 2] / norm, 0.0)
+    return nz > up
+
+
+# ----------------------------------------------------------------------
+# Position-free face matching in quantized-bin space
+# ----------------------------------------------------------------------
+
+FACE_COLUMNS = ("face_acc", "face_precision", "face_recall", "face_f1",
+                "roof_face_acc", "roof_face_precision", "roof_face_recall",
+                "roof_face_f1", "lod1_vert_copy_rate", "lod1_vert_copy_norm")
+
+
+def _face_keys(bins, faces):
+    """Multiset of faces, each the sorted tuple of its three vertex bin-triplets.
+
+    Sorting drops sequence position, vertex order and winding at once, and
+    keying on coordinates rather than indices makes two meshes comparable.
+    """
+    return Counter(tuple(sorted(map(tuple, bins[f].tolist()))) for f in faces)
+
+
+def _set_scores(g, t):
+    """``(acc, precision, recall, f1)`` of multisets ``g`` against ``t``.
+
+    NaN only when both are empty. One empty side scores 0, so a failed
+    generation counts against a mean instead of dropping out of it.
+    """
+    n_g, n_t = sum(g.values()), sum(t.values())
+    if n_g + n_t == 0:
+        return (float("nan"),) * 4
+    hit = sum((g & t).values())
+    p = hit / n_g if n_g else 0.0
+    r = hit / n_t if n_t else 0.0
+    f1 = 2 * p * r / (p + r) if p + r else 0.0
+    return hit / sum((g | t).values()), p, r, f1
+
+
+def _copy_rate(bins, faces, lod1_verts):
+    used = {tuple(x) for x in bins[np.unique(faces)].tolist()} if len(faces) else set()
+    return len(used & lod1_verts) / len(used) if used else float("nan")
+
+
+def face_set_metrics(gen, gt, lod1, scale):
+    """Discrete agreement of a generated mesh with its truth and its LOD1 input.
+
+    Args:
+        gen, gt, lod1: ``(vert_bins [V, 3] int, faces [F, 3])`` in one
+            building's quantized unit-box frame, so equal bins are equal points.
+        scale: ``[3]`` metres per unit-box axis, for the roof normals only.
+
+    Returns:
+        dict: the `FACE_COLUMNS`, in order. ``lod1_vert_copy_rate`` is the share
+        of generated vertices that are LOD1 vertices; ``lod1_vert_copy_norm``
+        divides it by the truth's own share, so above 1 means over-copying.
+    """
+    scale = np.asarray(scale, dtype=float).reshape(3)
+    meshes = []
+    for bins, faces in (gen, gt, lod1):
+        bins = np.asarray(bins, dtype=np.int64).reshape(-1, 3)
+        faces = np.asarray(faces, dtype=np.int64).reshape(-1, 3)
+        meshes.append((bins, faces))
+    (gb, gf), (tb, tf), (lb, lf) = meshes
+
+    out = dict(zip(FACE_COLUMNS[:4], _set_scores(_face_keys(gb, gf), _face_keys(tb, tf))))
+    roof_g = gf[roof_mask(gb * scale, gf)]
+    roof_t = tf[roof_mask(tb * scale, tf)]
+    out.update(zip(FACE_COLUMNS[4:8], _set_scores(_face_keys(gb, roof_g),
+                                                  _face_keys(tb, roof_t))))
+
+    lod1_verts = {tuple(x) for x in lb[np.unique(lf)].tolist()} if len(lf) else set()
+    rate_gen = _copy_rate(gb, gf, lod1_verts)
+    rate_gt = _copy_rate(tb, tf, lod1_verts)
+    out["lod1_vert_copy_rate"] = rate_gen
+    out["lod1_vert_copy_norm"] = (rate_gen / rate_gt if np.isfinite(rate_gen)
+                                  and np.isfinite(rate_gt) and rate_gt > 0
+                                  else float("nan"))
+    return out
 
 
 def roof_height_error(gen, gt):
